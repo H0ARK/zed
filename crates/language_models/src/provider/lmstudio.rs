@@ -282,11 +282,11 @@ impl LanguageModel for LmStudioLanguageModel {
     }
 
     fn supports_tools(&self) -> bool {
-        false
+        true
     }
 
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
-        false
+        true
     }
 
     fn telemetry_id(&self) -> String {

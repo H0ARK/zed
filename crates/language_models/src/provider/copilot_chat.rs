@@ -187,21 +187,15 @@ impl LanguageModel for CopilotChatLanguageModel {
     }
 
     fn supports_tools(&self) -> bool {
-        match self.model {
-            CopilotChatModel::Gpt4o
-            | CopilotChatModel::Gpt4_1
-            | CopilotChatModel::O4Mini
-            | CopilotChatModel::Claude3_5Sonnet
-            | CopilotChatModel::Claude3_7Sonnet => true,
-            _ => false,
-        }
+        // Allow all models to use tools
+        true
     }
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
         match choice {
             LanguageModelToolChoice::Auto
             | LanguageModelToolChoice::Any
-            | LanguageModelToolChoice::None => self.supports_tools(),
+            | LanguageModelToolChoice::None => true,
         }
     }
 
