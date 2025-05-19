@@ -9,7 +9,7 @@ use text::Point;
 
 /// For files over this size, instead of reading them (or including them in context),
 /// we automatically provide the file's symbol outline instead, with line numbers.
-pub const AUTO_OUTLINE_SIZE: usize = 16384;
+pub const AUTO_OUTLINE_SIZE: usize = 250 * 80; // Approximately 250 lines of 80 characters each
 
 pub async fn file_outline(
     project: Entity<Project>,
