@@ -18,6 +18,11 @@ pub enum CliRequest {
         env: Option<HashMap<String, String>>,
         user_data_dir: Option<String>,
     },
+    AgentChat {
+        prompt: String,
+        context_paths: Vec<String>,
+        wait: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,6 +31,8 @@ pub enum CliResponse {
     Stdout { message: String },
     Stderr { message: String },
     Exit { status: i32 },
+    AgentResponse { message: String },
+    AgentProgress { status: String },
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),
