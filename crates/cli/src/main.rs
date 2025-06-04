@@ -38,21 +38,13 @@ trait InstalledApp {
 #[command(
     name = "zed",
     disable_version_flag = true,
-    before_help = "The Zed CLI binary.
-This CLI is a separate binary that invokes Zed.
-
-Examples:
-    `zed`
-          Simply opens Zed
-    `zed --foreground`
-          Runs in foreground (shows all logs)
-    `zed path-to-your-project`
-          Open your project in Zed
-    `zed -n path-to-file `
-          Open file/folder in a new window",
+    before_help = "The Zed CLI binary.\nThis CLI is a separate binary that invokes Zed.\n\nExamples:\n    `zed`\n          Simply opens Zed\n    `zed --foreground`\n          Runs in foreground (shows all logs)\n    `zed path-to-your-project`\n          Open your project in Zed\n    `zed -n path-to-file `\n          Open file/folder in a new window\n    `zed agent chat \"What does this code do?\" --context src/main.rs`\n          Chat with the agent about your code",
     after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+    
     /// Wait for all of the given paths to be opened/closed before exiting.
     #[arg(short, long)]
     wait: bool,
@@ -66,7 +58,7 @@ struct Args {
     /// This overrides the default platform-specific data directory location.
     /// On macOS, the default is `~/Library/Application Support/Zed`.
     /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
-    /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
+    /// On Windows, the default is `%LOCALAPPDATA%\\Zed`.
     #[arg(long, value_name = "DIR")]
     user_data_dir: Option<String>,
     /// The paths to open in Zed (space-separated).
@@ -123,6 +115,30 @@ struct Args {
     /// Authenticate with GitHub Copilot
     #[arg(long)]
     copilot_auth: bool,
+}
+
+#[derive(Parser, Debug)]
+enum Commands {
+    /// Chat with the Zed agent
+    Agent {
+        #[command(subcommand)]
+        agent_command: AgentCommands,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum AgentCommands {
+    /// Start a chat session with the agent
+    Chat {
+        /// The prompt to send to the agent
+        prompt: String,
+        /// Paths to files or directories to include as context
+        #[arg(short, long, value_name = "PATH")]
+        context: Vec<String>,
+        /// Wait for the agent to finish before exiting
+        #[arg(short, long)]
+        wait: bool,
+    },
 }
 
 fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
@@ -222,6 +238,16 @@ fn main() -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
 
+    // Handle agent commands
+    if let Some(Commands::Agent { agent_command }) = args.command {
+        match agent_command {
+            AgentCommands::Chat { prompt, context, wait } => {
+                return handle_agent_chat(prompt, context, wait, &app, user_data_dir);
+            }
+        }
+    }
+
+    // Handle regular file opening (existing logic)
     let (server, server_name) =
         IpcOneShotServer::<IpcHandshake>::new().context("Handshake before Zed spawn")?;
     let url = format!("zed-cli://{server_name}");
@@ -811,23 +837,194 @@ mod windows {
             let path = if let Some(path) = path {
                 path.to_path_buf().canonicalize()?
             } else {
-                let cli = std::env::current_exe()?;
-                let dir = cli.parent().context("no parent path for cli")?;
-
-                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
-                // directory in development builds.
-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
-                possible_locations
-                    .iter()
-                    .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
-                    .context(format!(
-                        "could not find any of: {}",
-                        possible_locations.join(", ")
-                    ))?
+                locate_bundle().context("bundle autodiscovery")?
             };
 
-            Ok(App(path))
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("app") => {
+                    let plist_path = path.join("Contents/Info.plist");
+                    let plist =
+                        plist::from_file::<_, InfoPlist>(&plist_path).with_context(|| {
+                            format!("Reading *.app bundle plist file at {plist_path:?}")
+                        })?;
+                    Ok(Bundle::App {
+                        app_bundle: path,
+                        plist,
+                    })
+                }
+                _ => Ok(Bundle::LocalPath {
+                    executable: path,
+                }),
+            }
         }
+    }
+
+    impl Detect {
+        pub fn detect(path: Option<&Path>) -> anyhow::Result<impl InstalledApp> {
+            let path = if let Some(path) = path {
+                path.to_path_buf().canonicalize()?
+            } else {
+                locate_bundle().context("bundle autodiscovery")?
+            };
+
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("app") => {
+                    let plist_path = path.join("Contents/Info.plist");
+                    let plist =
+                        plist::from_file::<_, InfoPlist>(&plist_path).with_context(|| {
+                            format!("Reading *.app bundle plist file at {plist_path:?}")
+                        })?;
+                    Ok(Bundle::App {
+                        app_bundle: path,
+                        plist,
+                    })
+                }
+                _ => Ok(Bundle::LocalPath {
+                    executable: path,
+                }),
+            }
+        }
+    }
+
+    impl InstalledApp for Bundle {
+        fn zed_version_string(&self) -> String {
+            format!("Zed {} – {}", self.version(), self.path().display(),)
+        }
+
+        fn launch(&self, url: String) -> anyhow::Result<()> {
+            match self {
+                Self::App { app_bundle, .. } => {
+                    let app_path = app_bundle;
+
+                    let status = unsafe {
+                        let app_url = CFURL::from_path(app_path, true)
+                            .with_context(|| format!("invalid app path {app_path:?}"))?;
+                        let url_to_open = CFURL::wrap_under_create_rule(CFURLCreateWithBytes(
+                            ptr::null(),
+                            url.as_ptr(),
+                            url.len() as CFIndex,
+                            kCFStringEncodingUTF8,
+                            ptr::null(),
+                        ));
+                        // equivalent to: open zed-cli:... -a /Applications/Zed\ Preview.app
+                        let urls_to_open =
+                            CFArray::from_copyable(&[url_to_open.as_concrete_TypeRef()]);
+                        LSOpenFromURLSpec(
+                            &LSLaunchURLSpec {
+                                appURL: app_url.as_concrete_TypeRef(),
+                                itemURLs: urls_to_open.as_concrete_TypeRef(),
+                                passThruParams: ptr::null(),
+                                launchFlags: kLSLaunchDefaults,
+                                asyncRefCon: ptr::null_mut(),
+                            },
+                            ptr::null_mut(),
+                        )
+                    };
+
+                    anyhow::ensure!(
+                        status == 0,
+                        "cannot start app bundle {}",
+                        self.zed_version_string()
+                    );
+                }
+
+                Self::LocalPath { executable, .. } => {
+                    let executable_parent = executable
+                        .parent()
+                        .with_context(|| format!("Executable {executable:?} path has no parent"))?;
+                    let subprocess_stdout_file = fs::File::create(
+                        executable_parent.join("zed_dev.log"),
+                    )
+                    .with_context(|| format!("Log file creation in {executable_parent:?}"))?;
+                    let subprocess_stdin_file =
+                        subprocess_stdout_file.try_clone().with_context(|| {
+                            format!("Cloning descriptor for file {subprocess_stdout_file:?}")
+                        })?;
+                    let mut command = std::process::Command::new(executable);
+                    let command = command
+                        .env(FORCE_CLI_MODE_ENV_VAR_NAME, "")
+                        .stderr(subprocess_stdout_file)
+                        .stdout(subprocess_stdin_file)
+                        .arg(url);
+
+                    command
+                        .spawn()
+                        .with_context(|| format!("Spawning {command:?}"))?;
+                }
+            }
+
+            Ok(())
+        }
+
+        fn run_foreground(
+            &self,
+            ipc_url: String,
+            user_data_dir: Option<&str>,
+        ) -> io::Result<ExitStatus> {
+            let path = match self {
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
+                Bundle::LocalPath { executable, .. } => executable.clone(),
+            };
+
+            let mut cmd = std::process::Command::new(path);
+            cmd.arg(ipc_url);
+            if let Some(dir) = user_data_dir {
+                cmd.arg("--user-data-dir").arg(dir);
+            }
+            cmd.status()
+        }
+
+        fn path(&self) -> PathBuf {
+            match self {
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed").clone(),
+                Bundle::LocalPath { executable, .. } => executable.clone(),
+            }
+        }
+    }
+
+    impl Bundle {
+        fn version(&self) -> String {
+            match self {
+                Self::App { plist, .. } => plist.bundle_short_version_string.clone(),
+                Self::LocalPath { .. } => "<development>".to_string(),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            match self {
+                Self::App { app_bundle, .. } => app_bundle,
+                Self::LocalPath { executable, .. } => executable,
+            }
+        }
+    }
+
+    pub(super) fn spawn_channel_cli(
+        channel: release_channel::ReleaseChannel,
+        leftover_args: Vec<String>,
+    ) -> Result<()> {
+        use anyhow::bail;
+
+        let app_id_prompt = format!("id of app \"{}\"", channel.display_name());
+        let app_id_output = Command::new("osascript")
+            .arg("-e")
+            .arg(&app_id_prompt)
+            .output()?;
+        if !app_id_output.status.success() {
+            bail!("Could not determine app id for {}", channel.display_name());
+        }
+        let app_name = String::from_utf8(app_id_output.stdout)?.trim().to_owned();
+        let app_path_prompt = format!("kMDItemCFBundleIdentifier == '{app_name}'");
+        let app_path_output = Command::new("mdfind").arg(app_path_prompt).output()?;
+        if !app_path_output.status.success() {
+            bail!(
+                "Could not determine app path for {}",
+                channel.display_name()
+            );
+        }
+        let app_path = String::from_utf8(app_path_output.stdout)?.trim().to_owned();
+        let cli_path = format!("{app_path}/Contents/MacOS/cli");
+        Command::new(cli_path).args(leftover_args).spawn()?;
+        Ok(())
     }
 }
 
@@ -1051,4 +1248,64 @@ mod mac_os {
         Command::new(cli_path).args(leftover_args).spawn()?;
         Ok(())
     }
+}
+
+fn handle_agent_chat(prompt: String, context: Vec<String>, wait: bool, app: &impl InstalledApp, user_data_dir: Option<String>) -> Result<()> {
+    let (server, server_name) =
+        IpcOneShotServer::<IpcHandshake>::new().context("Handshake before agent chat")?;
+    let url = format!("zed-cli://{server_name}");
+
+    let exit_status = Arc::new(Mutex::new(None));
+
+    let sender: JoinHandle<anyhow::Result<()>> = thread::spawn({
+        let exit_status = exit_status.clone();
+        move || {
+            let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
+            let (tx, rx) = (handshake.requests, handshake.responses);
+
+            tx.send(CliRequest::AgentChat {
+                prompt,
+                context_paths: context,
+                wait,
+            })?;
+
+            while let Ok(response) = rx.recv() {
+                match response {
+                    CliResponse::Ping => {}
+                    CliResponse::Stdout { message } => println!("{message}"),
+                    CliResponse::Stderr { message } => eprintln!("{message}"),
+                    CliResponse::AgentResponse { message } => println!("{message}"),
+                    CliResponse::AgentProgress { status } => eprintln!("Status: {status}"),
+                    CliResponse::Exit { status } => {
+                        *exit_status.lock() = Some(status);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+    });
+
+    // Launch Zed with headless agent flag
+    let mut cmd = std::process::Command::new(app.path());
+    cmd.arg(url)
+        .arg("--headless-agent")  // Add headless flag
+        .env("ZED_HEADLESS_AGENT", "1");  // Also set env var
+    
+    if let Some(dir) = user_data_dir.as_deref() {
+        cmd.arg("--user-data-dir").arg(dir);
+    }
+    
+    if cmd.spawn().is_err() {
+        anyhow::bail!("Failed to launch Zed in headless mode");
+    }
+
+    sender.join().unwrap()?;
+
+    let exit_status = exit_status.lock().unwrap_or(0);
+    if exit_status != 0 {
+        std::process::exit(exit_status);
+    }
+
+    Ok(())
 }

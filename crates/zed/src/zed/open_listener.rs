@@ -404,8 +404,53 @@ pub async fn handle_cli_connection(
                     .log_err();
                 responses.send(CliResponse::Exit { status: 1 }).log_err();
             }
+            CliRequest::AgentChat {
+                prompt,
+                context_paths,
+                wait,
+            } => {
+                handle_agent_chat_request(prompt, context_paths, wait, responses, app_state, cx).await;
+            }
         }
     }
+}
+
+async fn handle_agent_chat_request(
+    prompt: String,
+    context_paths: Vec<String>,
+    wait: bool,
+    responses: IpcSender<CliResponse>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) {
+    responses
+        .send(CliResponse::AgentProgress {
+            status: "Initializing agent...".to_string(),
+        })
+        .log_err();
+
+    // For now, just echo back the prompt as a simple test
+    responses
+        .send(CliResponse::AgentResponse {
+            message: format!("Agent received prompt: {}", prompt),
+        })
+        .log_err();
+
+    if !context_paths.is_empty() {
+        responses
+            .send(CliResponse::AgentResponse {
+                message: format!("Context paths: {:?}", context_paths),
+            })
+            .log_err();
+    }
+
+    responses
+        .send(CliResponse::AgentResponse {
+            message: "Agent chat functionality is not yet fully implemented. This is a placeholder response.".to_string(),
+        })
+        .log_err();
+
+    responses.send(CliResponse::Exit { status: 0 }).log_err();
 }
 
 async fn open_workspaces(

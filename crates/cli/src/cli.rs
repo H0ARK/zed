@@ -64,6 +64,11 @@ pub enum CliRequest {
     SessionInfo {
         session_id: String,
     },
+    AgentChat {
+        prompt: String,
+        context_paths: Vec<String>,
+        wait: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +85,8 @@ pub enum CliResponse {
     SessionImported { session_id: String },
     SessionDetails { json_data: String },
     MessageSent { session_id: String, message_id: Option<String> },
+    AgentResponse { message: String },
+    AgentProgress { status: String },
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),
