@@ -286,7 +286,8 @@
       "cmd-shift-e": "project_panel::ToggleFocus",
       "cmd-shift-enter": "agent::ContinueThread",
       "alt-enter": "agent::ContinueWithBurnMode",
-      "cmd-alt-b": "agent::ToggleBurnMode"
+      "cmd-alt-b": "agent::ToggleBurnMode",
+      "cmd-alt-m": "agent_management::ToggleFocus"
     }
   },
   {

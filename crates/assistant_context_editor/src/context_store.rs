@@ -43,6 +43,7 @@ pub struct ContextStore {
     contexts: Vec<ContextHandle>,
     contexts_metadata: Vec<SavedContextMetadata>,
     context_server_slash_command_ids: HashMap<ContextServerId, Vec<SlashCommandId>>,
+    context_server_tasks: HashMap<ContextServerId, Task<()>>,
     host_contexts: Vec<RemoteContextMetadata>,
     fs: Arc<dyn Fs>,
     languages: Arc<LanguageRegistry>,
@@ -103,6 +104,7 @@ impl ContextStore {
                     contexts: Vec::new(),
                     contexts_metadata: Vec::new(),
                     context_server_slash_command_ids: HashMap::default(),
+                    context_server_tasks: HashMap::default(),
                     host_contexts: Vec::new(),
                     fs,
                     languages,
@@ -827,12 +829,18 @@ impl ContextStore {
             project::context_server_store::Event::ServerStatusChanged { server_id, status } => {
                 match status {
                     ContextServerStatus::Running => {
+                        // Check if we already have commands registered for this server to prevent duplicates
+                        if self.context_server_slash_command_ids.contains_key(server_id) {
+                            log::debug!("Context server {} already has slash commands registered, skipping", server_id.0);
+                            return;
+                        }
+
                         if let Some(server) = context_server_manager
                             .read(cx)
                             .get_running_server(server_id)
                         {
                             let context_server_manager = context_server_manager.clone();
-                            cx.spawn({
+                            let task = cx.spawn({
                                 let server = server.clone();
                                 let server_id = server_id.clone();
                                 async move |this, cx| {
@@ -861,22 +869,33 @@ impl ContextStore {
                                                 .collect::<Vec<_>>();
 
                                             this.update( cx, |this, _cx| {
-                                                this.context_server_slash_command_ids
-                                                    .insert(server_id.clone(), slash_command_ids);
+                                                // Use entry API to avoid double lookup and ensure atomicity
+                                                if let std::collections::hash_map::Entry::Vacant(e) = this.context_server_slash_command_ids.entry(server_id.clone()) {
+                                                    e.insert(slash_command_ids);
+                                                }
                                             })
                                             .log_err();
                                         }
                                     }
                                 }
-                            })
-                            .detach();
+                            });
+                            // Store the task to manage its lifecycle properly and prevent memory leaks
+                            self.context_server_tasks.insert(server_id.clone(), task);
                         }
                     }
                     ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
+                        // Clean up slash commands
                         if let Some(slash_command_ids) =
                             self.context_server_slash_command_ids.remove(server_id)
                         {
+                            log::info!("Cleaning up {} slash commands for context server {}", slash_command_ids.len(), server_id.0);
                             slash_command_working_set.remove(&slash_command_ids);
+                        }
+                        
+                        // Clean up any running tasks to prevent memory leaks
+                        if let Some(_task) = self.context_server_tasks.remove(server_id) {
+                            log::debug!("Cleaned up task for context server {}", server_id.0);
+                            // Task will be dropped and cancelled automatically
                         }
                     }
                     _ => {}

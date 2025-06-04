@@ -9,6 +9,7 @@ pub struct ToolMetrics {
 }
 
 impl ToolMetrics {
+    #[allow(dead_code)]
     pub fn insert(&mut self, tool_name: Arc<str>, succeeded: bool) {
         *self.use_counts.entry(tool_name.clone()).or_insert(0) += 1;
         if !succeeded {
@@ -16,6 +17,7 @@ impl ToolMetrics {
         }
     }
 
+    #[allow(dead_code)]
     pub fn merge(&mut self, other: &ToolMetrics) {
         for (tool_name, use_count) in &other.use_counts {
             *self.use_counts.entry(tool_name.clone()).or_insert(0) += use_count;
@@ -25,6 +27,7 @@ impl ToolMetrics {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.use_counts.is_empty() && self.failure_counts.is_empty()
     }

@@ -4,13 +4,13 @@ version = "0.1.0"
 publish.workspace = true
 edition.workspace = true
 license = "GPL-3.0-or-later"
-default-run = "eval"
+default-run = "zed-agent"
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "eval"
+name = "zed-agent"
 path = "src/eval.rs"
 
 [[bin]]

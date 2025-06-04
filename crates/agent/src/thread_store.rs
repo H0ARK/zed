@@ -67,6 +67,7 @@ pub struct ThreadStore {
     prompt_builder: Arc<PromptBuilder>,
     prompt_store: Option<Entity<PromptStore>>,
     context_server_tool_ids: HashMap<ContextServerId, Vec<ToolId>>,
+    context_server_tasks: HashMap<ContextServerId, Task<()>>,
     threads: Vec<SerializedThreadMetadata>,
     project_context: SharedProjectContext,
     reload_system_prompt_tx: mpsc::Sender<()>,
@@ -158,6 +159,7 @@ impl ThreadStore {
             prompt_builder,
             prompt_store,
             context_server_tool_ids: HashMap::default(),
+            context_server_tasks: HashMap::default(),
             threads: Vec::new(),
             project_context: SharedProjectContext::default(),
             reload_system_prompt_tx,
@@ -583,11 +585,17 @@ impl ThreadStore {
             project::context_server_store::Event::ServerStatusChanged { server_id, status } => {
                 match status {
                     ContextServerStatus::Running => {
+                        // Check if we already have tools registered for this server to prevent duplicates
+                        if self.context_server_tool_ids.contains_key(server_id) {
+                            log::debug!("Context server {} already has tools registered, skipping", server_id.0);
+                            return;
+                        }
+
                         if let Some(server) =
                             context_server_store.read(cx).get_running_server(server_id)
                         {
                             let context_server_manager = context_server_store.clone();
-                            cx.spawn({
+                            let task = cx.spawn({
                                 let server = server.clone();
                                 let server_id = server_id.clone();
                                 async move |this, cx| {
@@ -621,25 +629,36 @@ impl ThreadStore {
 
                                             if let Some(tool_ids) = tool_ids {
                                                 this.update(cx, |this, cx| {
-                                                    this.context_server_tool_ids
-                                                        .insert(server_id, tool_ids);
-                                                    this.load_default_profile(cx);
+                                                    // Use entry API to avoid double lookup and ensure atomicity
+                                                    if let std::collections::hash_map::Entry::Vacant(e) = this.context_server_tool_ids.entry(server_id) {
+                                                        e.insert(tool_ids);
+                                                        this.load_default_profile(cx);
+                                                    }
                                                 })
                                                 .log_err();
                                             }
                                         }
                                     }
                                 }
-                            })
-                            .detach();
+                            });
+                            // Store the task to manage its lifecycle properly and prevent memory leaks
+                            self.context_server_tasks.insert(server_id.clone(), task);
                         }
                     }
                     ContextServerStatus::Stopped | ContextServerStatus::Error(_) => {
+                        // Clean up tools
                         if let Some(tool_ids) = self.context_server_tool_ids.remove(server_id) {
+                            log::info!("Cleaning up {} tools for context server {}", tool_ids.len(), server_id.0);
                             tool_working_set.update(cx, |tool_working_set, _| {
                                 tool_working_set.remove(&tool_ids);
                             });
                             self.load_default_profile(cx);
+                        }
+                        
+                        // Clean up any running tasks to prevent memory leaks
+                        if let Some(_task) = self.context_server_tasks.remove(server_id) {
+                            log::debug!("Cleaned up task for context server {}", server_id.0);
+                            // Task will be dropped and cancelled automatically
                         }
                     }
                     _ => {}

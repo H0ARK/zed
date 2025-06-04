@@ -776,6 +776,8 @@ impl ImageContext {
     }
 }
 
+
+
 #[derive(Debug, Clone, Default)]
 pub struct ContextLoadResult {
     pub loaded_context: LoadedContext,
@@ -979,6 +981,8 @@ pub fn load_context(
             text.push_str("</user_rules>\n");
         }
 
+
+
         text.push_str("</context>\n");
 
         ContextLoadResult {
@@ -1088,6 +1092,7 @@ impl PartialEq for AgentContextKey {
                     return context.eq_for_key(other_context);
                 }
             }
+
         }
         false
     }

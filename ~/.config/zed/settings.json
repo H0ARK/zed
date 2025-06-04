@@ -1,0 +1,13 @@
+{
+  "agent": {
+    "default_model": {
+      "provider": "ollama",
+      "model": "llama3.2:3b"
+    }
+  },
+  "language_models": {
+    "anthropic": {
+      "api_key": "YOUR_ANTHROPIC_API_KEY_HERE"
+    }
+  }
+}

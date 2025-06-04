@@ -300,6 +300,110 @@ pub async fn handle_cli_connection(
                 let status = if open_workspace_result.is_err() { 1 } else { 0 };
                 responses.send(CliResponse::Exit { status }).log_err();
             }
+            CliRequest::Agent { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Agent CLI features are not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::CopilotAuth => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Copilot auth CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::ListSessions => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "List sessions CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::RemoveSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Remove session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::SessionStats => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Session stats CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::CreateSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Create session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::JoinSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Join session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::SetActiveSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Set active session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::CloneSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Clone session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::SendMessageToSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Send message to session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::ExportSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Export session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::ImportSession { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Import session CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
+            CliRequest::SessionInfo { .. } => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: "Session info CLI not yet implemented".to_string(),
+                    })
+                    .log_err();
+                responses.send(CliResponse::Exit { status: 1 }).log_err();
+            }
         }
     }
 }

@@ -96,6 +96,33 @@ struct Args {
     ))]
     #[arg(long)]
     uninstall: bool,
+    /// Start Zed in agent mode for interactive AI assistance
+    #[arg(long)]
+    agent: bool,
+    /// Message to send to the agent (required when using --agent)
+    #[arg(long, requires = "agent")]
+    message: Option<String>,
+    /// Provider to use for the agent (e.g., anthropic, openai)
+    #[arg(long)]
+    provider: Option<String>,
+    /// Model to use for the agent (e.g., claude-3-sonnet, gpt-4)
+    #[arg(long)]
+    model: Option<String>,
+    /// Session name/ID for the agent (creates new session if doesn't exist)
+    #[arg(long)]
+    session: Option<String>,
+    /// List all active agent sessions
+    #[arg(long, conflicts_with_all = ["agent", "copilot_auth"])]
+    list_sessions: bool,
+    /// Remove/delete an agent session
+    #[arg(long, value_name = "SESSION_ID", conflicts_with_all = ["agent", "copilot_auth"])]
+    remove_session: Option<String>,
+    /// Show session statistics
+    #[arg(long, conflicts_with_all = ["agent", "copilot_auth"])]
+    session_stats: bool,
+    /// Authenticate with GitHub Copilot
+    #[arg(long)]
+    copilot_auth: bool,
 }
 
 fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
@@ -223,7 +250,9 @@ fn main() -> Result<()> {
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        Some(std::env::vars().collect::<HashMap<_, _>>())
+        {
+            Some(std::env::vars().collect::<HashMap<_, _>>())
+        }
     };
 
     let exit_status = Arc::new(Mutex::new(None));
@@ -267,14 +296,54 @@ fn main() -> Result<()> {
             let (_, handshake) = server.accept().context("Handshake after Zed spawn")?;
             let (tx, rx) = (handshake.requests, handshake.responses);
 
-            tx.send(CliRequest::Open {
-                paths,
-                urls,
-                wait: args.wait,
-                open_new_workspace,
-                env,
-                user_data_dir: user_data_dir_for_thread,
-            })?;
+            if args.copilot_auth && !args.agent {
+                tx.send(CliRequest::CopilotAuth)?;
+            } else if args.list_sessions {
+                tx.send(CliRequest::ListSessions)?;
+            } else if let Some(session_id) = args.remove_session {
+                tx.send(CliRequest::RemoveSession { session_id })?;
+            } else if args.session_stats {
+                tx.send(CliRequest::SessionStats)?;
+            } else if args.agent {
+                let message = args.message.unwrap_or_else(|| {
+                    if !paths.is_empty() {
+                        format!("Please help me with the files: {}", paths.join(", "))
+                    } else {
+                        "Hello, I need assistance.".to_string()
+                    }
+                });
+
+                let working_directory = if !paths.is_empty() {
+                    // Use the parent directory of the first path
+                    std::path::Path::new(&paths[0])
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_string())
+                } else {
+                    // Use current working directory
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                };
+
+                tx.send(CliRequest::Agent {
+                    message,
+                    working_directory,
+                    provider: args.provider.clone(),
+                    model: args.model.clone(),
+                    copilot_auth: args.copilot_auth,
+                    session: args.session.clone(),
+                })?;
+            } else {
+                tx.send(CliRequest::Open {
+                    paths,
+                    urls,
+                    wait: args.wait,
+                    open_new_workspace,
+                    env,
+                    user_data_dir: user_data_dir_for_thread,
+                })?;
+            }
 
             while let Ok(response) = rx.recv() {
                 match response {
@@ -285,6 +354,14 @@ fn main() -> Result<()> {
                         exit_status.lock().replace(status);
                         return Ok(());
                     }
+                    CliResponse::SessionCreated { .. } => {}
+                    CliResponse::SessionJoined { .. } => {}
+                    CliResponse::SessionActivated { .. } => {}
+                    CliResponse::SessionCloned { .. } => {}
+                    CliResponse::MessageSent { .. } => {}
+                    CliResponse::SessionExported { .. } => {}
+                    CliResponse::SessionImported { .. } => {}
+                    CliResponse::SessionDetails { .. } => {} // Added to fix non-exhaustive match
                 }
             }
 

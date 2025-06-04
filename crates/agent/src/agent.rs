@@ -1,8 +1,11 @@
 mod active_thread;
 mod agent_configuration;
 mod agent_diff;
+// mod agent_first_panel; // Removed incomplete implementation
+mod agent_management_panel;
 mod agent_model_selector;
 mod agent_panel;
+mod agent_session_panel;
 mod buffer_codegen;
 mod context;
 mod context_picker;
@@ -16,8 +19,12 @@ mod inline_assistant;
 mod inline_prompt_editor;
 mod message_editor;
 mod profile_selector;
+mod session;
+
+mod session_manager_ui;
 mod slash_command_settings;
 mod terminal_codegen;
+mod vertical_session_list;
 mod terminal_inline_assistant;
 mod thread;
 mod thread_history;
@@ -28,6 +35,7 @@ mod ui;
 
 use std::sync::Arc;
 
+use crate::slash_command_settings::SlashCommandSettings;
 use agent_settings::{AgentProfileId, AgentSettings, LanguageModelSelection};
 use assistant_slash_command::SlashCommandRegistry;
 use client::Client;
@@ -44,11 +52,21 @@ use thread::ThreadId;
 
 pub use crate::active_thread::ActiveThread;
 use crate::agent_configuration::{AddContextServerModal, ManageProfilesModal};
+pub use crate::agent_management_panel::AgentManagementPanel;
 pub use crate::agent_panel::{AgentPanel, ConcreteAssistantPanelDelegate};
+pub use crate::agent_session_panel::AgentSessionPanel;
 pub use crate::context::{ContextLoadResult, LoadedContext};
 pub use crate::inline_assistant::InlineAssistant;
-use crate::slash_command_settings::SlashCommandSettings;
+pub use crate::message_editor::{MessageEditor, MessageEditorEvent};
+pub use crate::session::{
+    AgentSession, AgentSessionManager, CoordinationEntry, CoordinationType, OrchestratorConfig,
+    OrchestratorEvent, SessionConfig, SessionId, SessionManagerEvent, SessionManagerStats,
+    SessionOrchestrator, SessionStatus,
+};
+
+pub use crate::session_manager_ui::{SessionManagerUI, SessionTab};
 pub use crate::thread::{Message, MessageSegment, Thread, ThreadEvent};
+pub use crate::vertical_session_list::{VerticalSessionList, SessionListItem, SessionListEvent};
 pub use crate::thread_store::{SerializedThread, TextThreadStore, ThreadStore};
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use context_store::ContextStore;
@@ -137,6 +155,8 @@ pub fn init(
     assistant_slash_command::init(cx);
     thread_store::init(cx);
     agent_panel::init(cx);
+    crate::agent_management_panel::init(cx);
+    crate::agent_session_panel::init(cx);
     context_server_configuration::init(language_registry, cx);
 
     register_slash_commands(cx);

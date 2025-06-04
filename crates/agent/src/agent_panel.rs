@@ -24,7 +24,7 @@ use fs::Fs;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Corner, DismissEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
-    KeyContext, Pixels, Subscription, Task, UpdateGlobal, WeakEntity, linear_color_stop,
+    KeyContext, Pixels, Subscription, Task, UpdateGlobal, WeakEntity, actions, linear_color_stop,
     linear_gradient, prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
@@ -64,12 +64,16 @@ use crate::thread_history::{HistoryEntryElement, ThreadHistory};
 use crate::thread_store::ThreadStore;
 use crate::ui::AgentOnboardingModal;
 use crate::{
-    AddContextServer, AgentDiffPane, ContextStore, ContinueThread, ContinueWithBurnMode,
-    DeleteRecentlyOpenThread, ExpandMessageEditor, Follow, InlineAssistant, NewTextThread,
-    NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell,
-    ResetTrialUpsell, TextThreadStore, ThreadEvent, ToggleBurnMode, ToggleContextPicker,
-    ToggleNavigationMenu, ToggleOptionsMenu,
+    AddContextServer, AgentDiffPane, AgentSessionManager, ContextStore, ContinueThread,
+    ContinueWithBurnMode, DeleteRecentlyOpenThread, ExpandMessageEditor, Follow, InlineAssistant,
+    NewTextThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory,
+    ResetTrialEndUpsell, ResetTrialUpsell, TextThreadStore, ThreadEvent, ToggleBurnMode,
+    ToggleContextPicker, ToggleNavigationMenu, ToggleOptionsMenu,
 };
+
+
+
+actions!(agent_panel, [ToggleSessionList]);
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
 
@@ -162,6 +166,11 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
                     TrialEndUpsell::set_dismissed(false, cx);
+                })
+                .register_action(|workspace, _: &ToggleSessionList, _window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| panel.toggle_session_list(cx));
+                    }
                 });
         },
     )
@@ -372,6 +381,10 @@ pub struct AgentPanel {
     zoomed: bool,
     pending_serialization: Option<Task<Result<()>>>,
     hide_upsell: bool,
+    orchestrator_mode: bool,
+    session_list: Option<Entity<crate::vertical_session_list::VerticalSessionList>>,
+    show_session_list: bool,
+    session_list_width: Option<Pixels>,
 }
 
 impl AgentPanel {
@@ -699,6 +712,34 @@ impl AgentPanel {
             },
         );
 
+        // Initialize session manager
+        let session_manager = if let Some(global_manager) = AgentSessionManager::global(cx) {
+            global_manager
+        } else {
+            let new_manager =
+                cx.new(|cx| AgentSessionManager::new(thread_store.clone(), project.clone(), cx));
+            AgentSessionManager::set_global(new_manager.clone(), cx);
+            new_manager
+        };
+
+        let _session_manager_ui = cx.new(|cx| {
+            crate::session_manager_ui::SessionManagerUI::new(
+                session_manager.clone(),
+                thread_store.clone(),
+                cx,
+            )
+        });
+
+        // Create the vertical session list
+        let session_list = cx.new(|cx| {
+            crate::vertical_session_list::VerticalSessionList::new(
+                workspace.clone(),
+                thread_store.clone(),
+                project.clone(),
+                cx,
+            )
+        });
+
         Self {
             active_view,
             workspace,
@@ -736,6 +777,10 @@ impl AgentPanel {
             zoomed: false,
             pending_serialization: None,
             hide_upsell: false,
+            orchestrator_mode: false,
+            session_list: Some(session_list),
+            show_session_list: false, // Start with session list hidden by default
+            session_list_width: Some(px(300.0)),
         }
     }
 
@@ -1357,6 +1402,33 @@ impl AgentPanel {
             .update(cx, |this, cx| this.delete_local_context(path, cx))
     }
 
+    pub fn set_orchestrator_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.orchestrator_mode = enabled;
+        if let Some(session_list) = &self.session_list {
+            session_list.update(cx, |list, cx| {
+                if enabled != list.is_orchestrator_mode() {
+                    list.toggle_orchestrator_mode(cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn is_orchestrator_mode(&self) -> bool {
+        self.orchestrator_mode
+    }
+
+    pub fn toggle_session_list(&mut self, cx: &mut Context<Self>) {
+        self.show_session_list = !self.show_session_list;
+        cx.notify();
+    }
+
+    pub fn is_session_list_visible(&self) -> bool {
+        self.show_session_list
+    }
+
+
+
     fn set_active_view(
         &mut self,
         new_view: ActiveView,
@@ -1646,13 +1718,17 @@ impl AgentPanel {
             .into_any()
     }
 
-    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_session_toggle_button(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+
+    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_thread = self.thread.read(cx);
         let user_store = self.user_store.read(cx);
         let thread = active_thread.thread().read(cx);
         let thread_id = thread.id().clone();
         let is_empty = active_thread.is_empty();
-        let editor_empty = self.message_editor.read(cx).is_editor_fully_empty(cx);
+        let _editor_empty = self.message_editor.read(cx).is_editor_fully_empty(cx);
         let last_usage = active_thread.thread().read(cx).last_usage().or_else(|| {
             maybe!({
                 let amount = user_store.model_request_usage_amount()?;
@@ -1675,7 +1751,7 @@ impl AgentPanel {
         let account_url = zed_urls::account_url(cx);
 
         let show_token_count = match &self.active_view {
-            ActiveView::Thread { .. } => !is_empty || !editor_empty,
+            ActiveView::Thread { .. } => true, // Always show token count for threads
             ActiveView::TextThread { .. } => true,
             _ => false,
         };
@@ -1891,6 +1967,7 @@ impl AgentPanel {
                                         );
                                     }),
                             )
+                            .child(self.render_session_toggle_button(cx))
                             .child(agent_extra_menu),
                     ),
             )
@@ -1900,7 +1977,7 @@ impl AgentPanel {
         let is_generating = thread.is_generating();
         let message_editor = self.message_editor.read(cx);
 
-        let conversation_token_usage = thread.total_token_usage()?;
+        let conversation_token_usage = thread.total_token_usage().unwrap_or_default();
 
         let (total_token_usage, is_estimating) = if let Some((editing_message_id, unsent_tokens)) =
             self.thread.read(cx).editing_message_id()
@@ -1921,10 +1998,7 @@ impl AgentPanel {
 
         match &self.active_view {
             ActiveView::Thread { .. } => {
-                if total_token_usage.total == 0 {
-                    return None;
-                }
-
+                // Always show token count, even when 0 - this provides persistent visibility
                 let token_color = match total_token_usage.ratio() {
                     TokenUsageRatio::Normal if is_estimating => Color::Default,
                     TokenUsageRatio::Normal => Color::Muted,
@@ -1993,9 +2067,20 @@ impl AgentPanel {
                 Some(token_count)
             }
             ActiveView::TextThread { context_editor, .. } => {
-                let element = render_remaining_tokens(context_editor, cx)?;
-
-                Some(element.into_any_element())
+                if let Some(element) = render_remaining_tokens(context_editor, cx) {
+                    Some(element.into_any_element())
+                } else {
+                    // Show a default token count even when render_remaining_tokens returns None
+                    Some(
+                        h_flex()
+                            .id("token-count")
+                            .gap_0p5()
+                            .child(Label::new("0").size(LabelSize::Small).color(Color::Muted))
+                            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                            .child(Label::new("∞").size(LabelSize::Small).color(Color::Muted))
+                            .into_any_element(),
+                    )
+                }
             }
             _ => None,
         }
@@ -3109,6 +3194,9 @@ impl Render for AgentPanel {
                 this.continue_conversation(window, cx);
             }))
             .on_action(cx.listener(Self::toggle_burn_mode))
+            .on_action(cx.listener(|this, _: &ToggleSessionList, _window, cx| {
+                this.toggle_session_list(cx);
+            }))
             .child(self.render_toolbar(window, cx))
             .children(self.render_upsell(window, cx))
             .children(self.render_trial_end_upsell(window, cx))
@@ -3134,14 +3222,39 @@ impl Render for AgentPanel {
                 ActiveView::Configuration => parent.children(self.configuration.clone()),
             });
 
+        let final_content = if self.show_session_list {
+            // Show session list on the left, main content on the right
+            h_flex()
+                .size_full()
+                .when_some(self.session_list.as_ref(), |flex, session_list| {
+                    flex.child(
+                        div()
+                            .w(self.session_list_width.unwrap_or(px(300.0)))
+                            .h_full()
+                            .border_r_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(session_list.clone())
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .child(content)
+                )
+                .into_any_element()
+        } else {
+            content.into_any_element()
+        };
+
         match self.active_view.which_font_size_used() {
             WhichFontSize::AgentFont => {
                 WithRemSize::new(ThemeSettings::get_global(cx).agent_font_size(cx))
                     .size_full()
-                    .child(content)
+                    .child(final_content)
                     .into_any()
             }
-            _ => content.into_any(),
+            _ => final_content.into_any(),
         }
     }
 }
