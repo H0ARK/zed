@@ -11,11 +11,131 @@ export class TokenCounter {
   }
 
   /**
+   * Calculate token count for the actual request string that gets sent to the agent
+   * This is the most accurate method as it counts tokens on the full JSON structure
+   * @param {string} requestString - The serialized JSON request string
+   * @returns {number} Estimated token count
+   */
+  calculateTokensForRequestString(requestString) {
+    if (!requestString || typeof requestString !== 'string') {
+      return 0;
+    }
+    
+    // Count tokens on the actual request string that gets sent to the API
+    return Math.ceil(requestString.length * this.averageTokensPerChar);
+  }
+
+  /**
+   * Calculate token count for a simulated Anthropic API request structure
+   * This method constructs what the actual API request would look like
+   * @param {Array} messages - Array of message objects
+   * @param {Object} options - Additional request options (system, tools, etc.)
+   * @returns {number} Estimated token count
+   */
+  calculateTokensForApiRequest(messages, options = {}) {
+    if (!Array.isArray(messages)) {
+      return 0;
+    }
+
+    // Construct a request structure similar to what gets sent to Anthropic
+    const apiRequest = {
+      model: options.model || "claude-3-5-sonnet-latest",
+      max_tokens: options.max_tokens || 8192,
+      messages: this.convertToApiMessages(messages),
+      ...(options.system && { system: options.system }),
+      ...(options.tools && options.tools.length > 0 && { tools: options.tools }),
+      ...(options.tool_choice && { tool_choice: options.tool_choice }),
+      ...(options.temperature && { temperature: options.temperature }),
+    };
+
+    // Serialize the request and count tokens on the actual JSON
+    const requestString = JSON.stringify(apiRequest);
+    return this.calculateTokensForRequestString(requestString);
+  }
+
+  /**
+   * Convert messages to Anthropic API format
+   * @param {Array} messages - Array of message objects
+   * @returns {Array} Messages in Anthropic API format
+   */
+  convertToApiMessages(messages) {
+    return messages.map(message => {
+      const apiMessage = {
+        role: message.role || 'user',
+        content: []
+      };
+
+      if (typeof message.content === 'string') {
+        apiMessage.content.push({
+          type: 'text',
+          text: message.content
+        });
+      } else if (Array.isArray(message.content)) {
+        // Handle multi-part content (text + images, tool use, etc.)
+        apiMessage.content = message.content.map(part => {
+          if (typeof part === 'string') {
+            return { type: 'text', text: part };
+          } else if (part.type === 'text') {
+            return { type: 'text', text: part.text || part.content || '' };
+          } else if (part.type === 'image') {
+            return {
+              type: 'image',
+              source: part.source || { type: 'base64', media_type: 'image/png', data: part.data || '' }
+            };
+          } else if (part.type === 'tool_use') {
+            return {
+              type: 'tool_use',
+              id: part.id || '',
+              name: part.name || '',
+              input: part.input || {}
+            };
+          } else if (part.type === 'tool_result') {
+            return {
+              type: 'tool_result',
+              tool_use_id: part.tool_use_id || '',
+              content: part.content || '',
+              is_error: part.is_error || false
+            };
+          }
+          return part;
+        });
+      } else if (message.content && typeof message.content === 'object') {
+        // Handle single content object
+        if (message.content.type === 'text') {
+          apiMessage.content.push({
+            type: 'text',
+            text: message.content.text || message.content.content || ''
+          });
+        } else {
+          apiMessage.content.push(message.content);
+        }
+      }
+
+      return apiMessage;
+    });
+  }
+
+  /**
    * Calculate token count for a list of messages
+   * @param {Array} messages - Array of message objects
+   * @param {Object} options - Additional request options (system, tools, etc.)
+   * @returns {number} Estimated token count
+   */
+  calculateTokenCount(messages, options = {}) {
+    if (!Array.isArray(messages)) {
+      return 0;
+    }
+
+    // Use the new accurate method that accounts for full API request structure
+    return this.calculateTokensForApiRequest(messages, options);
+  }
+
+  /**
+   * Legacy method: Calculate token count using simple content-based estimation
    * @param {Array} messages - Array of message objects
    * @returns {number} Estimated token count
    */
-  calculateTokenCount(messages) {
+  calculateTokenCountLegacy(messages) {
     if (!Array.isArray(messages)) {
       return 0;
     }
