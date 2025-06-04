@@ -139,14 +139,8 @@ impl AgentManagementPanel {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        // Create new session manager
-        let session_manager = Some(cx.new(|cx| {
-            AgentSessionManager::new(
-                thread_store.clone(),
-                project,
-                cx,
-            )
-        }));
+        // Use global session manager instead of creating a new one
+        let session_manager = AgentSessionManager::global(cx);
 
         let session_orchestrator = session_manager.as_ref().map(|manager| {
             cx.new(|cx| {

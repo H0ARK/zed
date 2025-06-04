@@ -387,7 +387,9 @@ fn main() -> Result<()> {
                     CliResponse::MessageSent { .. } => {}
                     CliResponse::SessionExported { .. } => {}
                     CliResponse::SessionImported { .. } => {}
-                    CliResponse::SessionDetails { .. } => {} // Added to fix non-exhaustive match
+                    CliResponse::SessionDetails { .. } => {}
+                    CliResponse::AgentResponse { .. } => {}
+                    CliResponse::AgentProgress { .. } => {}
                 }
             }
 
@@ -1280,6 +1282,14 @@ fn handle_agent_chat(prompt: String, context: Vec<String>, wait: bool, app: &imp
                         *exit_status.lock() = Some(status);
                         break;
                     }
+                    CliResponse::SessionCreated { .. } => {}
+                    CliResponse::SessionJoined { .. } => {}
+                    CliResponse::SessionActivated { .. } => {}
+                    CliResponse::SessionCloned { .. } => {}
+                    CliResponse::MessageSent { .. } => {}
+                    CliResponse::SessionExported { .. } => {}
+                    CliResponse::SessionImported { .. } => {}
+                    CliResponse::SessionDetails { .. } => {}
                 }
             }
             Ok(())

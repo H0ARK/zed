@@ -46,6 +46,7 @@ pub struct SessionOrchestrator {
     active_coordination_task: Option<Task<Result<()>>>,
     coordination_history: Vec<CoordinationEntry>,
     session_communication_channels: HashMap<SessionId, Vec<String>>,
+    _session_manager_subscription: gpui::Subscription,
 }
 
 #[derive(Debug, Clone)]
@@ -76,20 +77,18 @@ impl SessionOrchestrator {
         config: OrchestratorConfig,
         cx: &mut Context<Self>,
     ) -> Self {
-        let orchestrator = Self {
+        // Subscribe to session manager events - store subscription to prevent memory leak
+        let session_manager_subscription = cx.subscribe(&session_manager, Self::handle_session_manager_event);
+
+        Self {
             session_manager: session_manager.clone(),
             thread_store,
             config,
             active_coordination_task: None,
             coordination_history: Vec::new(),
             session_communication_channels: HashMap::new(),
-        };
-
-        // Subscribe to session manager events
-        cx.subscribe(&session_manager, Self::handle_session_manager_event)
-            .detach();
-
-        orchestrator
+            _session_manager_subscription: session_manager_subscription,
+        }
     }
 
     pub fn session_count(&self, cx: &App) -> usize {

@@ -4384,7 +4384,7 @@ fn main() {{
         init_test_settings(cx);
 
         let project = create_test_project(cx, json!({})).await;
-        let (_, _thread_store, thread, _context_store, model) =
+        let (_, _thread_store, thread, _context_store, _model) =
             setup_test_environment(cx, project.clone()).await;
 
         // Test token estimation accuracy

@@ -712,15 +712,13 @@ impl AgentPanel {
             },
         );
 
-        // Initialize session manager
-        let session_manager = if let Some(global_manager) = AgentSessionManager::global(cx) {
-            global_manager
-        } else {
+        // Initialize session manager - use global singleton to prevent multiple instances
+        let session_manager = AgentSessionManager::global(cx).unwrap_or_else(|| {
             let new_manager =
                 cx.new(|cx| AgentSessionManager::new(thread_store.clone(), project.clone(), cx));
             AgentSessionManager::set_global(new_manager.clone(), cx);
             new_manager
-        };
+        });
 
         let _session_manager_ui = cx.new(|cx| {
             crate::session_manager_ui::SessionManagerUI::new(

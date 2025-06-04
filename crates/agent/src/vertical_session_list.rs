@@ -76,14 +76,8 @@ impl VerticalSessionList {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         
-        // Create session manager
-        let session_manager = Some(cx.new(|cx| {
-            AgentSessionManager::new(
-                thread_store.clone(),
-                project,
-                cx,
-            )
-        }));
+        // Use global session manager instead of creating a new one
+        let session_manager = AgentSessionManager::global(cx);
 
         let session_orchestrator = session_manager.as_ref().map(|manager| {
             cx.new(|cx| {
@@ -147,44 +141,53 @@ impl VerticalSessionList {
     }
 
     fn update_sessions(&mut self, cx: &mut Context<Self>) {
-        self.sessions.clear();
-
         if let Some(manager) = &self.session_manager {
             let session_ids = manager.read(cx).list_sessions();
             let active_session = manager.read(cx).active_session_id();
 
-            for session_id in session_ids {
-                if let Some(session) = manager.read(cx).get_session(&session_id) {
-                    let session_data = session.read(cx);
-                    let is_orchestrator = self.orchestrator_mode && session_id != *self.main_session_id.as_ref().unwrap_or(&session_id);
-                    
-                    let item = SessionListItem {
-                        id: session_id.clone(),
-                        name: session_data.name().to_string(),
-                        status: session_data.status().clone(),
-                        created_at: session_data.metadata.created_at,
-                        last_active: session_data.metadata.last_active,
-                        message_count: session_data.metadata.message_count,
-                        is_active: active_session == Some(&session_id),
-                        is_orchestrator,
-                        thread_preview: None, // TODO: Implement thread preview
-                    };
-                    self.sessions.push(item);
+            // Only update if session count changed to prevent unnecessary rebuilds
+            if self.sessions.len() != session_ids.len() {
+                self.sessions.clear();
+
+                for session_id in session_ids {
+                    if let Some(session) = manager.read(cx).get_session(&session_id) {
+                        let session_data = session.read(cx);
+                        let is_orchestrator = self.orchestrator_mode && session_id != *self.main_session_id.as_ref().unwrap_or(&session_id);
+                        
+                        let item = SessionListItem {
+                            id: session_id.clone(),
+                            name: session_data.name().to_string(),
+                            status: session_data.status().clone(),
+                            created_at: session_data.metadata.created_at,
+                            last_active: session_data.metadata.last_active,
+                            message_count: session_data.metadata.message_count,
+                            is_active: active_session == Some(&session_id),
+                            is_orchestrator,
+                            thread_preview: None, // TODO: Implement thread preview
+                        };
+                        self.sessions.push(item);
+                    }
                 }
+
+                // Ensure main session is always first
+                if let Some(main_id) = &self.main_session_id {
+                    if let Some(main_index) = self.sessions.iter().position(|s| &s.id == main_id) {
+                        if main_index != 0 {
+                            let main_session = self.sessions.remove(main_index);
+                            self.sessions.insert(0, main_session);
+                        }
+                    }
+                }
+
+                cx.notify();
+            } else {
+                // Just update active status without rebuilding entire list
+                for session_item in &mut self.sessions {
+                    session_item.is_active = active_session == Some(&session_item.id);
+                }
+                cx.notify();
             }
         }
-
-        // Ensure main session is always first
-        if let Some(main_id) = &self.main_session_id {
-            if let Some(main_index) = self.sessions.iter().position(|s| &s.id == main_id) {
-                if main_index != 0 {
-                    let main_session = self.sessions.remove(main_index);
-                    self.sessions.insert(0, main_session);
-                }
-            }
-        }
-
-        cx.notify();
     }
 
     #[allow(dead_code)]
