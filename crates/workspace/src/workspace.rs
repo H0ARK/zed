@@ -18,6 +18,8 @@ mod theme_preview;
 mod toast_layer;
 mod toolbar;
 mod workspace_settings;
+#[cfg(test)]
+mod hub_terminal_panel_tests;
 
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
 
