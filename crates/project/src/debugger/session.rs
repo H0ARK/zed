@@ -29,6 +29,7 @@ use dap::{
     StartDebuggingRequestArgumentsRequest,
 };
 use futures::SinkExt;
+use futures::channel::mpsc::UnboundedSender;
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, future::Shared};
 use gpui::{
@@ -49,6 +50,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
+use task::TaskContext;
 use text::{PointUtf16, ToPointUtf16};
 use util::ResultExt;
 use worktree::Worktree;
@@ -137,6 +139,8 @@ pub struct RunningMode {
     worktree: WeakEntity<Worktree>,
     executor: BackgroundExecutor,
     is_started: bool,
+    has_ever_stopped: bool,
+    messages_tx: UnboundedSender<Message>,
 }
 
 fn client_source(abs_path: &Path) -> dap::Source {
@@ -161,33 +165,35 @@ impl RunningMode {
         worktree: WeakEntity<Worktree>,
         binary: DebugAdapterBinary,
         messages_tx: futures::channel::mpsc::UnboundedSender<Message>,
-        cx: AsyncApp,
+        cx: &mut AsyncApp,
     ) -> Result<Self> {
-        let message_handler = Box::new(move |message| {
-            messages_tx.unbounded_send(message).ok();
+        let message_handler = Box::new({
+            let messages_tx = messages_tx.clone();
+            move |message| {
+                messages_tx.unbounded_send(message).ok();
+            }
         });
 
-        let client = Arc::new(
-            if let Some(client) = parent_session
-                .and_then(|session| cx.update(|cx| session.read(cx).adapter_client()).ok())
-                .flatten()
-            {
-                client
-                    .reconnect(session_id, binary.clone(), message_handler, cx.clone())
-                    .await?
-            } else {
-                DebugAdapterClient::start(session_id, binary.clone(), message_handler, cx.clone())
-                    .await?
-            },
-        );
+        let client = if let Some(client) = parent_session
+            .and_then(|session| cx.update(|cx| session.read(cx).adapter_client()).ok())
+            .flatten()
+        {
+            client
+                .create_child_connection(session_id, binary.clone(), message_handler, cx)
+                .await?
+        } else {
+            DebugAdapterClient::start(session_id, binary.clone(), message_handler, cx).await?
+        };
 
         Ok(Self {
-            client,
+            client: Arc::new(client),
             worktree,
             tmp_breakpoint: None,
             binary,
             executor: cx.background_executor().clone(),
             is_started: false,
+            has_ever_stopped: false,
+            messages_tx,
         })
     }
 
@@ -478,6 +484,22 @@ impl RunningMode {
         })
     }
 
+    fn reconnect_for_ssh(&self, cx: &mut AsyncApp) -> Option<Task<Result<()>>> {
+        let client = self.client.clone();
+        let messages_tx = self.messages_tx.clone();
+        let message_handler = Box::new(move |message| {
+            messages_tx.unbounded_send(message).ok();
+        });
+        if client.should_reconnect_for_ssh() {
+            Some(cx.spawn(async move |cx| {
+                client.connect(message_handler, cx).await?;
+                anyhow::Ok(())
+            }))
+        } else {
+            None
+        }
+    }
+
     fn request<R: LocalDapCommand>(&self, request: R) -> Task<Result<R::Response>>
     where
         <R::DapRequest as dap::requests::Request>::Response: 'static,
@@ -506,6 +528,20 @@ impl Mode {
             Mode::Building => Task::ready(Err(anyhow!(
                 "no adapter running to send request: {request:?}"
             ))),
+        }
+    }
+
+    /// Did this debug session stop at least once?
+    pub(crate) fn has_ever_stopped(&self) -> bool {
+        match self {
+            Mode::Building => false,
+            Mode::Running(running_mode) => running_mode.has_ever_stopped,
+        }
+    }
+
+    fn stopped(&mut self) {
+        if let Mode::Running(running) = self {
+            running.has_ever_stopped = true;
         }
     }
 }
@@ -603,6 +639,7 @@ pub struct Session {
     ignore_breakpoints: bool,
     exception_breakpoints: BTreeMap<String, (ExceptionBreakpointsFilter, IsEnabled)>,
     background_tasks: Vec<Task<()>>,
+    task_context: TaskContext,
 }
 
 trait CacheableCommand: Any + Send + Sync {
@@ -717,6 +754,7 @@ impl Session {
         parent_session: Option<Entity<Session>>,
         label: SharedString,
         adapter: DebugAdapterName,
+        task_context: TaskContext,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new::<Self>(|cx| {
@@ -767,10 +805,15 @@ impl Session {
                 exception_breakpoints: Default::default(),
                 label,
                 adapter,
+                task_context,
             };
 
             this
         })
+    }
+
+    pub fn task_context(&self) -> &TaskContext {
+        &self.task_context
     }
 
     pub fn worktree(&self) -> Option<Entity<Worktree>> {
@@ -831,7 +874,7 @@ impl Session {
                 worktree.downgrade(),
                 binary.clone(),
                 message_tx,
-                cx.clone(),
+                cx,
             )
             .await?;
             this.update(cx, |this, cx| {
@@ -1107,35 +1150,58 @@ impl Session {
     pub(super) fn request_initialize(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let adapter_id = self.adapter().to_string();
         let request = Initialize { adapter_id };
-        match &self.mode {
-            Mode::Running(local_mode) => {
-                let capabilities = local_mode.request(request);
 
-                cx.spawn(async move |this, cx| {
-                    let capabilities = capabilities.await?;
-                    this.update(cx, |session, cx| {
-                        session.capabilities = capabilities;
-                        let filters = session
-                            .capabilities
-                            .exception_breakpoint_filters
-                            .clone()
-                            .unwrap_or_default();
-                        for filter in filters {
-                            let default = filter.default.unwrap_or_default();
-                            session
-                                .exception_breakpoints
-                                .entry(filter.filter.clone())
-                                .or_insert_with(|| (filter, default));
-                        }
-                        cx.emit(SessionEvent::CapabilitiesLoaded);
-                    })?;
-                    Ok(())
-                })
-            }
-            Mode::Building => Task::ready(Err(anyhow!(
+        let Mode::Running(running) = &self.mode else {
+            return Task::ready(Err(anyhow!(
                 "Cannot send initialize request, task still building"
-            ))),
-        }
+            )));
+        };
+        let mut response = running.request(request.clone());
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                let capabilities = response.await;
+                match capabilities {
+                    Err(e) => {
+                        let Ok(Some(reconnect)) = this.update(cx, |this, cx| {
+                            this.as_running()
+                                .and_then(|running| running.reconnect_for_ssh(&mut cx.to_async()))
+                        }) else {
+                            return Err(e);
+                        };
+                        log::info!("Failed to connect to debug adapter: {}, retrying...", e);
+                        reconnect.await?;
+
+                        let Ok(Some(r)) = this.update(cx, |this, _| {
+                            this.as_running()
+                                .map(|running| running.request(request.clone()))
+                        }) else {
+                            return Err(e);
+                        };
+                        response = r
+                    }
+                    Ok(capabilities) => {
+                        this.update(cx, |session, cx| {
+                            session.capabilities = capabilities;
+                            let filters = session
+                                .capabilities
+                                .exception_breakpoint_filters
+                                .clone()
+                                .unwrap_or_default();
+                            for filter in filters {
+                                let default = filter.default.unwrap_or_default();
+                                session
+                                    .exception_breakpoints
+                                    .entry(filter.filter.clone())
+                                    .or_insert_with(|| (filter, default));
+                            }
+                            cx.emit(SessionEvent::CapabilitiesLoaded);
+                        })?;
+                        return Ok(());
+                    }
+                }
+            }
+        })
     }
 
     pub(super) fn initialize_sequence(
@@ -1237,6 +1303,7 @@ impl Session {
     }
 
     fn handle_stopped_event(&mut self, event: StoppedEvent, cx: &mut Context<Self>) {
+        self.mode.stopped();
         // todo(debugger): Find a clean way to get around the clone
         let breakpoint_store = self.breakpoint_store.clone();
         if let Some((local, path)) = self.as_running_mut().and_then(|local| {
@@ -1256,7 +1323,6 @@ impl Session {
 
         if event.all_threads_stopped.unwrap_or_default() || event.thread_id.is_none() {
             self.thread_states.stop_all_threads();
-
             self.invalidate_command_type::<StackTraceCommand>();
         }
 
@@ -1831,6 +1897,9 @@ impl Session {
         }
     }
 
+    pub fn has_ever_stopped(&self) -> bool {
+        self.mode.has_ever_stopped()
+    }
     pub fn step_over(
         &mut self,
         thread_id: ThreadId,
@@ -2137,7 +2206,7 @@ impl Session {
                 move |this, response, cx| {
                     let response = response.log_err()?;
                     this.invalidate_command_type::<VariablesCommand>();
-                    cx.notify();
+                    cx.emit(SessionEvent::Variables);
                     Some(response)
                 },
                 cx,
@@ -2205,7 +2274,6 @@ impl Session {
                         this.push_output(event, cx);
                     }
                 };
-                this.invalidate_command_type::<ScopesCommand>();
                 cx.notify();
             })
             .ok();
