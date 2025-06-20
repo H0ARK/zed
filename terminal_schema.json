@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Hub Terminal State",
+  "description": "JSON schema representing the state of a terminal with command blocks",
+  "type": "object",
+  "properties": {
+    "terminal_id": {
+      "type": "integer",
+      "description": "Unique identifier for this terminal instance"
+    },
+    "working_directory": {
+      "type": "string",
+      "description": "Current working directory of the terminal"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["initializing", "ready", "busy", "error"],
+      "description": "Current terminal status"
+    },
+    "commands": {
+      "type": "array",
+      "description": "Array of commands executed in this terminal",
+      "items": {
+        "$ref": "#/definitions/command"
+      }
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO timestamp of last update"
+    }
+  },
+  "required": ["terminal_id", "status", "commands"],
+  "definitions": {
+    "command": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for this command"
+        },
+        "command": {
+          "type": "string",
+          "description": "The actual command that was executed"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["running", "success", "error", "cancelled"],
+          "description": "Current status of command execution"
+        },
+        "output": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Array of output lines from the command"
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "Exit code of the command (if completed)"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the command started executing"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the command finished executing"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "description": "Command execution time in milliseconds"
+        },
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "The shell prompt when command was executed"
+            },
+            "shell": {
+              "type": "string",
+              "description": "Shell type (bash, zsh, etc.)"
+            },
+            "environment": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Relevant environment variables"
+            }
+          }
+        }
+      },
+      "required": ["id", "command", "status", "output", "started_at"]
+    }
+  }
+}

@@ -3,10 +3,8 @@
 //! This module contains renderers that convert blocks and their content
 //! into visual elements using the GPUI framework.
 
-use crate::block::{Block, BlockContent, UiComponent};
-use anyhow::Result;
+use crate::block::{Block, UiComponent};
 use gpui::*;
-use hub_protocol::messages::*;
 
 /// Renderer for individual blocks
 pub struct BlockRenderer {

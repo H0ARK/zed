@@ -3,11 +3,7 @@
 //! This module implements the core block abstraction that represents
 //! interactive command sessions as first-class objects.
 
-use anyhow::Result;
-use hub_protocol::messages::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use gpui::{Entity, Context, App};
 
 /// A unique identifier for a block
 pub type BlockId = String;

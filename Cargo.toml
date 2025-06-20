@@ -72,8 +72,6 @@ members = [
     "crates/hub_ai",
     "crates/hub_blocks",
     "crates/hub_core",
-    "crates/hub_protocol",
-    "crates/hub_sdk",
     "crates/hub_terminal_engine",
     "crates/icons",
     "crates/image_viewer",

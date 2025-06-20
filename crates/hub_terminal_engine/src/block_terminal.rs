@@ -101,7 +101,7 @@ impl BlockTerminalView {
         hub_block: &HubBlock, 
         cx: &mut Context<Self>
     ) -> Result<Entity<BlockEntity>> {
-        let content = self.create_content_from_hub_block(hub_block)?;
+        let _content = self.create_content_from_hub_block(hub_block)?;
         
         let block = Block::new(
             hub_block.id.clone(),
@@ -119,9 +119,9 @@ impl BlockTerminalView {
     /// Update a Block entity from a HubBlock
     fn update_block_from_hub_block(
         &self,
-        block_entity: &Entity<BlockEntity>,
+        _block_entity: &Entity<BlockEntity>,
         hub_block: &HubBlock,
-        cx: &mut Context<Self>
+        _cx: &mut Context<Self>
     ) {
         // For now, we just log the update since we need to understand the update mechanism
         log::info!("Updating block {} with type {}", hub_block.id, hub_block.block_type);
@@ -163,7 +163,7 @@ impl BlockTerminalView {
 impl EventEmitter<()> for BlockTerminalView {}
 
 impl Render for BlockTerminalView {
-    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Update blocks from Hub state
         self.update_blocks(cx);
         
@@ -245,7 +245,7 @@ pub fn create_block_terminal_view(
     hub_terminal: Option<Entity<HubTerminal>>,
     cx: &mut App,
 ) -> Entity<BlockTerminalView> {
-    cx.new(|cx| {
+    cx.new(|_cx| {
         let mut view = BlockTerminalView::new(terminal);
         if let Some(hub_terminal) = hub_terminal {
             view.enable_hub(hub_terminal);

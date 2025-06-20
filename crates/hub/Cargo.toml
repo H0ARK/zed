@@ -29,19 +29,11 @@ terminal.workspace = true
 terminal_view.workspace = true
 project.workspace = true
 hub_core.workspace = true
-hub_protocol.workspace = true
 hub_blocks.workspace = true
 hub_terminal_engine.workspace = true
 workspace-hack.workspace = true
 chrono.workspace = true
 
-[[bin]]
-name = "simple_hub_server"
-path = "../../simple_hub_server.rs"
-
-[[bin]]
-name = "simple_hub_client"
-path = "../../simple_hub_client.rs"
 
 [features]
 test-support = ["gpui/test-support"]

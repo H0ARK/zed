@@ -3,534 +3,90 @@
 use gpui::{
     div, prelude::*, AnyElement, Context, Entity, EventEmitter, FocusHandle, Render, 
     Window, InteractiveElement, ParentElement, Styled, WeakEntity, Subscription, Timer,
-    MouseButton, MouseDownEvent, px, InputHandler, KeyDownEvent, ScrollWheelEvent,
-    UTF16Selection, Bounds, Pixels, Focusable, KeyContext, Point, actions,
 };
 use std::collections::HashMap;
 use theme::ActiveTheme;
 use ui::{h_flex, v_flex, ButtonStyle, ButtonCommon, Clickable, IconButton, IconName, Tooltip};
-use terminal::{Terminal, terminal_settings::TerminalSettings};
+use terminal::Terminal;
 use project::terminals::TerminalKind;
 use util::ResultExt;
 use anyhow::Result;
 use std::time::Duration;
-use settings::Settings;
-use crate::terminal_semantic_parser::TerminalSemanticParser;
 
-// Hub Terminal scroll actions
-actions!(hub_terminal, [HubScrollLineUp, HubScrollLineDown, HubScrollPageUp, HubScrollPageDown, HubScrollToTop, HubScrollToBottom]);
 
-/// Input handler for Hub Terminal Element
-struct HubTerminalInputHandler {
+/// Interactive terminal element that can receive focus and input
+pub struct InteractiveTerminalElement {
     terminal: Entity<Terminal>,
     _focus_handle: FocusHandle,
+    focused: bool,
 }
 
-impl InputHandler for HubTerminalInputHandler {
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _: &mut Window,
-        _cx: &mut gpui::App,
-    ) -> Option<UTF16Selection> {
-        // Simple implementation for Hub terminal
-        Some(UTF16Selection {
-            range: 0..0,
-            reversed: false,
-        })
-    }
-
-    fn marked_text_range(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut gpui::App,
-    ) -> Option<std::ops::Range<usize>> {
-        None // Hub terminal doesn't support marked text for now
-    }
-
-    fn text_for_range(
-        &mut self,
-        _: std::ops::Range<usize>,
-        _: &mut Option<std::ops::Range<usize>>,
-        _: &mut Window,
-        _: &mut gpui::App,
-    ) -> Option<String> {
-        None
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        _replacement_range: Option<std::ops::Range<usize>>,
-        text: &str,
-        _window: &mut Window,
-        cx: &mut gpui::App,
-    ) {
-        // Send the input text directly to the terminal
-        if !text.is_empty() {
-            self.terminal.update(cx, |terminal, _| {
-                terminal.input(text.to_string().into_bytes());
-            });
-        }
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        _range_utf16: Option<std::ops::Range<usize>>,
-        new_text: &str,
-        _new_marked_range: Option<std::ops::Range<usize>>,
-        _window: &mut Window,
-        cx: &mut gpui::App,
-    ) {
-        // For Hub terminal, just treat this as regular text input
-        if !new_text.is_empty() {
-            self.terminal.update(cx, |terminal, _| {
-                terminal.input(new_text.to_string().into_bytes());
-            });
-        }
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut gpui::App) {
-        // No-op for Hub terminal
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _range_utf16: std::ops::Range<usize>,
-        _window: &mut Window,
-        _cx: &mut gpui::App,
-    ) -> Option<Bounds<Pixels>> {
-        None // Hub terminal doesn't support detailed text bounds for now
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut gpui::App,
-    ) -> Option<usize> {
-        None // Hub terminal doesn't support character indexing for now
-    }
-}
-
-/// Hub-enhanced terminal element that renders actual terminal content
-pub struct HubTerminalElement {
-    terminal: Entity<Terminal>,
-    focus_handle: FocusHandle,
-    scroll_offset: usize, // Lines scrolled back from bottom (0 = at bottom)
-}
-
-impl HubTerminalElement {
-    pub fn new(terminal: Entity<Terminal>, focus_handle: FocusHandle) -> Self {
+impl InteractiveTerminalElement {
+    pub fn new(terminal: Entity<Terminal>, focus_handle: FocusHandle, focused: bool) -> Self {
         Self {
             terminal,
-            focus_handle,
-            scroll_offset: 0, // Start at bottom (latest content)
-        }
-    }
-    
-    /// Convert terminal ANSI colors to GPUI colors (similar to terminal_element.rs)
-    fn convert_terminal_color(&self, color: &terminal::alacritty_terminal::vte::ansi::Color, cx: &Context<Self>) -> gpui::Hsla {
-        use terminal::alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
-        
-        let theme = cx.theme();
-        let colors = theme.colors();
-        
-        match color {
-            AnsiColor::Named(n) => match n {
-                NamedColor::Black => colors.terminal_ansi_black,
-                NamedColor::Red => colors.terminal_ansi_red,
-                NamedColor::Green => colors.terminal_ansi_green,
-                NamedColor::Yellow => colors.terminal_ansi_yellow,
-                NamedColor::Blue => colors.terminal_ansi_blue,
-                NamedColor::Magenta => colors.terminal_ansi_magenta,
-                NamedColor::Cyan => colors.terminal_ansi_cyan,
-                NamedColor::White => colors.terminal_ansi_white,
-                NamedColor::BrightBlack => colors.terminal_ansi_bright_black,
-                NamedColor::BrightRed => colors.terminal_ansi_bright_red,
-                NamedColor::BrightGreen => colors.terminal_ansi_bright_green,
-                NamedColor::BrightYellow => colors.terminal_ansi_bright_yellow,
-                NamedColor::BrightBlue => colors.terminal_ansi_bright_blue,
-                NamedColor::BrightMagenta => colors.terminal_ansi_bright_magenta,
-                NamedColor::BrightCyan => colors.terminal_ansi_bright_cyan,
-                NamedColor::BrightWhite => colors.terminal_ansi_bright_white,
-                NamedColor::Foreground => colors.terminal_foreground,
-                NamedColor::Background => colors.terminal_ansi_background,
-                NamedColor::Cursor => theme.players().local().cursor,
-                NamedColor::DimBlack => colors.terminal_ansi_dim_black,
-                NamedColor::DimRed => colors.terminal_ansi_dim_red,
-                NamedColor::DimGreen => colors.terminal_ansi_dim_green,
-                NamedColor::DimYellow => colors.terminal_ansi_dim_yellow,
-                NamedColor::DimBlue => colors.terminal_ansi_dim_blue,
-                NamedColor::DimMagenta => colors.terminal_ansi_dim_magenta,
-                NamedColor::DimCyan => colors.terminal_ansi_dim_cyan,
-                NamedColor::DimWhite => colors.terminal_ansi_dim_white,
-                NamedColor::BrightForeground => colors.terminal_bright_foreground,
-                NamedColor::DimForeground => colors.terminal_dim_foreground,
-            },
-            AnsiColor::Spec(rgb) => {
-                terminal::rgba_color(rgb.r, rgb.g, rgb.b)
-            },
-            AnsiColor::Indexed(i) => {
-                terminal::get_color_at_index(*i as usize, theme)
-            },
-        }
-    }
-    
-    /// Get the maximum scroll offset (how far back we can scroll)
-    fn max_scroll_offset(&self, cx: &gpui::App) -> usize {
-        let terminal = self.terminal.read(cx);
-        let total_lines = terminal.total_lines();
-        let viewport_lines = terminal.viewport_lines();
-        
-        // Can scroll back up to total_lines - viewport_lines
-        total_lines.saturating_sub(viewport_lines)
-    }
-    
-    /// Scroll handling methods
-    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let terminal = self.terminal.read(cx);
-        let line_height = terminal.last_content().terminal_bounds.line_height;
-        
-        // Convert pixel delta to lines
-        let lines_delta = (event.delta.pixel_delta(line_height).y / line_height).round() as i32;
-        
-        // Positive delta = scroll up (increase offset), negative = scroll down (decrease offset)
-        let new_offset = if lines_delta > 0 {
-            (self.scroll_offset + lines_delta as usize).min(self.max_scroll_offset(cx))
-        } else {
-            self.scroll_offset.saturating_sub((-lines_delta) as usize)
-        };
-        
-        if new_offset != self.scroll_offset {
-            self.scroll_offset = new_offset;
-            cx.notify();
-        }
-    }
-    
-    fn scroll_line_up(&mut self, _: &HubScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
-        let max_offset = self.max_scroll_offset(cx);
-        if self.scroll_offset < max_offset {
-            self.scroll_offset += 1;
-            cx.notify();
-        }
-    }
-    
-    fn scroll_line_down(&mut self, _: &HubScrollLineDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.scroll_offset > 0 {
-            self.scroll_offset -= 1;
-            cx.notify();
-        }
-    }
-    
-    fn scroll_page_up(&mut self, _: &HubScrollPageUp, _: &mut Window, cx: &mut Context<Self>) {
-        let terminal = self.terminal.read(cx);
-        let viewport_lines = terminal.viewport_lines();
-        let max_offset = self.max_scroll_offset(cx);
-        
-        // Scroll up by one page (viewport_lines)
-        self.scroll_offset = (self.scroll_offset + viewport_lines).min(max_offset);
-        cx.notify();
-    }
-    
-    fn scroll_page_down(&mut self, _: &HubScrollPageDown, _: &mut Window, cx: &mut Context<Self>) {
-        let terminal = self.terminal.read(cx);
-        let viewport_lines = terminal.viewport_lines();
-        
-        // Scroll down by one page (viewport_lines)
-        self.scroll_offset = self.scroll_offset.saturating_sub(viewport_lines);
-        cx.notify();
-    }
-    
-    fn scroll_to_top(&mut self, _: &HubScrollToTop, _: &mut Window, cx: &mut Context<Self>) {
-        let max_offset = self.max_scroll_offset(cx);
-        if self.scroll_offset != max_offset {
-            self.scroll_offset = max_offset;
-            cx.notify();
-        }
-    }
-    
-    fn scroll_to_bottom(&mut self, _: &HubScrollToBottom, _: &mut Window, cx: &mut Context<Self>) {
-        if self.scroll_offset != 0 {
-            self.scroll_offset = 0;
-            cx.notify();
+            _focus_handle: focus_handle,
+            focused,
         }
     }
 }
 
-impl EventEmitter<()> for HubTerminalElement {}
+impl EventEmitter<()> for InteractiveTerminalElement {}
 
-impl Focusable for HubTerminalElement {
-    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl HubTerminalElement {
-    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Handle scroll actions first
-        match event.keystroke.key.as_str() {
-            "pageup" => {
-                self.scroll_page_up(&HubScrollPageUp, window, cx);
-                return;
-            }
-            "pagedown" => {
-                self.scroll_page_down(&HubScrollPageDown, window, cx);
-                return;
-            }
-            "up" if event.keystroke.modifiers.shift => {
-                self.scroll_line_up(&HubScrollLineUp, window, cx);
-                return;
-            }
-            "down" if event.keystroke.modifiers.shift => {
-                self.scroll_line_down(&HubScrollLineDown, window, cx);
-                return;
-            }
-            "home" if event.keystroke.modifiers.platform || event.keystroke.modifiers.control => {
-                self.scroll_to_top(&HubScrollToTop, window, cx);
-                return;
-            }
-            "end" if event.keystroke.modifiers.platform || event.keystroke.modifiers.control => {
-                self.scroll_to_bottom(&HubScrollToBottom, window, cx);
-                return;
-            }
-            _ => {}
-        }
-        
-        // If not handled as scroll action, pass to terminal
-        self.terminal.update(cx, |term, terminal_cx| {
-            let handled = term.try_keystroke(
-                &event.keystroke,
-                TerminalSettings::get_global(terminal_cx).option_as_meta,
-            );
-            if handled {
-                terminal_cx.stop_propagation();
-            }
-        });
-    }
-
-    fn dispatch_context(&self, cx: &gpui::App) -> KeyContext {
-        let mut dispatch_context = KeyContext::new_with_defaults();
-        dispatch_context.add("Terminal");
-        
-        // Add terminal-specific context based on current mode
-        let terminal = self.terminal.read(cx);
-        let mode = terminal.last_content().mode;
-        
-        if terminal.vi_mode_enabled() {
-            dispatch_context.add("vi_mode");
-        }
-        
-        // Add other terminal mode contexts as needed
-        dispatch_context.set(
-            "screen",
-            if mode.contains(terminal::alacritty_terminal::term::TermMode::ALT_SCREEN) {
-                "alt"
-            } else {
-                "normal"
-            },
-        );
-        
-        dispatch_context
-    }
-}
-
-impl Render for HubTerminalElement {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Render for InteractiveTerminalElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let terminal = self.terminal.read(cx);
         let content = terminal.last_content();
         
-        // Apply scroll offset to display_offset for scrolling
-        let original_display_offset = content.display_offset;
-        let scrolled_display_offset = original_display_offset + self.scroll_offset;
-        let focused = self.focus_handle.is_focused(window);
-        
-        // Create the input handler for proper keyboard input
-        let input_handler = HubTerminalInputHandler {
-            terminal: self.terminal.clone(),
-            _focus_handle: self.focus_handle.clone(),
-        };
-        
-        // Get terminal settings for proper font rendering
-        let terminal_settings = terminal::terminal_settings::TerminalSettings::get_global(cx);
-        let theme_settings = theme::ThemeSettings::get_global(cx);
-        
-        // Calculate proper font settings like TerminalElement does
-        let font_family = terminal_settings
-            .font_family
-            .as_ref()
-            .unwrap_or(&theme_settings.buffer_font.family)
-            .clone();
-        
-        let font_size = terminal_settings
-            .font_size
-            .map_or(theme_settings.buffer_font_size(cx), |size| theme::adjusted_font_size(size, cx));
-        
-        let line_height = terminal_settings.line_height.value();
-        
-        // Create a proper terminal renderer with correct input handling
         div()
-            .id("hub-terminal")
             .flex()
             .flex_col()
             .size_full()
             .bg(cx.theme().colors().terminal_background)
-            .font_family(font_family.clone())
-            .text_size(font_size)
-            .line_height(line_height)
-            .track_focus(&self.focus_handle)
-            .key_context(self.dispatch_context(cx))
-            .when(focused, |div| {
+            .p_4()
+            .child(
+                div()
+                    .text_color(cx.theme().colors().text)
+                    .child(format!("Terminal - Bounds: {}x{}", 
+                        content.terminal_bounds.bounds.size.width.0 as u32,
+                        content.terminal_bounds.bounds.size.height.0 as u32
+                    ))
+            )
+            .child(
+                div()
+                    .text_color(cx.theme().colors().text_muted)
+                    .text_size(gpui::rems(0.8))
+                    .child("🖱️ Click here and type commands - Hub blocks will appear above")
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .text_color(cx.theme().colors().text_accent)
+                    .text_size(gpui::rems(0.75))
+                    .child("💡 Hub Terminal: Enhanced command line interface")
+            )
+            .when(self.focused, |div| {
                 div.border_2().border_color(cx.theme().colors().border_focused)
             })
-            .when(!focused, |div| {
+            .when(!self.focused, |div| {
                 div.border_1().border_color(cx.theme().colors().border)
             })
-            .on_key_down(cx.listener(Self::key_down))
-            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, _event: &MouseDownEvent, window, cx| {
-                    window.focus(&_this.focus_handle);
-                    cx.stop_propagation();
-                }),
-            )
-            .child({
-                // Get font metrics for proper cell sizing
-                let text_system = cx.text_system();
-                let font_id = text_system.resolve_font(&gpui::Font {
-                    family: font_family.clone(),
-                    features: terminal_settings.font_features.clone().unwrap_or_default(),
-                    weight: terminal_settings.font_weight.unwrap_or_default(),
-                    style: gpui::FontStyle::Normal,
-                    fallbacks: terminal_settings.font_fallbacks.clone(),
-                });
-                let font_size_px = font_size;
-                let cell_width = text_system.advance(font_id, font_size_px, 'm')
-                    .unwrap_or_default().width;
-                let line_height_px = font_size_px.0 * line_height.to_pixels(window.rem_size()).0;
-                let viewport_lines = terminal.viewport_lines();
-                
-                let element = div()
-                    .size_full()
-                    .relative()
-                    .child({
-                        // Render terminal content properly
-                        div()
-                            .absolute()
-                            .size_full()
-                            .children({
-                                // Filter cells based on scroll offset and render each cell individually
-                                content.cells.iter().filter_map(|indexed_cell| {
-                                    let cell_line = indexed_cell.point.line.0 as usize;
-                                    
-                                    // Calculate which lines should be visible based on scroll offset
-                                    let scroll_start_line = scrolled_display_offset;
-                                    let scroll_end_line = scroll_start_line + viewport_lines;
-                                    
-                                    // Only render cells that are within the scrolled viewport
-                                    if cell_line >= scroll_start_line && cell_line < scroll_end_line {
-                                        // Adjust the cell's display position relative to the viewport
-                                        let adjusted_line = cell_line - scroll_start_line;
-                                        Some((indexed_cell, adjusted_line))
-                                    } else {
-                                        None
-                                    }
-                                }).map(|(indexed_cell, adjusted_line)| {
-                                    let cell = &indexed_cell.cell;
-                                    let point = &indexed_cell.point;
-                                    
-                                    // Calculate proper position using adjusted line
-                                    let x = point.column.0 as f32 * cell_width.0;
-                                    let y = adjusted_line as f32 * line_height_px;
-                                    
-                                    // Convert colors using terminal color conversion
-                                    let fg_color = self.convert_terminal_color(&indexed_cell.fg, cx);
-                                    let bg_color = if matches!(indexed_cell.bg, terminal::alacritty_terminal::vte::ansi::Color::Named(terminal::alacritty_terminal::vte::ansi::NamedColor::Background)) {
-                                        None // Use default background
-                                    } else {
-                                        Some(self.convert_terminal_color(&indexed_cell.bg, cx))
-                                    };
-                                    
-                                    // Skip blank cells for performance
-                                    if cell.c == ' ' && bg_color.is_none() {
-                                        return div(); // Empty div for blank cells
-                                    }
-                                    
-                                    let mut cell_div = div()
-                                        .absolute()
-                                        .left(px(x))
-                                        .top(px(y))
-                                        .w(px(cell_width.0))
-                                        .h(px(line_height_px))
-                                        .text_color(fg_color)
-                                        .font_family(font_family.clone())
-                                        .text_size(font_size)
-                                        .line_height(line_height);
-                                    
-                                    // Add background color if needed
-                                    if let Some(bg) = bg_color {
-                                        cell_div = cell_div.bg(bg);
-                                    }
-                                    
-                                    // Add character content
-                                    cell_div.child(cell.c.to_string())
-                                })
-                            })
-                    })
-                    .child({
-                        // Render cursor properly positioned with scroll offset
-                        if focused {
-                            let cursor_line = content.cursor.point.line.0 as usize;
-                            let scroll_start_line = scrolled_display_offset;
-                            let scroll_end_line = scroll_start_line + viewport_lines;
-                            
-                            // Only show cursor if it's in the visible area
-                            if cursor_line >= scroll_start_line && cursor_line < scroll_end_line {
-                                let adjusted_cursor_line = cursor_line - scroll_start_line;
-                                let cursor_x = content.cursor.point.column.0 as f32 * cell_width.0;
-                                let cursor_y = adjusted_cursor_line as f32 * line_height_px;
-                                
-                                div()
-                                    .absolute()
-                                    .left(px(cursor_x))
-                                    .top(px(cursor_y))
-                                    .w(px(cell_width.0))
-                                    .h(px(line_height_px))
-                                    .bg(cx.theme().colors().terminal_foreground)
-                                    .opacity(0.7)
-                            } else {
-                                div() // Cursor is off-screen due to scrolling
-                            }
-                        } else {
-                            div() // Empty div when not focused
-                        }
-                    });
-                
-                // Register the input handler when focused
-                if focused {
-                    window.handle_input(&self.focus_handle, input_handler, cx);
-                }
-                
-                element
-            })
-            .when(self.scroll_offset > 0, |div_el| {
-                // Show scroll indicator when scrolled up
-                div_el.child(
-                    div()
-                        .absolute()
-                        .top(px(8.0))
-                        .right(px(8.0))
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().colors().surface_background.opacity(0.9))
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded(px(4.0))
-                        .text_color(cx.theme().colors().text_muted)
-                        .text_size(gpui::rems(0.75))
-                        .child(format!("↑ {}", self.scroll_offset))
-                )
-            })
+    }
+}
+
+// Helper function to convert key strings to bytes for terminal input
+#[allow(dead_code)]
+fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
+    match key {
+        "enter" => Some(b"\r".to_vec()),
+        "backspace" => Some(b"\x7f".to_vec()),
+        "tab" => Some(b"\t".to_vec()),
+        "escape" => Some(b"\x1b".to_vec()),
+        key if key.len() == 1 => {
+            let char = key.chars().next()?;
+            Some(char.to_string().into_bytes())
+        }
+        _ => None,
     }
 }
 
@@ -597,8 +153,6 @@ pub struct HubTerminalView {
     command_input: HubCommandInput,
     command_blocks: Vec<HubCommandBlock>,
     next_block_id: usize,
-    // New: Semantic parser for real command detection
-    semantic_parser: TerminalSemanticParser,
 }
 
 impl HubTerminalView {
@@ -611,9 +165,7 @@ impl HubTerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![
-            cx.observe(&terminal, |this, _, cx| {
-                // Process terminal updates with semantic parser
-                this.process_terminal_updates(cx);
+            cx.observe(&terminal, |_, _, cx| {
                 cx.notify();
             })
         ];
@@ -630,11 +182,10 @@ impl HubTerminalView {
             command_input,
             command_blocks: Vec::new(),
             next_block_id: 1,
-            semantic_parser: TerminalSemanticParser::new(terminal_id as u32),
         };
         
-        // Start processing real terminal content
-        view.process_terminal_updates(cx);
+        // Generate demo commands immediately
+        view.generate_demo_commands(cx);
         view
     }
     
@@ -646,7 +197,7 @@ impl HubTerminalView {
     ) -> Self {
         let command_input = HubCommandInput::new(cx);
         
-        let view = Self { 
+        let mut view = Self { 
             terminal: None, 
             terminal_id,
             _hub_enabled: true,
@@ -656,10 +207,10 @@ impl HubTerminalView {
             command_input,
             command_blocks: Vec::new(),
             next_block_id: 1,
-            semantic_parser: TerminalSemanticParser::new(terminal_id as u32),
         };
         
-        // Deferred terminals will start processing when terminal is set
+        // Generate demo commands immediately for deferred terminals too
+        view.generate_demo_commands(cx);
         view
     }
     
@@ -743,109 +294,6 @@ impl HubTerminalView {
         }
     }
     
-    /// Process terminal updates using semantic parser to detect real commands
-    fn process_terminal_updates(&mut self, cx: &mut Context<Self>) {
-        if let Some(terminal) = &self.terminal {
-            // Process current terminal state with error handling
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.semantic_parser.process_terminal_update(terminal, cx)
-            })) {
-                Ok(Some(json_update)) => {
-                    self.update_command_blocks_from_json(&json_update);
-                    cx.notify();
-                }
-                Ok(None) => {
-                    // No update available, this is normal
-                }
-                Err(panic_info) => {
-                    eprintln!("Semantic parser panicked: {:?}", panic_info);
-                    
-                    // Create error block to inform user of parser crash
-                    let error_block = HubCommandBlock {
-                        command: "🔥 Parser Crash".to_string(),
-                        output: vec![
-                            "Semantic parser encountered a critical error".to_string(),
-                            "Terminal command detection may be impaired".to_string(),
-                            "Consider restarting the terminal".to_string(),
-                        ],
-                        status: CommandStatus::Error,
-                        _block_id: "parser_crash".to_string(),
-                    };
-                    
-                    if !self.command_blocks.iter().any(|block| block._block_id == "parser_crash") {
-                        self.command_blocks.push(error_block);
-                        cx.notify();
-                    }
-                    
-                    // Reset parser to try to recover
-                    self.semantic_parser = TerminalSemanticParser::new(self.terminal_id as u32);
-                }
-            }
-        }
-    }
-    
-    /// Convert JSON terminal state to command blocks for UI rendering
-    fn update_command_blocks_from_json(&mut self, json_state: &str) {
-        match crate::terminal_state::TerminalState::from_json(json_state) {
-            Ok(terminal_state) => {
-                // Clear existing blocks
-                self.command_blocks.clear();
-                
-                // Convert each command in JSON state to a command block
-                for command in terminal_state.commands {
-                    let mut block = HubCommandBlock::new(command.command.clone(), command.id.clone());
-                    
-                    // Set status based on command state
-                    match command.status {
-                        crate::terminal_state::CommandStatus::Running => {
-                            block.set_status(CommandStatus::Running);
-                        }
-                        crate::terminal_state::CommandStatus::Success => {
-                            block.set_status(CommandStatus::Success);
-                        }
-                        crate::terminal_state::CommandStatus::Error => {
-                            block.set_status(CommandStatus::Error);
-                        }
-                        crate::terminal_state::CommandStatus::Cancelled => {
-                            block.set_status(CommandStatus::Error);
-                        }
-                    }
-                    
-                    // Add output lines
-                    for output_line in command.output {
-                        block.add_output(output_line);
-                    }
-                    
-                    self.command_blocks.push(block);
-                }
-            }
-            Err(e) => {
-                // Enhanced error handling with detailed diagnostics
-                eprintln!("JSON parsing error in HubTerminalView::update_command_blocks_from_json");
-                eprintln!("Error: {}", e);
-                eprintln!("JSON content (first 500 chars): {}", 
-                    &json_state.chars().take(500).collect::<String>());
-                
-                // Create an error command block to show the user what happened
-                let error_block = HubCommandBlock {
-                    command: "⚠️ Parser Error".to_string(),
-                    output: vec![
-                        "Failed to parse terminal state".to_string(),
-                        format!("Error: {}", e),
-                        "This is likely a temporary parsing issue.".to_string(),
-                    ],
-                    status: CommandStatus::Error,
-                    _block_id: "parser_error".to_string(),
-                };
-                
-                // Only add error block if we don't already have one
-                if !self.command_blocks.iter().any(|block| block._block_id == "parser_error") {
-                    self.command_blocks.push(error_block);
-                }
-            }
-        }
-    }
-    
     fn generate_demo_commands(&mut self, cx: &mut Context<Self>) {
         // Auto-execute a few commands since stdin is not available
         if self.command_blocks.is_empty() {
@@ -914,7 +362,6 @@ impl HubTerminalView {
         }
     }
     
-    #[allow(dead_code)]
     fn auto_execute_command(&mut self, command: String, cx: &mut Context<Self>) {
         // Send real command to terminal and create command block for real output
         if let Some(terminal) = &self.terminal {
@@ -1333,7 +780,7 @@ impl Render for HubTerminalView {
         // Ensure terminal is created
         self.ensure_terminal_created(window, cx);
         
-        let _focused = self._focus_handle.is_focused(window);
+        let focused = self._focus_handle.is_focused(window);
         
         // Render the terminal with Hub block capabilities
         div()
@@ -1349,9 +796,10 @@ impl Render for HubTerminalView {
                     .bg(cx.theme().colors().terminal_background)
                     .when_some(self.terminal.clone(), |div, terminal| {
                         div.child(
-                            cx.new(|_cx| HubTerminalElement::new(
+                            cx.new(|_cx| InteractiveTerminalElement::new(
                                 terminal,
-                                self._focus_handle.clone()
+                                self._focus_handle.clone(),
+                                focused
                             ))
                         )
                     })

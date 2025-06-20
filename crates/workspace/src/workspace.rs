@@ -1,6 +1,9 @@
 pub mod dock;
 pub mod history_manager;
 mod hub_terminal_panel;
+mod terminal_state;
+mod hub_block_types;
+mod terminal_semantic_parser;
 pub mod item;
 mod modal_layer;
 pub mod notifications;
@@ -1166,7 +1169,7 @@ impl Workspace {
         cx.emit(Event::WorkspaceCreated(weak_handle.clone()));
         let modal_layer = cx.new(|_| ModalLayer::new());
         let toast_layer = cx.new(|_| ToastLayer::new());
-        let hub_terminal_panel = cx.new(|cx| HubTerminalPanel::new(cx));
+        let hub_terminal_panel = cx.new(|cx| HubTerminalPanel::new(weak_handle.clone(), cx));
         cx.subscribe(
             &modal_layer,
             |_, _, _: &modal_layer::ModalOpenedEvent, cx| {

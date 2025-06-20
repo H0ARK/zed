@@ -3,7 +3,7 @@
 //! This module handles user interactions with blocks, including clicks,
 //! selections, form submissions, and other interactive elements.
 
-use crate::block::{Block, BlockId, BlockInteraction};
+use crate::block::BlockId;
 use anyhow::Result;
 use gpui::*;
 use serde::{Deserialize, Serialize};
@@ -78,7 +78,7 @@ impl InteractionManager {
         // For now, we'll use a simple default handler
         let response = InteractionResponse {
             success: true,
-            message: Some(format!("Processed {} interaction", format!("{:?}", event.interaction_type))),
+            message: Some(format!("Processed {:?} interaction", event.interaction_type)),
             updates: Vec::new(),
             new_components: Vec::new(),
         };

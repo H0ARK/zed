@@ -9,7 +9,6 @@ pub mod renderers;
 pub mod interactions;
 
 use gpui::App;
-use anyhow::Result;
 
 pub use block::*;
 pub use block_manager::*;

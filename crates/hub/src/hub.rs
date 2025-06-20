@@ -10,14 +10,12 @@ use gpui::{App, Context, EventEmitter, IntoElement, ParentElement, Render};
 use anyhow::Result;
 
 pub use hub_core::*;
-pub use hub_protocol::*;
 pub use hub_blocks::*;
 pub use hub_terminal_engine::*;
 
 /// Initialize The Hub platform
 pub fn init(cx: &mut App) -> Result<()> {
     hub_core::init(cx);
-    hub_protocol::init(cx);
     hub_blocks::init(cx);
     hub_terminal_engine::init(cx)?;
     

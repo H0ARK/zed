@@ -24,7 +24,6 @@ serde_derive.workspace = true
 schemars.workspace = true
 tokio.workspace = true
 hub_core.workspace = true
-hub_protocol.workspace = true
 hub_blocks.workspace = true
 log.workspace = true
 uuid.workspace = true

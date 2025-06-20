@@ -1,0 +1,46 @@
+{
+  "terminal_id": 1,
+  "working_directory": "/Users/conrad/Documents/github/zed",
+  "status": "ready",
+  "commands": [
+    {
+      "id": "cmd_1_1",
+      "command": "ls",
+      "status": "success",
+      "output": [
+        "README.md",
+        "src/",
+        "Cargo.toml",
+        "target/"
+      ],
+      "exit_code": 0,
+      "started_at": "1703097600",
+      "completed_at": "1703097601",
+      "duration_ms": 1000,
+      "metadata": {
+        "prompt": "conrad@macbook:~/Documents/github/zed$",
+        "shell": "zsh"
+      }
+    },
+    {
+      "id": "cmd_1_2", 
+      "command": "git status",
+      "status": "running",
+      "output": [
+        "On branch main",
+        "Your branch is up to date with 'origin/main'.",
+        "",
+        "Changes not staged for commit:"
+      ],
+      "exit_code": null,
+      "started_at": "1703097602",
+      "completed_at": null,
+      "duration_ms": null,
+      "metadata": {
+        "prompt": "conrad@macbook:~/Documents/github/zed$",
+        "shell": "zsh"
+      }
+    }
+  ],
+  "last_updated": "1703097602"
+}

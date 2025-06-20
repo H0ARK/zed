@@ -23,7 +23,6 @@ language_model.workspace = true
 anthropic.workspace = true
 open_ai.workspace = true
 hub_core.workspace = true
-hub_protocol.workspace = true
 gpui.workspace = true
 workspace-hack.workspace = true
 

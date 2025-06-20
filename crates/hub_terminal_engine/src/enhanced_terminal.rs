@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::Result;
-use gpui::{App, Context, Entity, EventEmitter, WeakEntity};
+use gpui::{Entity, EventEmitter};
 use terminal::Terminal;
 use hub_protocol::{MessageEnvelope, MessageType, HubClient, HubClientBuilder};
 
@@ -144,7 +144,7 @@ impl HubTerminal {
                     );
                     
                     // Send message asynchronously
-                    if let Ok(mut client) = client.lock() {
+                    if let Ok(_client) = client.lock() {
                         // TODO: Send message asynchronously
                         log::info!("Would send Hub message: {:?}", message);
                     }

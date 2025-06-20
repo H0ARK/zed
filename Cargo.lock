@@ -7754,7 +7754,6 @@ dependencies = [
  "gpui",
  "hub_blocks",
  "hub_core",
- "hub_protocol",
  "hub_terminal_engine",
  "project",
  "schemars",
@@ -7779,7 +7778,6 @@ dependencies = [
  "futures 0.3.31",
  "gpui",
  "hub_core",
- "hub_protocol",
  "language_model",
  "open_ai",
  "schemars",
@@ -7797,7 +7795,6 @@ dependencies = [
  "futures 0.3.31",
  "gpui",
  "hub_core",
- "hub_protocol",
  "schemars",
  "serde",
  "serde_derive",
@@ -7826,44 +7823,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hub_protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "dirs 4.0.0",
- "futures 0.3.31",
- "gpui",
- "hub_core",
- "schemars",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 2.0.12",
- "tokio",
- "uuid",
- "workspace-hack",
-]
-
-[[package]]
-name = "hub_sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hub_core",
- "hub_protocol",
- "schemars",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 2.0.12",
- "tokio",
- "workspace-hack",
-]
-
-[[package]]
 name = "hub_terminal_engine"
 version = "0.1.0"
 dependencies = [
@@ -7873,7 +7832,6 @@ dependencies = [
  "gpui",
  "hub_blocks",
  "hub_core",
- "hub_protocol",
  "log",
  "schemars",
  "serde",
@@ -19520,6 +19478,7 @@ dependencies = [
  "async-recursion 1.1.1",
  "bincode",
  "call",
+ "chrono",
  "client",
  "clock",
  "collections",
@@ -19538,6 +19497,7 @@ dependencies = [
  "parking_lot",
  "postage",
  "project",
+ "regex",
  "remote",
  "schemars",
  "serde",
@@ -19550,6 +19510,7 @@ dependencies = [
  "task",
  "telemetry",
  "tempfile",
+ "terminal",
  "theme",
  "ui",
  "util",
@@ -20137,7 +20098,6 @@ dependencies = [
  "gpui",
  "gpui_tokio",
  "http_client",
- "hub_protocol",
  "hub_terminal_engine",
  "image_viewer",
  "indoc",

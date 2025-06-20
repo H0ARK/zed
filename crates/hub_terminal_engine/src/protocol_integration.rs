@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use gpui::{App, Context, Entity, WeakEntity};
+use gpui::{Entity, WeakEntity};
 use terminal::Terminal;
 
 use crate::enhanced_terminal::{HubTerminal, HubBlock};
-use hub_protocol::{MessageEnvelope, HubServer};
+use hub_protocol::HubServer;
 
 /// Manager for Hub-enhanced terminals
 pub struct HubTerminalManager {
