@@ -68,6 +68,13 @@ members = [
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/http_client_tls",
+    "crates/hub",
+    "crates/hub_ai",
+    "crates/hub_blocks",
+    "crates/hub_core",
+    "crates/hub_protocol",
+    "crates/hub_sdk",
+    "crates/hub_terminal_engine",
     "crates/icons",
     "crates/image_viewer",
     "crates/indexed_docs",
@@ -277,6 +284,13 @@ gpui_tokio = { path = "crates/gpui_tokio" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
+hub = { path = "crates/hub" }
+hub_ai = { path = "crates/hub_ai" }
+hub_blocks = { path = "crates/hub_blocks" }
+hub_core = { path = "crates/hub_core" }
+hub_protocol = { path = "crates/hub_protocol" }
+hub_sdk = { path = "crates/hub_sdk" }
+hub_terminal_engine = { path = "crates/hub_terminal_engine" }
 icons = { path = "crates/icons" }
 image_viewer = { path = "crates/image_viewer" }
 indexed_docs = { path = "crates/indexed_docs" }

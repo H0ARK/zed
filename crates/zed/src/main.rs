@@ -596,6 +596,14 @@ Error: Running Zed as root or via sudo is unsupported.
         zeta::init(cx);
         inspector_ui::init(app_state.clone(), cx);
 
+        // Auto-start The Hub server and terminal engine
+        hub_terminal_engine::init(cx).log_err();
+        cx.background_executor()
+            .spawn(async {
+                start_hub_server_process().await.log_err();
+            })
+            .detach();
+
         cx.observe_global::<SettingsStore>({
             let fs = fs.clone();
             let languages = app_state.languages.clone();
@@ -1307,4 +1315,53 @@ fn dump_all_gpui_actions() {
         serde_json::to_string_pretty(&actions).unwrap().as_bytes(),
     )
     .unwrap();
+}
+
+/// Auto-start The Hub server as a separate process when Zed launches
+async fn start_hub_server_process() -> Result<()> {
+    use std::process::Command;
+    use std::path::Path;
+    
+    // Check if hub server binary exists
+    let server_path = Path::new("hub-server/target/debug/hub-server-daemon");
+    if !server_path.exists() {
+        log::warn!("🔍 Hub server binary not found, attempting to build...");
+        
+        // Try to build the Hub server
+        let output = Command::new("cargo")
+            .args(&["build", "--manifest-path", "hub-server/Cargo.toml"])
+            .output();
+            
+        match output {
+            Ok(result) if result.status.success() => {
+                log::info!("✅ Hub server built successfully");
+            }
+            Ok(result) => {
+                log::error!("❌ Failed to build Hub server: {}", String::from_utf8_lossy(&result.stderr));
+                return Ok(()); // Don't fail Zed startup if Hub server can't be built
+            }
+            Err(e) => {
+                log::error!("❌ Failed to execute cargo build for Hub server: {}", e);
+                return Ok(()); // Don't fail Zed startup
+            }
+        }
+    }
+    
+    // Start the Hub server as a background process
+    match Command::new(server_path)
+        .spawn()
+    {
+        Ok(mut child) => {
+            log::info!("🚀 The Hub server started automatically (PID: {})", child.id());
+            
+            // Detach the child process so it continues running independently
+            let _ = child.wait();
+        }
+        Err(e) => {
+            log::error!("❌ Failed to start Hub server: {}", e);
+            // Don't fail Zed startup if Hub server can't start
+        }
+    }
+    
+    Ok(())
 }

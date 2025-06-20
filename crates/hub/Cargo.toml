@@ -1,0 +1,50 @@
+[package]
+name = "hub"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "The Hub: CLI App Platform"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/hub.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+settings.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+workspace.workspace = true
+terminal.workspace = true
+terminal_view.workspace = true
+project.workspace = true
+hub_core.workspace = true
+hub_protocol.workspace = true
+hub_blocks.workspace = true
+hub_terminal_engine.workspace = true
+workspace-hack.workspace = true
+chrono.workspace = true
+
+[[bin]]
+name = "simple_hub_server"
+path = "../../simple_hub_server.rs"
+
+[[bin]]
+name = "simple_hub_client"
+path = "../../simple_hub_client.rs"
+
+[features]
+test-support = ["gpui/test-support"]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

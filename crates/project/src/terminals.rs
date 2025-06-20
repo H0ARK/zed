@@ -2,6 +2,7 @@ use crate::{Project, ProjectPath};
 use anyhow::{Context as _, Result};
 use collections::HashMap;
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Task, WeakEntity};
+use hub_terminal_engine::HubTerminalExtension;
 use itertools::Itertools;
 use language::LanguageName;
 use settings::{Settings, SettingsLocation};
@@ -345,6 +346,18 @@ impl Project {
         )
         .map(|builder| {
             let terminal_handle = cx.new(|cx| builder.subscribe(cx));
+
+            // Enhance terminal with Hub capabilities
+            // Initialize Hub terminal manager if not already done
+            let _ = hub_terminal_engine::initialize_hub_terminal_manager();
+            
+            hub_terminal_engine::with_hub_terminal_manager(|manager| {
+                if let Ok(hub_terminal) = terminal_handle.enable_hub(manager) {
+                    log::info!("Terminal {} enhanced with Hub capabilities", terminal_handle.entity_id());
+                } else {
+                    log::debug!("Failed to enhance terminal {} with Hub capabilities", terminal_handle.entity_id());
+                }
+            });
 
             this.terminals
                 .local_handles

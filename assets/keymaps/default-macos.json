@@ -139,7 +139,7 @@
       "cmd-'": "editor::ToggleSelectedDiffHunks",
       "cmd-\"": "editor::ExpandAllDiffHunks",
       "cmd-alt-g b": "git::Blame",
-      "cmd-alt-g m": "git::OpenModifiedFiles",
+      // "cmd-alt-g m": "git::OpenModifiedFiles", // Action removed
       "cmd-i": "editor::ShowSignatureHelp",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",
@@ -585,8 +585,8 @@
       // Change the default action on `menu::Confirm` by setting the parameter
       // "alt-cmd-o": ["projects::OpenRecent", {"create_new_window": true }],
       "alt-cmd-o": ["projects::OpenRecent", { "create_new_window": false }],
-      "ctrl-cmd-o": ["projects::OpenRemote", { "from_existing_connection": false, "create_new_window": false }],
-      "ctrl-cmd-shift-o": ["projects::OpenRemote", { "from_existing_connection": true, "create_new_window": false }],
+      "ctrl-cmd-o": ["projects::OpenRemote", { "from_existing_connection": false }],
+      "ctrl-cmd-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
       "alt-cmd-b": "branches::OpenRecent",
       "ctrl-~": "workspace::NewTerminal",
       "cmd-s": "workspace::Save",
@@ -954,7 +954,7 @@
     "bindings": {
       "cmd-t": "debugger::ToggleThreadPicker",
       "cmd-i": "debugger::ToggleSessionPicker",
-      "shift-alt-escape": "debugger::ToggleExpandItem"
+      // "shift-alt-escape": "debugger::ToggleExpandItem" // Action removed
     }
   },
   {
@@ -970,8 +970,8 @@
     "bindings": {
       "ctrl-backspace": "collab_panel::Remove",
       "space": "menu::Confirm",
-      "cmd-up": "collab_panel::MoveChannelUp",
-      "cmd-down": "collab_panel::MoveChannelDown"
+      // "cmd-up": "collab_panel::MoveChannelUp", // Action removed
+      // "cmd-down": "collab_panel::MoveChannelDown" // Action removed
     }
   },
   {
@@ -1011,8 +1011,8 @@
     "context": "FileFinder",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-shift-a": "file_finder::ToggleSplitMenu",
-      "cmd-shift-i": "file_finder::ToggleFilterMenu"
+      // "cmd-shift-a": "file_finder::ToggleSplitMenu", // Action removed
+      // "cmd-shift-i": "file_finder::ToggleFilterMenu" // Action removed
     }
   },
   {

@@ -1,0 +1,38 @@
+[package]
+name = "hub_terminal_engine"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "Enhanced terminal engine for The Hub"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/hub_terminal_engine.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+terminal.workspace = true
+alacritty_terminal.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+hub_core.workspace = true
+hub_protocol.workspace = true
+hub_blocks.workspace = true
+log.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+workspace-hack.workspace = true
+
+[features]
+test-support = ["gpui/test-support"]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,27 @@
+[package]
+name = "hub_core"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "Core types and functionality for The Hub"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/hub_core.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+gpui.workspace = true
+log.workspace = true
+workspace-hack.workspace = true

@@ -47,6 +47,7 @@ git.workspace = true
 git_hosting_providers.workspace = true
 globset.workspace = true
 gpui.workspace = true
+hub_terminal_engine.workspace = true
 http_client.workspace = true
 image.workspace = true
 itertools.workspace = true

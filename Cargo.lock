@@ -7745,6 +7745,147 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures 0.3.31",
+ "gpui",
+ "hub_blocks",
+ "hub_core",
+ "hub_protocol",
+ "hub_terminal_engine",
+ "project",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "settings",
+ "terminal",
+ "terminal_view",
+ "tokio",
+ "uuid",
+ "workspace",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hub_ai"
+version = "0.1.0"
+dependencies = [
+ "anthropic",
+ "anyhow",
+ "futures 0.3.31",
+ "gpui",
+ "hub_core",
+ "hub_protocol",
+ "language_model",
+ "open_ai",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hub_blocks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures 0.3.31",
+ "gpui",
+ "hub_core",
+ "hub_protocol",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "ui",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hub_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui",
+ "log",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "thiserror 2.0.12",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hub_protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dirs 4.0.0",
+ "futures 0.3.31",
+ "gpui",
+ "hub_core",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hub_sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hub_core",
+ "hub_protocol",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hub_terminal_engine"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "futures 0.3.31",
+ "gpui",
+ "hub_blocks",
+ "hub_core",
+ "hub_protocol",
+ "log",
+ "schemars",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "terminal",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "human_bytes"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12283,6 +12424,7 @@ dependencies = [
  "globset",
  "gpui",
  "http_client",
+ "hub_terminal_engine",
  "image",
  "indexmap",
  "itertools 0.14.0",
@@ -19995,6 +20137,8 @@ dependencies = [
  "gpui",
  "gpui_tokio",
  "http_client",
+ "hub_protocol",
+ "hub_terminal_engine",
  "image_viewer",
  "indoc",
  "inline_completion_button",

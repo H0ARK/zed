@@ -1,0 +1,31 @@
+[package]
+name = "hub_ai"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "AI integration layer for The Hub"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/hub_ai.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_derive.workspace = true
+schemars.workspace = true
+language_model.workspace = true
+anthropic.workspace = true
+open_ai.workspace = true
+hub_core.workspace = true
+hub_protocol.workspace = true
+gpui.workspace = true
+workspace-hack.workspace = true
+
+[features]
+test-support = []

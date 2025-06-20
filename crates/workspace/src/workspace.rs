@@ -1,5 +1,6 @@
 pub mod dock;
 pub mod history_manager;
+mod hub_terminal_panel;
 pub mod item;
 mod modal_layer;
 pub mod notifications;
@@ -34,6 +35,7 @@ use futures::{
     },
     future::try_join_all,
 };
+use hub_terminal_panel::HubTerminalPanel;
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Bounds, Context,
     CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
@@ -939,6 +941,7 @@ pub struct Workspace {
     status_bar: Entity<StatusBar>,
     modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
+    hub_terminal_panel: Entity<HubTerminalPanel>,
     titlebar_item: Option<AnyView>,
     notifications: Notifications,
     suppressed_notifications: HashSet<NotificationId>,
@@ -1163,6 +1166,7 @@ impl Workspace {
         cx.emit(Event::WorkspaceCreated(weak_handle.clone()));
         let modal_layer = cx.new(|_| ModalLayer::new());
         let toast_layer = cx.new(|_| ToastLayer::new());
+        let hub_terminal_panel = cx.new(|cx| HubTerminalPanel::new(cx));
         cx.subscribe(
             &modal_layer,
             |_, _, _: &modal_layer::ModalOpenedEvent, cx| {
@@ -1265,6 +1269,7 @@ impl Workspace {
             status_bar,
             modal_layer,
             toast_layer,
+            hub_terminal_panel,
             titlebar_item: None,
             notifications: Notifications::default(),
             suppressed_notifications: HashSet::default(),
@@ -6068,20 +6073,24 @@ impl Render for Workspace {
                                                                         h_flex()
                                                                             .flex_1()
                                                                             .when_some(paddings.0, |this, p| this.child(p.border_r_1()))
-                                                                            .child(self.center.render(
-                                                                                self.zoomed.as_ref(),
-                                                                                &PaneRenderContext {
-                                                                                    follower_states:
-                                                                                        &self.follower_states,
-                                                                                    active_call: self.active_call(),
-                                                                                    active_pane: &self.active_pane,
-                                                                                    app_state: &self.app_state,
-                                                                                    project: &self.project,
-                                                                                    workspace: &self.weak_self,
-                                                                                },
-                                                                                window,
-                                                                                cx,
-                                                                            ))
+                                                                            // COMMENTED OUT: Original file editor interface
+                                                                            // .child(self.center.render(
+                                                                            //     self.zoomed.as_ref(),
+                                                                            //     &PaneRenderContext {
+                                                                            //         follower_states:
+                                                                            //             &self.follower_states,
+                                                                            //         active_call: self.active_call(),
+                                                                            //         active_pane: &self.active_pane,
+                                                                            //         app_state: &self.app_state,
+                                                                            //         project: &self.project,
+                                                                            //         workspace: &self.weak_self,
+                                                                            //     },
+                                                                            //     window,
+                                                                            //     cx,
+                                                                            // ))
+                                                                            
+                                                                            // THE HUB: Replace with Hub Terminal Panel
+                                                                            .child(self.hub_terminal_panel.clone())
                                                                             .when_some(paddings.1, |this, p| this.child(p.border_l_1())),
                                                                     )
                                                             )
@@ -6130,20 +6139,24 @@ impl Render for Workspace {
                                                                         h_flex()
                                                                             .flex_1()
                                                                             .when_some(paddings.0, |this, p| this.child(p.border_r_1()))
-                                                                            .child(self.center.render(
-                                                                                self.zoomed.as_ref(),
-                                                                                &PaneRenderContext {
-                                                                                    follower_states:
-                                                                                        &self.follower_states,
-                                                                                    active_call: self.active_call(),
-                                                                                    active_pane: &self.active_pane,
-                                                                                    app_state: &self.app_state,
-                                                                                    project: &self.project,
-                                                                                    workspace: &self.weak_self,
-                                                                                },
-                                                                                window,
-                                                                                cx,
-                                                                            ))
+                                                                            // COMMENTED OUT: Original file editor interface
+                                                                            // .child(self.center.render(
+                                                                            //     self.zoomed.as_ref(),
+                                                                            //     &PaneRenderContext {
+                                                                            //         follower_states:
+                                                                            //             &self.follower_states,
+                                                                            //         active_call: self.active_call(),
+                                                                            //         active_pane: &self.active_pane,
+                                                                            //         app_state: &self.app_state,
+                                                                            //         project: &self.project,
+                                                                            //         workspace: &self.weak_self,
+                                                                            //     },
+                                                                            //     window,
+                                                                            //     cx,
+                                                                            // ))
+                                                                            
+                                                                            // THE HUB: Replace with Hub Terminal Panel
+                                                                            .child(self.hub_terminal_panel.clone())
                                                                             .when_some(paddings.1, |this, p| this.child(p.border_l_1())),
                                                                     )
                                                             )
@@ -6178,20 +6191,24 @@ impl Render for Workspace {
                                                             .when_some(paddings.0, |this, p| {
                                                                 this.child(p.border_r_1())
                                                             })
-                                                            .child(self.center.render(
-                                                                self.zoomed.as_ref(),
-                                                                &PaneRenderContext {
-                                                                    follower_states:
-                                                                        &self.follower_states,
-                                                                    active_call: self.active_call(),
-                                                                    active_pane: &self.active_pane,
-                                                                    app_state: &self.app_state,
-                                                                    project: &self.project,
-                                                                    workspace: &self.weak_self,
-                                                                },
-                                                                window,
-                                                                cx,
-                                                            ))
+                                                            // COMMENTED OUT: Original file editor interface
+                                                            // .child(self.center.render(
+                                                            //     self.zoomed.as_ref(),
+                                                            //     &PaneRenderContext {
+                                                            //         follower_states:
+                                                            //             &self.follower_states,
+                                                            //         active_call: self.active_call(),
+                                                            //         active_pane: &self.active_pane,
+                                                            //         app_state: &self.app_state,
+                                                            //         project: &self.project,
+                                                            //         workspace: &self.weak_self,
+                                                            //     },
+                                                            //     window,
+                                                            //     cx,
+                                                            // ))
+                                                            
+                                                            // THE HUB: Replace with Hub Terminal Panel
+                                                            .child(self.hub_terminal_panel.clone())
                                                             .when_some(paddings.1, |this, p| {
                                                                 this.child(p.border_l_1())
                                                             }),
