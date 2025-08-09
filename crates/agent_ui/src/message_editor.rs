@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use uuid;
 
 use crate::agent_model_selector::AgentModelSelector;
 use crate::language_model_selector::ToggleModelSelector;
@@ -33,7 +34,7 @@ use gpui::{
 };
 use language::{Buffer, Language, Point};
 use language_model::{
-    ConfiguredModel, LanguageModelRequestMessage, MessageContent, ZED_CLOUD_PROVIDER_ID,
+    ConfiguredModel, LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolUseId, MessageContent, ZED_CLOUD_PROVIDER_ID,
 };
 use multi_buffer;
 use project::Project;
@@ -365,12 +366,22 @@ impl MessageEditor {
             return;
         }
 
-        let (user_message, user_message_creases) = self.editor.update(cx, |editor, cx| {
+        let (user_message, user_message_creases, should_execute_command) = self.editor.update(cx, |editor, cx| {
             let creases = extract_message_creases(editor, cx);
             let text = editor.text(cx);
+            
+            // Check if the message starts with '!' to execute command directly
+            let should_execute = text.trim_start().starts_with('!');
+            
             editor.clear(window, cx);
-            (text, creases)
+            (text, creases, should_execute)
         });
+        
+        // If command should be executed directly, do it and return early
+        if should_execute_command {
+            self.execute_direct_command(&user_message, cx);
+            return;
+        }
 
         self.last_estimated_token_count.take();
         cx.emit(MessageEditorEvent::EstimatedTokenCount);
@@ -410,6 +421,59 @@ impl MessageEditor {
                 .log_err();
         })
         .detach();
+    }
+
+    fn execute_direct_command(&mut self, text: &str, cx: &mut Context<Self>) {
+        let command = text.trim_start().strip_prefix('!').unwrap_or(text).trim();
+        
+        // Execute the terminal command directly using the run_command tool
+        if let Some(_workspace) = self.workspace.upgrade() {
+            let command = command.to_string();
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| {
+                    // Use the run_command tool directly
+                    this.run_command_tool("terminal", &[command.clone()], cx);
+                }).ok();
+            }).detach();
+        }
+    }
+
+    fn run_command_tool(&mut self, tool_name: &str, args: &[String], cx: &mut Context<Self>) {
+        // Create the tool input for terminal command
+        let input = serde_json::json!({
+            "command": args.get(0).unwrap_or(&String::new()),
+            "cd": "."
+        });
+        
+        // Execute the tool directly through the thread
+        self.thread.update(cx, |thread, cx| {
+            if let Some(tool) = thread.tools().read(cx).tool(tool_name, cx) {
+                if let Some(configured_model) = thread.configured_model() {
+                    let request = Arc::new(LanguageModelRequest {
+                        thread_id: Some(thread.id().to_string()),
+                        prompt_id: None,
+                        intent: None,
+                        mode: None,
+                        messages: vec![],
+                        tools: vec![],
+                        tool_choice: None,
+                        stop: vec![],
+                        temperature: None,
+                    });
+
+                    thread.run_tool(
+                        LanguageModelToolUseId::from(format!("direct-terminal-{}", uuid::Uuid::new_v4())),
+                        "Direct terminal command",
+                        input,
+                        request,
+                        tool,
+                        configured_model.model,
+                        None,
+                        cx,
+                    );
+                }
+            }
+        });
     }
 
     fn stop_current_and_send_new_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1378,7 +1442,7 @@ impl MessageEditor {
         // Replace existing load task, if any, causing it to be cancelled.
         let load_task = load_task.shared();
         self.load_context_task = Some(load_task.clone());
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this: WeakEntity<MessageEditor>, cx| {
             load_task.await;
             this.read_with(cx, |this, _cx| this.last_loaded_context.clone())
                 .ok()

@@ -404,6 +404,17 @@ impl AgentPanel {
             anyhow::Ok(())
         }));
     }
+
+    pub fn new_internal(
+        workspace: &Workspace,
+        thread_store: Entity<ThreadStore>,
+        context_store: Entity<TextThreadStore>,
+        prompt_store: Option<Entity<PromptStore>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(workspace, thread_store, context_store, prompt_store, window, cx)
+    }
     pub fn load(
         workspace: WeakEntity<Workspace>,
         prompt_builder: Arc<PromptBuilder>,
@@ -720,7 +731,7 @@ impl AgentPanel {
             .update(cx, |thread, cx| thread.cancel_last_completion(window, cx));
     }
 
-    fn new_thread(&mut self, action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn new_thread(&mut self, action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         // Preserve chat box text when using creating new thread from summary'
         let preserved_text = action
             .from_thread_id
@@ -831,7 +842,7 @@ impl AgentPanel {
         ];
     }
 
-    fn new_prompt_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn new_prompt_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let context = self
             .context_store
             .update(cx, |context_store, cx| context_store.create(cx));
@@ -891,7 +902,7 @@ impl AgentPanel {
         .detach_and_log_err(cx);
     }
 
-    fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.active_view, ActiveView::History) {
             if let Some(previous_view) = self.previous_view.take() {
                 self.set_active_view(previous_view, window, cx);

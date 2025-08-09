@@ -9,7 +9,7 @@ mod quick_action_bar;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
-use agent_ui::{AgentDiffToolbar, AgentPanelDelegate};
+use agent_ui::{AgentDiffToolbar, AgentItem, AgentPanelDelegate};
 use anyhow::Context as _;
 pub use app_menus::*;
 use assets::Assets;
@@ -65,7 +65,7 @@ use vim_mode_setting::VimModeSetting;
 use welcome::{BaseKeymap, DOCS_URL, MultibufferHint};
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 use workspace::{
-    AppState, NewFile, NewWindow, OpenLog, Toast, Workspace, WorkspaceSettings,
+    AppState, NewFile, NewWindow, OpenLog, SplitDirection, Toast, Workspace, WorkspaceSettings,
     create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
     open_new,
 };
@@ -92,6 +92,7 @@ actions!(
         ToggleFullScreen,
         Zoom,
         TestPanic,
+        OpenAgentTab,
     ]
 );
 
@@ -355,7 +356,7 @@ pub fn initialize_workspace(
         });
 
         initialize_panels(prompt_builder.clone(), window, cx);
-        register_actions(app_state.clone(), workspace, window, cx);
+        register_actions(app_state.clone(), prompt_builder.clone(), workspace, window, cx);
 
         workspace.focus_handle(cx).focus(window);
     })
@@ -516,19 +517,24 @@ fn initialize_panels(
         })?;
 
         let is_assistant2_enabled = !cfg!(test);
-        let agent_panel = if is_assistant2_enabled {
-            let agent_panel =
-                agent_ui::AgentPanel::load(workspace_handle.clone(), prompt_builder, cx.clone())
-                    .await?;
-
-            Some(agent_panel)
-        } else {
-            None
-        };
-
+        
         workspace_handle.update_in(cx, |workspace, window, cx| {
-            if let Some(agent_panel) = agent_panel {
-                workspace.add_panel(agent_panel, window, cx);
+            // Open the agent tab as the main item instead of adding as a panel
+            if is_assistant2_enabled {
+                let task = AgentItem::load(
+                    workspace.weak_handle(),
+                    prompt_builder.clone(),
+                    window.to_async(cx),
+                );
+                cx.spawn_in(window, async move |workspace, cx| {
+                    if let Ok(agent_item) = task.await {
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            workspace.add_item_to_active_pane(Box::new(agent_item), None, true, window, cx);
+                        })?;
+                    }
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
             }
 
             // Register the actions that are shared between `assistant` and `assistant2`.
@@ -556,6 +562,7 @@ fn initialize_panels(
 
 fn register_actions(
     app_state: Arc<AppState>,
+    prompt_builder: Arc<PromptBuilder>,
     workspace: &mut Workspace,
     _: &mut Window,
     cx: &mut Context<Workspace>,
@@ -851,6 +858,34 @@ fn register_actions(
                     )
                     .detach();
                 }
+            }
+        })
+        .register_action({
+            let prompt_builder = prompt_builder.clone();
+            move |workspace, _: &OpenAgentTab, window, cx| {
+                let task = AgentItem::load(
+                    workspace.weak_handle(),
+                    prompt_builder.clone(),
+                    window.to_async(cx),
+                );
+                cx.spawn_in(window, async move |workspace, cx| {
+                    if let Ok(agent_item) = task.await {
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            // Create a new pane by splitting to the right
+                            let new_pane = workspace.split_pane(
+                                workspace.active_pane().clone(),
+                                SplitDirection::Right,
+                                window,
+                                cx,
+                            );
+                            new_pane.update(cx, |pane, cx| {
+                                pane.add_item(Box::new(agent_item), true, true, None, window, cx);
+                            });
+                        })?;
+                    }
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
             }
         });
     if workspace.project().read(cx).is_via_ssh() {

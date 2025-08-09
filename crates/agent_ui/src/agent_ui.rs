@@ -1,6 +1,7 @@
 mod active_thread;
 mod agent_configuration;
 mod agent_diff;
+mod agent_item;
 mod agent_model_selector;
 mod agent_panel;
 mod buffer_codegen;
@@ -44,6 +45,7 @@ use settings::{Settings as _, SettingsStore};
 
 pub use crate::active_thread::ActiveThread;
 use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModal};
+pub use crate::agent_item::AgentItem;
 pub use crate::agent_panel::{AgentPanel, ConcreteAssistantPanelDelegate};
 pub use crate::inline_assistant::InlineAssistant;
 use crate::slash_command_settings::SlashCommandSettings;
