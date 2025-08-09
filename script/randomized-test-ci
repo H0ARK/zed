@@ -3,11 +3,7 @@
 const fs = require("fs");
 const { randomBytes } = require("crypto");
 const { execFileSync } = require("child_process");
-const {
-  minimizeTestPlan,
-  buildTests,
-  runTests,
-} = require("./randomized-test-minimize");
+const { minimizeTestPlan, buildTests, runTests } = require("./randomized-test-minimize");
 
 const { ZED_SERVER_URL } = process.env;
 if (!ZED_SERVER_URL) throw new Error("Missing env var `ZED_SERVER_URL`");
@@ -62,9 +58,6 @@ async function main() {
 
 function randomU64() {
   const bytes = randomBytes(8);
-  const hexString = bytes.reduce(
-    (string, byte) => string + byte.toString(16),
-    "",
-  );
+  const hexString = bytes.reduce((string, byte) => string + byte.toString(16), "");
   return BigInt("0x" + hexString).toString(10);
 }

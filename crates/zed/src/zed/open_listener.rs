@@ -373,9 +373,9 @@ async fn open_workspaces(
                     env,
                     ..Default::default()
                 };
-                workspace::open_new(open_options, app_state, cx, |workspace, window, cx| {
-                    Editor::new_file(workspace, &Default::default(), window, cx)
-                })
+                // Do not create a default untitled editor on empty launch.
+                // The Agent tab (and other startup UI) will be added by workspace initialization.
+                workspace::open_new(open_options, app_state, cx, |_workspace, _window, _cx| {})
                 .detach();
             })
             .log_err();

@@ -25,7 +25,7 @@ use client::{
 };
 use collections::{HashMap, HashSet, hash_map};
 pub use dock::Panel;
-use dock::{Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE};
+use dock::{Dock, DockPosition, PanelHandle, RESIZE_HANDLE_SIZE};
 use futures::{
     Future, FutureExt, StreamExt,
     channel::{
@@ -57,6 +57,7 @@ use notifications::{
 };
 pub use pane::*;
 pub use pane_group::*;
+pub use workspace_settings::TabBarSettings;
 use persistence::{
     DB, SerializedWindowBounds,
     model::{SerializedSshProject, SerializedWorkspace},
@@ -80,7 +81,6 @@ use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
-use status_bar::StatusBar;
 pub use status_bar::StatusItemView;
 use std::{
     any::TypeId,
@@ -104,11 +104,12 @@ use ui::{Window, prelude::*};
 use util::{ResultExt, TryFutureExt, paths::SanitizedPath, serde::default_true};
 use uuid::Uuid;
 pub use workspace_settings::{
-    AutosaveSetting, BottomDockLayout, RestoreOnStartupBehavior, TabBarSettings, WorkspaceSettings,
+    AutosaveSetting, BottomDockLayout, RestoreOnStartupBehavior, WorkspaceSettings,
 };
 use zed_actions::{Spawn, feedback::FileBugReport};
 
 use crate::notifications::NotificationId;
+// use of TabBarSettings within this module can go through the public re-export above
 use crate::persistence::{
     SerializedAxis,
     model::{DockData, DockStructure, SerializedItem, SerializedPane, SerializedPaneGroup},
@@ -165,9 +166,9 @@ pub trait DebuggerProvider {
     fn active_thread_state(&self, cx: &App) -> Option<ThreadStatus>;
 }
 
-actions!(
-    workspace,
-    [
+    actions!(
+        workspace,
+        [
         ActivateNextPane,
         ActivatePreviousPane,
         ActivateNextWindow,
@@ -205,6 +206,8 @@ actions!(
         Welcome,
         RestoreBanner,
         ToggleExpandItem,
+            #[action(name = "OpenAgentTab")]
+            OpenAgentTab,
     ]
 );
 
@@ -212,6 +215,8 @@ actions!(
 pub struct OpenPaths {
     pub paths: Vec<PathBuf>,
 }
+
+// OpenAgentTab action is declared via the actions! macro above.
 
 #[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
 #[action(namespace = workspace)]
@@ -939,7 +944,7 @@ pub struct Workspace {
     active_pane: Entity<Pane>,
     last_active_center_pane: Option<WeakEntity<Pane>>,
     last_active_view_id: Option<proto::ViewId>,
-    status_bar: Entity<StatusBar>,
+    // Removed: status_bar
     modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1116,7 +1121,7 @@ impl Workspace {
                 project.clone(),
                 pane_history_timestamp.clone(),
                 None,
-                NewFile.boxed_clone(),
+                NewCenterTerminal.boxed_clone(),
                 window,
                 cx,
             );
@@ -1178,16 +1183,7 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
-        let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
-        let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
-        let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
-        let status_bar = cx.new(|cx| {
-            let mut status_bar = StatusBar::new(&center_pane.clone(), window, cx);
-            status_bar.add_left_item(left_dock_buttons, window, cx);
-            status_bar.add_right_item(right_dock_buttons, window, cx);
-            status_bar.add_right_item(bottom_dock_buttons, window, cx);
-            status_bar
-        });
+        // Remove bottom status bar: do not create or add dock buttons/status bar.
 
         let session_id = app_state.session.read(cx).id().to_owned();
 
@@ -1265,7 +1261,7 @@ impl Workspace {
             active_pane: center_pane.clone(),
             last_active_center_pane: Some(center_pane.downgrade()),
             last_active_view_id: None,
-            status_bar,
+            // Removed: status_bar,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -1557,9 +1553,7 @@ impl Workspace {
         });
     }
 
-    pub fn status_bar(&self) -> &Entity<StatusBar> {
-        &self.status_bar
-    }
+    // Removed: status bar accessors
 
     pub fn app_state(&self) -> &Arc<AppState> {
         &self.app_state
@@ -3639,9 +3633,7 @@ impl Workspace {
     ) {
         // This is explicitly hoisted out of the following check for pane identity as
         // terminal panel panes are not registered as a center panes.
-        self.status_bar.update(cx, |status_bar, cx| {
-            status_bar.set_active_pane(&pane, window, cx);
-        });
+        // Removed status bar updates
         if self.active_pane != pane {
             self.set_active_pane(&pane, window, cx);
         }
@@ -6258,7 +6250,7 @@ impl Render for Workspace {
                                 }))
                                 .children(self.render_notifications(window, cx)),
                         )
-                        .child(self.status_bar.clone())
+                        // Removed status bar from layout
                         .child(self.modal_layer.clone())
                         .child(self.toast_layer.clone()),
                 ),

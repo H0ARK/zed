@@ -50,11 +50,9 @@ function getPullRequestNumbers(startDate, endDate) {
   const sinceDate = startDate.toISOString();
   const untilDate = endDate.toISOString();
 
-  const pullRequestNumbers = execFileSync(
-    "git",
-    ["log", `--since=${sinceDate}`, `--until=${untilDate}`, "--oneline"],
-    { encoding: "utf8" },
-  )
+  const pullRequestNumbers = execFileSync("git", ["log", `--since=${sinceDate}`, `--until=${untilDate}`, "--oneline"], {
+    encoding: "utf8",
+  })
     .split("\n")
     .filter((line) => line.length > 0)
     .map((line) => {

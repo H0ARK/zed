@@ -153,9 +153,7 @@ impl Item for AgentItem {
         Some("agent panel")
     }
     
-    fn is_singleton(&self, _cx: &App) -> bool {
-        true
-    }
+    fn is_singleton(&self, _cx: &App) -> bool { false }
     
     fn clone_on_split(
         &self,

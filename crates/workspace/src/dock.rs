@@ -1,13 +1,13 @@
 use crate::persistence::model::DockData;
 use crate::{DraggedDock, Event, ModalLayer, Pane};
-use crate::{Workspace, status_bar::StatusItemView};
+use crate::Workspace;
 use anyhow::Context as _;
 use client::proto;
 use gpui::{
     Action, AnyView, App, Axis, Context, Corner, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Pixels, Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window,
+    deferred, div, px,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -731,6 +731,71 @@ impl Render for Dock {
             let size = entry.panel.size(window, cx);
 
             let position = self.position;
+            // Header row with dock panel switcher buttons shown on every panel
+            let header_buttons = {
+                let active_index = self.active_panel_index;
+                let is_open = self.is_open;
+                let mut buttons: Vec<_> = self
+                    .panel_entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, entry)| {
+                        let icon = entry.panel.icon(window, cx)?;
+                        let tooltip = entry.panel.icon_tooltip(window, cx)?;
+                        let is_active_button = Some(i) == active_index && is_open;
+                        // When inactive, clicking should activate that panel without depending on global toggle actions.
+                        // When active, clicking should close the dock.
+                        let target_panel_id = entry.panel.panel_id();
+                        Some(
+                            IconButton::new(entry.panel.persistent_name(), icon)
+                                .icon_size(IconSize::Small)
+                                .toggle_state(is_active_button)
+                                .on_click(cx.listener(move |this: &mut Dock, _event, window, cx| {
+                                    if is_active_button {
+                                        let action = this.toggle_action().boxed_clone();
+                                        window.dispatch_action(action, cx);
+                                    } else {
+                                        if let Some(ix) = this
+                                            .panel_entries
+                                            .iter()
+                                            .position(|e| e.panel.panel_id() == target_panel_id)
+                                        {
+                                            this.set_open(true, window, cx);
+                                            this.activate_panel(ix, window, cx);
+                                            if let Some(panel) = this.active_panel() {
+                                                let focus_handle = panel.panel_focus_handle(cx);
+                                                window.focus(&focus_handle);
+                                            }
+                                        }
+                                    }
+                                }))
+                                .tooltip({
+                                    move |window, cx| Tooltip::text(tooltip)(window, cx)
+                                }),
+                        )
+                    })
+                    .collect();
+
+                // Add fixed quick-access buttons: Project Search, Project Panel, Diagnostics, Terminal
+                // Reuse existing actions where available.
+                let add_quick = |id: &'static str, icon: IconName, action: Box<dyn Action>| {
+                    IconButton::new(id, icon)
+                        .icon_size(IconSize::Small)
+                        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                };
+                buttons.insert(0, add_quick("quick-project-panel", IconName::Folder, crate::ToggleLeftDock.boxed_clone()));
+                buttons.push(add_quick("quick-search", IconName::MagnifyingGlass, crate::NewSearch.boxed_clone()));
+                buttons.push(add_quick("quick-diagnostics", IconName::BugOff, crate::ClearAllNotifications.boxed_clone()));
+                buttons.push(add_quick("quick-terminal", IconName::Terminal, crate::NewTerminal.boxed_clone()));
+                h_flex()
+                    .flex_none()
+                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .px(DynamicSpacing::Base06.rems(cx))
+                    .h(DynamicSpacing::Base32.px(cx))
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .children(buttons)
+            };
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -813,10 +878,15 @@ impl Render for Dock {
                             Axis::Vertical => this.min_h(size).w_full(),
                         })
                         .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
+                            v_flex()
+                                .size_full()
+                                .child(header_buttons)
+                                .child(
+                                    entry
+                                        .panel
+                                        .to_any()
+                                        .cached(StyleRefinement::default().v_flex().size_full()),
+                                ),
                         ),
                 )
                 .when(self.resizable(cx), |this| {
@@ -932,7 +1002,7 @@ impl Render for PanelButtons {
     }
 }
 
-impl StatusItemView for PanelButtons {
+impl super::status_bar::StatusItemView for PanelButtons {
     fn set_active_pane_item(
         &mut self,
         _active_pane_item: Option<&dyn crate::ItemHandle>,

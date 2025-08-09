@@ -570,9 +570,9 @@
     // Whether to hide the gitignore entries in the project panel.
     "hide_gitignore": false,
     // Default width of the project panel.
-    "default_width": 240,
+    "default_width": 200,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "left",
+    "dock": "right",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -755,9 +755,9 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "right",
+    "dock": "left",
     // Default width when the agent panel is docked to the left or right.
-    "default_width": 640,
+    "default_width": 1000,
     // Default height when the agent panel is docked to the bottom.
     "default_height": 320,
     // The default model to use when creating new threads.
@@ -902,7 +902,13 @@
     // Whether or not to show the navigation history buttons.
     "show_nav_history_buttons": true,
     // Whether or not to show the tab bar buttons.
-    "show_tab_bar_buttons": true
+    "show_tab_bar_buttons": true,
+    // Whether to render the editor tabs inside the window title bar instead of in each pane.
+    // Default is true; set to false to keep tabs inside panes.
+    "show_in_title_bar": true,
+    // When tabs are shown in the title bar, hide the left/right navigation arrows.
+    // Set to false to show arrows in the title bar.
+    "hide_nav_arrows_in_title_bar": true
   },
   // Settings related to the editor's tabs
   "tabs": {

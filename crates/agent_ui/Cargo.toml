@@ -63,6 +63,7 @@ parking_lot.workspace = true
 paths.workspace = true
 picker.workspace = true
 project.workspace = true
+project_panel.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 release_channel.workspace = true
@@ -93,6 +94,8 @@ workspace-hack.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zed_llm_client.workspace = true
+git.workspace = true
+git_ui.workspace = true
 
 [dev-dependencies]
 assistant_tools.workspace = true

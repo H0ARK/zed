@@ -209,6 +209,8 @@ pub struct TabBarSettings {
     pub show: bool,
     pub show_nav_history_buttons: bool,
     pub show_tab_bar_buttons: bool,
+    pub show_in_title_bar: bool,
+    pub hide_nav_arrows_in_title_bar: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -225,6 +227,13 @@ pub struct TabBarSettingsContent {
     ///
     /// Default: true
     pub show_tab_bar_buttons: Option<bool>,
+    /// Whether to render the editor tabs inside the window title bar instead of in each pane.
+    ///
+    /// Default: false
+    pub show_in_title_bar: Option<bool>,
+    /// Whether to hide navigation arrows when tabs are shown in the title bar.
+    /// Default: true
+    pub hide_nav_arrows_in_title_bar: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -368,7 +377,14 @@ impl Settings for TabBarSettings {
     type FileContent = TabBarSettingsContent;
 
     fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-        sources.json_merge()
+        let merged: TabBarSettingsContent = sources.json_merge()?;
+        Ok(TabBarSettings {
+            show: merged.show.unwrap_or(true),
+            show_nav_history_buttons: merged.show_nav_history_buttons.unwrap_or(true),
+            show_tab_bar_buttons: merged.show_tab_bar_buttons.unwrap_or(true),
+            show_in_title_bar: merged.show_in_title_bar.unwrap_or(true),
+            hide_nav_arrows_in_title_bar: merged.hide_nav_arrows_in_title_bar.unwrap_or(true),
+        })
     }
 
     fn import_from_vscode(vscode: &settings::VsCodeSettings, current: &mut Self::FileContent) {

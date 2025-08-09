@@ -1,4 +1,5 @@
 This tool opens a file or URL with the default application associated with it on the user's operating system:
+
 - On macOS, it's equivalent to the `open` command
 - On Windows, it's equivalent to `start`
 - On Linux, it uses something like `xdg-open`, `gio open`, `gnome-open`, `kde-open`, `wslview` as appropriate

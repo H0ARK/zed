@@ -924,14 +924,9 @@ async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp
         cx.update(|cx| show_welcome_view(app_state, cx))?.await?;
     } else {
         cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    Editor::new_file(workspace, &Default::default(), window, cx)
-                },
-            )
+            // Do not create a default untitled editor on empty launch.
+            // The Agent tab (and other startup UI) will be added by workspace initialization.
+            workspace::open_new(Default::default(), app_state, cx, |_workspace, _window, _cx| {})
         })?
         .await?;
     }

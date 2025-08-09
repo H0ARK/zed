@@ -1,12 +1,4 @@
 {
-  "admins": [
-    "nathansobo",
-    "as-cii",
-    "maxbrunsfeld",
-    "iamnbutler",
-    "mikayla-maki",
-    "JosephTLyons",
-    "rgbkrk"
-  ],
+  "admins": ["nathansobo", "as-cii", "maxbrunsfeld", "iamnbutler", "mikayla-maki", "JosephTLyons", "rgbkrk"],
   "channels": ["zed"]
 }

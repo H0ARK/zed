@@ -9,17 +9,11 @@ const CARGO_TEST_ARGS = ["--release", "--lib", "--package", "collab"];
 
 if (require.main === module) {
   if (process.argv.length < 4) {
-    process.stderr.write(
-      "usage: script/randomized-test-minimize <input-plan> <output-plan> [start-index]\n",
-    );
+    process.stderr.write("usage: script/randomized-test-minimize <input-plan> <output-plan> [start-index]\n");
     process.exit(1);
   }
 
-  minimizeTestPlan(
-    process.argv[2],
-    process.argv[3],
-    parseInt(process.argv[4]) || 0,
-  );
+  minimizeTestPlan(process.argv[2], process.argv[3], parseInt(process.argv[4]) || 0);
 }
 
 function minimizeTestPlan(inputPlanPath, outputPlanPath, startIndex = 0) {
@@ -40,9 +34,7 @@ function minimizeTestPlan(inputPlanPath, outputPlanPath, startIndex = 0) {
     newTestPlan.splice(ix, 1);
     fs.writeFileSync(tempPlanPath, serializeTestPlan(newTestPlan), "utf8");
 
-    process.stderr.write(
-      `${ix}/${testPlan.length}: ${JSON.stringify(testPlan[ix])}`,
-    );
+    process.stderr.write(`${ix}/${testPlan.length}: ${JSON.stringify(testPlan[ix])}`);
     const failingSeed = runTests({
       SEED: "0",
       LOAD_PLAN: tempPlanPath,
@@ -81,35 +73,27 @@ function minimizeTestPlan(inputPlanPath, outputPlanPath, startIndex = 0) {
 }
 
 function buildTests() {
-  const { status } = spawnSync(
-    "cargo",
-    ["test", "--no-run", ...CARGO_TEST_ARGS],
-    {
-      stdio: "inherit",
-      encoding: "utf8",
-      env: {
-        ...process.env,
-      },
+  const { status } = spawnSync("cargo", ["test", "--no-run", ...CARGO_TEST_ARGS], {
+    stdio: "inherit",
+    encoding: "utf8",
+    env: {
+      ...process.env,
     },
-  );
+  });
   if (status !== 0) {
     throw new Error("build failed");
   }
 }
 
 function runTests(env) {
-  const { status, stdout } = spawnSync(
-    "cargo",
-    ["test", ...CARGO_TEST_ARGS, "random_project_collaboration"],
-    {
-      stdio: "pipe",
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        ...env,
-      },
+  const { status, stdout } = spawnSync("cargo", ["test", ...CARGO_TEST_ARGS, "random_project_collaboration"], {
+    stdio: "pipe",
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...env,
     },
-  );
+  });
 
   if (status !== 0) {
     FAILING_SEED_REGEX.lastIndex = 0;

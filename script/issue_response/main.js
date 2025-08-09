@@ -18,9 +18,7 @@ async function main() {
     throw new Error("SLACK_ISSUE_RESPONSE_WEBHOOK_URL is not set");
   }
 
-  const webhook = new IncomingWebhook(
-    process.env["SLACK_ISSUE_RESPONSE_WEBHOOK_URL"],
-  );
+  const webhook = new IncomingWebhook(process.env["SLACK_ISSUE_RESPONSE_WEBHOOK_URL"]);
 
   const owner = "zed-industries";
   const repo = "zed";
@@ -28,14 +26,11 @@ async function main() {
   const githubHandleSet = new Set();
 
   for (const team of teams) {
-    const teamMembers = await octokit.paginate(
-      octokit.rest.teams.listMembersInOrg,
-      {
-        org: owner,
-        team_slug: team,
-        per_page: 100,
-      },
-    );
+    const teamMembers = await octokit.paginate(octokit.rest.teams.listMembersInOrg, {
+      org: owner,
+      team_slug: team,
+      per_page: 100,
+    });
 
     for (const teamMember of teamMembers) {
       githubHandleSet.add(teamMember.login);
@@ -63,26 +58,17 @@ async function main() {
     ...authorFilters,
   ];
 
-  const issues = await octokit.paginate(
-    octokit.rest.search.issuesAndPullRequests,
-    {
-      q: q.join("+"),
-      per_page: 100,
-    },
-  );
+  const issues = await octokit.paginate(octokit.rest.search.issuesAndPullRequests, {
+    q: q.join("+"),
+    per_page: 100,
+  });
   const issueLines = issues.map((issue, index) => {
-    const formattedDate = new Date(issue.created_at).toLocaleDateString(
-      "en-US",
-      {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-      },
-    );
-    const sanitizedTitle = issue.title
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
+    const formattedDate = new Date(issue.created_at).toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+    const sanitizedTitle = issue.title.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
     return `${index + 1}. ${formattedDate}: <${issue.html_url}|${sanitizedTitle}>\n`;
   });

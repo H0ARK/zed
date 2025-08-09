@@ -1865,7 +1865,7 @@ impl ActiveThread {
         // For all items that should be aligned with the LLM's response.
         const RESPONSE_PADDING_X: Pixels = px(19.);
 
-        let show_feedback = thread.is_turn_end(ix);
+        let show_feedback = false; //thread.is_turn_end(ix);
         let feedback_container = h_flex()
             .group("feedback_container")
             .mt_1()
@@ -2730,6 +2730,13 @@ impl ActiveThread {
             return card.render(&tool_use.status, window, workspace, cx);
         }
 
+        // Check if this is a direct terminal command
+        let is_direct_terminal_command = tool_use.id.to_string().starts_with("term-");
+
+        if is_direct_terminal_command {
+            return self.render_direct_terminal_command(tool_use, window, workspace, cx).into_any_element();
+        }
+
         let is_open = self
             .expanded_tool_uses
             .get(&tool_use.id)
@@ -3204,6 +3211,187 @@ impl ActiveThread {
                     })
             }
         }).into_any_element()
+    }
+
+    fn render_direct_terminal_command(
+        &self,
+        tool_use: ToolUse,
+        window: &mut Window,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let rendered_tool_use = self.rendered_tool_uses.get(&tool_use.id).cloned();
+        let is_status_finished = matches!(&tool_use.status, ToolUseStatus::Finished(_));
+
+        // Status icon for running/finished states
+        let status_icon = match &tool_use.status {
+            ToolUseStatus::Pending
+            | ToolUseStatus::InputStillStreaming
+            | ToolUseStatus::Running => Some(
+                Icon::new(IconName::ArrowCircle)
+                    .color(Color::Accent)
+                    .size(IconSize::Small)
+                    .with_animation(
+                        "arrow-circle",
+                        Animation::new(Duration::from_secs(2)).repeat(),
+                        |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                    )
+                    .into_any_element()
+            ),
+            ToolUseStatus::Error(_) => Some(
+                Icon::new(IconName::Close)
+                    .color(Color::Error)
+                    .size(IconSize::Small)
+                    .into_any_element()
+            ),
+            ToolUseStatus::Finished(_) | ToolUseStatus::NeedsConfirmation => None,
+        };
+
+        // Terminal output content - show real-time terminal output when running, or final result when finished
+        let terminal_output = match &tool_use.status {
+            ToolUseStatus::Finished(_) => {
+                rendered_tool_use.as_ref().map(|rendered| {
+                    div()
+                        .w_full()
+                        .text_ui_sm(cx)
+                        .child(
+                            MarkdownElement::new(
+                                rendered.output.clone(),
+                                tool_use_markdown_style(window, cx),
+                            )
+                            .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                                copy_button: false,
+                                copy_button_on_hover: false,
+                                border: false,
+                            })
+                            .on_url_click({
+                                let workspace = self.workspace.clone();
+                                move |text, window, cx| {
+                                    open_markdown_link(text, workspace.clone(), window, cx);
+                                }
+                            })
+                        )
+                        .into_any_element()
+                })
+            }
+            ToolUseStatus::Running | ToolUseStatus::InputStillStreaming => {
+                // Show real-time terminal output if a terminal card is available
+                log::info!("Direct terminal command running, tool_use.id: {}", tool_use.id);
+
+                if let Some(card) = self.thread.read(cx).card_for_tool(&tool_use.id) {
+                    log::info!("Found terminal card for tool_use.id: {}, rendering card", tool_use.id);
+                    Some(card.render(&tool_use.status, window, workspace.clone(), cx))
+                } else {
+                    log::warn!("No terminal card found for tool_use.id: {}, showing fallback", tool_use.id);
+
+                    // Debug: Check if any cards are available
+                    let thread = self.thread.read(cx);
+                    log::info!("Thread has pending tool uses: {}", thread.has_pending_tool_uses());
+
+                    // Fallback to running indicator if no card is available
+                    Some(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::ArrowCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Accent)
+                                    .with_animation(
+                                        "arrow-circle",
+                                        Animation::new(Duration::from_secs(2)).repeat(),
+                                        |icon, delta| {
+                                            icon.transform(Transformation::rotate(percentage(delta)))
+                                        },
+                                    ),
+                            )
+                            .child(
+                                Label::new("Running…")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .buffer_font(cx),
+                            )
+                            .into_any_element()
+                    )
+                }
+            },
+            ToolUseStatus::Error(_) => {
+                rendered_tool_use.as_ref().map(|rendered| {
+                    div()
+                        .text_ui_sm(cx)
+                        .child(
+                            MarkdownElement::new(
+                                rendered.output.clone(),
+                                tool_use_markdown_style(window, cx),
+                            )
+                            .on_url_click({
+                                let workspace = self.workspace.clone();
+                                move |text, window, cx| {
+                                    open_markdown_link(text, workspace.clone(), window, cx);
+                                }
+                            })
+                        )
+                        .into_any_element()
+                })
+            }
+            ToolUseStatus::Pending | ToolUseStatus::NeedsConfirmation => None,
+        };
+
+        // Streamlined terminal command display
+        v_flex()
+            .gap_1()
+            .mb_2()
+            .child(
+                v_flex()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .justify_between()
+                            .opacity(0.8)
+                            .hover(|style| style.opacity(1.))
+                            .when(!is_status_finished, |this| this.pr_2())
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .max_w_full()
+                                    .overflow_hidden()
+                                    .child(
+                                        Icon::new(IconName::Terminal)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        h_flex().pr_8().text_size(rems(0.8125)).children(
+                                            rendered_tool_use.map(|rendered| {
+                                                MarkdownElement::new(
+                                                    rendered.label,
+                                                    tool_use_markdown_style(window, cx),
+                                                )
+                                                .on_url_click({
+                                                    let workspace = self.workspace.clone();
+                                                    move |text, window, cx| {
+                                                        open_markdown_link(text, workspace.clone(), window, cx);
+                                                    }
+                                                })
+                                            })
+                                        ),
+                                    ),
+                            )
+                            .children(status_icon.map(|icon| {
+                                h_flex().gap_1().child(icon)
+                            })),
+                    )
+                    .children(terminal_output.map(|output| {
+                        v_flex()
+                            .mt_1()
+                            .border_1()
+                            .border_color(self.tool_card_border_color(cx))
+                            .bg(cx.theme().colors().editor_background)
+                            .rounded_lg()
+                            .p_2()
+                            .child(output)
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_rules_item(&self, cx: &Context<Self>) -> AnyElement {

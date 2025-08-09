@@ -24,7 +24,6 @@ The process for updating an extension in this directory has three parts.
 
 1. Create a PR with your changes. (Merge it)
 2. Bump the extension version in:
-
    - extensions/{language_name}/extension.toml
    - extensions/{language_name}/Cargo.toml
    - Cargo.lock

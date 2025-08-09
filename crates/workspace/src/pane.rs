@@ -1,7 +1,6 @@
 use crate::{
-    CloseWindow, NewFile, NewTerminal, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible,
-    SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace,
-    WorkspaceItemBuilder,
+    CloseWindow, NewCenterTerminal, OpenInTerminal, OpenOptions, OpenTerminal,
+    OpenVisible, SplitDirection, ToggleZoom, Workspace, WorkspaceItemBuilder,
     item::{
         ActivateOnClose, ClosePosition, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
         ProjectItemKind, SaveOptions, ShowCloseButton, ShowDiagnostics, TabContentParams,
@@ -12,6 +11,7 @@ use crate::{
     toolbar::Toolbar,
     workspace_settings::{AutosaveSetting, TabBarSettings, WorkspaceSettings},
 };
+use crate::dock::DockPosition;
 use anyhow::Result;
 use collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -457,7 +457,10 @@ impl Pane {
             custom_drop_handle: None,
             can_split_predicate: None,
             can_toggle_zoom: true,
-            should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
+            should_display_tab_bar: Rc::new(|_, cx| {
+                let t = TabBarSettings::get_global(cx);
+                t.show && !t.show_in_title_bar
+            }),
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
             render_tab_bar: Rc::new(Self::render_tab_bar),
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
@@ -690,6 +693,14 @@ impl Pane {
         cx.notify();
     }
 
+    pub fn render_tab_bar_element_for_titlebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> AnyElement {
+        (self.render_tab_bar.clone())(self, window, cx)
+    }
+
     pub fn set_render_tab_bar_buttons<F>(&mut self, cx: &mut Context<Self>, render: F)
     where
         F: 'static
@@ -701,6 +712,11 @@ impl Pane {
     {
         self.render_tab_bar_buttons = Rc::new(render);
         cx.notify();
+    }
+
+    /// Sets the action dispatched when double-clicking the empty tab bar area.
+    pub fn set_double_click_action(&mut self, action: Box<dyn Action>) {
+        self.double_click_dispatch_action = action;
     }
 
     pub fn set_custom_drop_handle<F>(&mut self, cx: &mut Context<Self>, handle: F)
@@ -1157,7 +1173,7 @@ impl Pane {
             }
             self.update_history(index);
             self.update_toolbar(window, cx);
-            self.update_status_bar(window, cx);
+            // Status bar removed
 
             if focus_item {
                 self.focus_active_item(window, cx);
@@ -2121,22 +2137,7 @@ impl Pane {
         });
     }
 
-    fn update_status_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
-        let pane = cx.entity().clone();
-
-        window.defer(cx, move |window, cx| {
-            let Ok(status_bar) =
-                workspace.read_with(cx, |workspace, _| workspace.status_bar.clone())
-            else {
-                return;
-            };
-
-            status_bar.update(cx, move |status_bar, cx| {
-                status_bar.set_active_pane(&pane, window, cx);
-            });
-        });
-    }
+    // Status bar removed (intentionally unused)
 
     fn entry_abs_path(&self, entry: ProjectEntryId, cx: &App) -> Option<PathBuf> {
         let worktree = self
@@ -2744,6 +2745,18 @@ impl Pane {
 
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
         let focus_handle = self.focus_handle.clone();
+        // Button to toggle the left side panel (left dock), placed before the tabs
+        let workspace_handle = self.workspace.clone();
+        let toggle_left_dock_button = IconButton::new("toggle_left_dock", IconName::PanelLeft)
+            .icon_size(IconSize::Small)
+            .on_click(move |_, window, cx| {
+                if let Some(workspace) = workspace_handle.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_dock(DockPosition::Left, window, cx);
+                    });
+                }
+            })
+            .tooltip(Tooltip::text("Toggle left dock"));
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
             .icon_size(IconSize::Small)
             .on_click({
@@ -2797,12 +2810,22 @@ impl Pane {
         let unpinned_tabs = tab_items.split_off(self.pinned_tab_count);
         let pinned_tabs = tab_items;
         TabBar::new("tab_bar")
+            // Place the side panel toggle button at the very start of the header, in front of tabs
+            .start_child(toggle_left_dock_button)
             .when(
                 self.display_nav_history_buttons.unwrap_or_default(),
                 |tab_bar| {
-                    tab_bar
-                        .start_child(navigate_backward)
-                        .start_child(navigate_forward)
+                    // Respect title-bar specific setting to hide nav arrows when tabs are rendered in title bar.
+                    let hide_arrows = TabBarSettings::get_global(cx)
+                        .hide_nav_arrows_in_title_bar
+                        && TabBarSettings::get_global(cx).show_in_title_bar;
+                    if hide_arrows {
+                        tab_bar
+                    } else {
+                        tab_bar
+                            .start_child(navigate_backward)
+                            .start_child(navigate_forward)
+                    }
                 },
             )
             .map(|tab_bar| {
@@ -3300,60 +3323,11 @@ fn default_render_tab_bar_buttons(
                 .with_handle(pane.new_item_context_menu_handle.clone())
                 .menu(move |window, cx| {
                     Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New File", NewFile.boxed_clone())
-                            .action("Open File", ToggleFileFinder::default().boxed_clone())
-                            .separator()
-                            .action(
-                                "Search Project",
-                                DeploySearch {
-                                    replace_enabled: false,
-                                    included_files: None,
-                                    excluded_files: None,
-                                }
-                                .boxed_clone(),
-                            )
-                            .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
-                            .separator()
-                            .action("New Terminal", NewTerminal.boxed_clone())
+                        // Open a new Agent Panel (currently implemented as a terminal tab in the center pane)
+                        menu.action("New Agent Panel", NewCenterTerminal.boxed_clone())
                     }))
                 }),
         )
-        .child(
-            PopoverMenu::new("pane-tab-bar-split")
-                .trigger_with_tooltip(
-                    IconButton::new("split", IconName::Split).icon_size(IconSize::Small),
-                    Tooltip::text("Split Pane"),
-                )
-                .anchor(Corner::TopRight)
-                .with_handle(pane.split_item_context_menu_handle.clone())
-                .menu(move |window, cx| {
-                    ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("Split Right", SplitRight.boxed_clone())
-                            .action("Split Left", SplitLeft.boxed_clone())
-                            .action("Split Up", SplitUp.boxed_clone())
-                            .action("Split Down", SplitDown.boxed_clone())
-                    })
-                    .into()
-                }),
-        )
-        .child({
-            let zoomed = pane.is_zoomed();
-            IconButton::new("toggle_zoom", IconName::Maximize)
-                .icon_size(IconSize::Small)
-                .toggle_state(zoomed)
-                .selected_icon(IconName::Minimize)
-                .on_click(cx.listener(|pane, _, window, cx| {
-                    pane.toggle_zoom(&crate::ToggleZoom, window, cx);
-                }))
-                .tooltip(move |window, cx| {
-                    Tooltip::for_action(
-                        if zoomed { "Zoom Out" } else { "Zoom In" },
-                        &ToggleZoom,
-                        window,
-                        cx,
-                    )
-                })
-        })
         .into_any_element()
         .into();
     (None, right_children)

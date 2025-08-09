@@ -123,42 +123,69 @@ impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title_bar_settings = *TitleBarSettings::get_global(cx);
 
-        let mut children = Vec::new();
+        // Build a left block containing project/menu, collaborators, and optional banner
+        let left_block = h_flex()
+            .gap_1()
+            .map(|title_bar| {
+                let mut render_project_items = title_bar_settings.show_branch_name
+                    || title_bar_settings.show_project_items;
+                title_bar
+                    .when_some(self.application_menu.clone(), |title_bar, menu| {
+                        render_project_items &= !menu.read(cx).all_menus_shown();
+                        title_bar.child(menu)
+                    })
+                    .when(render_project_items, |title_bar| {
+                        title_bar
+                            .when(title_bar_settings.show_project_items, |title_bar| {
+                                title_bar
+                                    .children(self.render_project_host(cx))
+                                    // Remove the "Open recent project" button for terminal-centric workflow
+                                    // .child(self.render_project_name(cx))
+                            })
+                            .when(title_bar_settings.show_branch_name, |title_bar| {
+                                title_bar.children(self.render_project_branch(cx))
+                            })
+                    })
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .into_any_element();
 
-        children.push(
-            h_flex()
-                .gap_1()
-                .map(|title_bar| {
-                    let mut render_project_items = title_bar_settings.show_branch_name
-                        || title_bar_settings.show_project_items;
-                    title_bar
-                        .when_some(self.application_menu.clone(), |title_bar, menu| {
-                            render_project_items &= !menu.read(cx).all_menus_shown();
-                            title_bar.child(menu)
-                        })
-                        .when(render_project_items, |title_bar| {
-                            title_bar
-                                .when(title_bar_settings.show_project_items, |title_bar| {
-                                    title_bar
-                                        .children(self.render_project_host(cx))
-                                        .child(self.render_project_name(cx))
-                                })
-                                .when(title_bar_settings.show_branch_name, |title_bar| {
-                                    title_bar.children(self.render_project_branch(cx))
-                                })
-                        })
-                })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .into_any_element(),
-        );
-
-        children.push(self.render_collaborator_list(window, cx).into_any_element());
-
+        let mut left_children: Vec<AnyElement> = Vec::new();
+        left_children.push(left_block);
+        left_children.push(self.render_collaborator_list(window, cx).into_any_element());
         if title_bar_settings.show_onboarding_banner {
-            children.push(self.banner.clone().into_any_element())
+            left_children.push(self.banner.clone().into_any_element());
         }
+        let left_container = h_flex().gap_1().children(left_children).into_any_element();
 
-        children.push(
+        // Build center block (tabs) if enabled, otherwise a flexible spacer
+        let center_container = if workspace::TabBarSettings::get_global(cx).show_in_title_bar {
+            if let Some(workspace) = self.workspace.upgrade() {
+                let pane = workspace.read_with(cx, |ws, _| ws.focused_pane(window, cx));
+                // Only render tabs when there are items; otherwise leave center as flexible spacer
+                let has_items = pane.read(cx).items_len() > 0;
+                if has_items {
+                    let tab = pane.update(cx, |pane, cx| {
+                        pane.render_tab_bar_element_for_titlebar(window, cx)
+                    });
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(tab)
+                        .into_any_element()
+                } else {
+                    h_flex().flex_1().min_w_0().into_any_element()
+                }
+            } else {
+                h_flex().flex_1().min_w_0().into_any_element()
+            }
+        } else {
+            h_flex().flex_1().min_w_0().into_any_element()
+        };
+
+        // Build right block
+        let right_container =
             h_flex()
                 .gap_1()
                 .pr_1()
@@ -177,8 +204,9 @@ impl Render for TitleBar {
                             .child(self.render_user_menu_button(cx))
                     }
                 })
-                .into_any_element(),
-        );
+                .into_any_element();
+
+        let children: Vec<AnyElement> = vec![left_container, center_container, right_container];
 
         self.platform_titlebar.update(cx, |this, _| {
             this.set_children(children);

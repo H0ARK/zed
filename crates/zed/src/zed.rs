@@ -297,7 +297,7 @@ pub fn initialize_workspace(
 
         let popover_menu_handle = PopoverMenuHandle::default();
 
-        let edit_prediction_button = cx.new(|cx| {
+        let _edit_prediction_button = cx.new(|cx| {
             inline_completion_button::InlineCompletionButton::new(
                 app_state.fs.clone(),
                 app_state.user_store.clone(),
@@ -312,37 +312,26 @@ pub fn initialize_workspace(
             }
         });
 
-        let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
-        let diagnostic_summary =
+        let _search_button = cx.new(|_| search::search_status_button::SearchButton::new());
+        let _diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
-        let activity_indicator = activity_indicator::ActivityIndicator::new(
+        let _activity_indicator = activity_indicator::ActivityIndicator::new(
             workspace,
             workspace.project().read(cx).languages().clone(),
             window,
             cx,
         );
-        let active_buffer_language =
+        let _active_buffer_language =
             cx.new(|_| language_selector::ActiveBufferLanguage::new(workspace));
-        let active_toolchain_language =
+        let _active_toolchain_language =
             cx.new(|cx| toolchain_selector::ActiveToolchain::new(workspace, window, cx));
-        let vim_mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
-        let image_info = cx.new(|_cx| ImageInfo::new(workspace));
-        let lsp_tool = cx.new(|cx| LspTool::new(workspace, window, cx));
+        let _vim_mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
+        let _image_info = cx.new(|_cx| ImageInfo::new(workspace));
+        let _lsp_tool = cx.new(|cx| LspTool::new(workspace, window, cx));
 
-        let cursor_position =
+        let _cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
-        workspace.status_bar().update(cx, |status_bar, cx| {
-            status_bar.add_left_item(search_button, window, cx);
-            status_bar.add_left_item(diagnostic_summary, window, cx);
-            status_bar.add_left_item(lsp_tool, window, cx);
-            status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(edit_prediction_button, window, cx);
-            status_bar.add_right_item(active_buffer_language, window, cx);
-            status_bar.add_right_item(active_toolchain_language, window, cx);
-            status_bar.add_right_item(vim_mode_indicator, window, cx);
-            status_bar.add_right_item(cursor_position, window, cx);
-            status_bar.add_right_item(image_info, window, cx);
-        });
+        // Bottom status bar removed; skip adding status bar items.
 
         let handle = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
