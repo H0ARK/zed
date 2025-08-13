@@ -57,21 +57,24 @@ use client::zed_urls;
 use zed_llm_client::UsageLimit;
 use zed_actions::agent::OpenConfiguration;
 use zed_actions::assistant::OpenRulesLibrary;
-use crate::{AddContextServer, NewTextThread, ToggleOptionsMenu, OpenHistory};
+use crate::{AddContextServer, NewTextThread, ToggleOptionsMenu, OpenHistory, text_thread_editor::humanize_token_count};
 use workspace::ToggleZoom;
-use gpui::{AsyncApp, AsyncWindowContext, Corner};
+use gpui::{AsyncApp, AsyncWindowContext, Corner, StatefulInteractiveElement as _};
 use copilot::copilot_chat;
 use util::ResultExt;
 struct DirBrowser {
+    parent: WeakEntity<MessageEditor>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     current_dir: PathBuf,
     search_editor: Entity<Editor>,
     menu_focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DirBrowser {
     fn new(
+        parent: WeakEntity<MessageEditor>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         start_dir: PathBuf,
@@ -85,13 +88,23 @@ impl DirBrowser {
             editor
         });
 
-        Self {
+        let mut this = Self {
+            parent,
             project,
             workspace,
             current_dir: start_dir,
-            search_editor,
+            search_editor: search_editor.clone(),
             menu_focus,
-        }
+            _subscriptions: Vec::new(),
+        };
+
+        // Re-render on search edits so filtering updates live.
+        this._subscriptions.push(cx.subscribe(&search_editor, |_this, _, event, cx| match event {
+            EditorEvent::BufferEdited => cx.notify(),
+            _ => {}
+        }));
+
+        this
     }
 }
 
@@ -140,8 +153,9 @@ impl Render for DirBrowser {
             let snapshot = wt.snapshot();
             let query = self.search_editor.read(cx).text(cx).to_lowercase();
 
+            let mut dir_items: Vec<(Arc<std::path::Path>, String, Option<PathBuf>)> = Vec::new();
             for entry in snapshot.child_entries(&rel) {
-                let is_dir = entry.is_dir();
+                if !entry.is_dir() { continue; }
                 let name = entry
                     .path
                     .file_name()
@@ -150,41 +164,109 @@ impl Render for DirBrowser {
                 if !query.is_empty() && !name.to_lowercase().contains(&query) {
                     continue;
                 }
-                let icon = if is_dir {
-                    FileIcons::get_folder_icon(false, cx)
-                        .map(Icon::from_path)
-                        .unwrap_or_else(|| Icon::new(IconName::Folder))
-                } else {
-                    FileIcons::get_icon(&entry.path, cx)
-                        .map(Icon::from_path)
-                        .unwrap_or_else(|| Icon::new(IconName::File))
-                };
                 let abs = wt.absolutize(&entry.path).ok();
-                let workspace = self.workspace.clone();
+                dir_items.push((entry.path.clone(), name, abs));
+            }
+
+            dir_items.sort_by(|a, b| {
+                let (a_hidden, b_hidden) = (a.1.starts_with('.'), b.1.starts_with('.'));
+                (a_hidden as u8, a.1.to_lowercase()).cmp(&(b_hidden as u8, b.1.to_lowercase()))
+            });
+
+            for (rel_path, name, abs) in dir_items {
+                let icon = FileIcons::get_folder_icon(false, cx)
+                    .map(Icon::from_path)
+                    .unwrap_or_else(|| Icon::new(IconName::Folder));
+                let abs_clone = abs.clone();
                 children.push(
-                    ui::ListItem::new(entry.path.clone())
+                    ui::ListItem::new(rel_path.clone())
                         .start_slot(icon.size(IconSize::Small).color(Color::Muted))
                         .child(Label::new(name.clone()))
                         .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
-                            if is_dir {
-                                if let Some(abs) = abs.clone() {
-                                    this.current_dir = abs;
-                                    cx.notify();
-                                }
-                                window.focus(&this.menu_focus);
-                            } else if let (Some(ws), Some(abs)) = (workspace.upgrade(), abs.clone()) {
-                                if let Some(pp) = ws.read(cx).project().read(cx).project_path_for_absolute_path(&abs, cx) {
-                                    ws.update(cx, |ws, cx| {
-                                        ws.open_path(pp, None, true, window, cx).detach_and_log_err(cx);
+                            if let Some(abs) = abs_clone.clone() {
+                                // Set parent cwd and close the menu instead of navigating within
+                                if let Some(parent) = this.parent.upgrade() {
+                                    let _ = parent.update(cx, |parent, cx| {
+                                        parent.cwd = Some(abs);
+                                        cx.notify();
                                     });
                                 }
+                                this.menu_focus.dispatch_action(&menu::Cancel, window, cx);
                             }
                         }))
                         .into_any_element(),
                 );
             }
         } else {
-            children.push(Label::new("No project directory").color(Color::Muted).into_any_element());
+            // Fallback to browsing the filesystem directly (e.g., home directory) when no project worktree
+            if !self.current_dir.is_dir() {
+                self.current_dir = paths::home_dir().clone();
+            }
+
+            // Parent navigation when possible
+            if let Some(parent) = self.current_dir.parent() {
+                let parent = parent.to_path_buf();
+                children.push(
+                    ui::ListItem::new("go-up-fs")
+                        .child(Label::new("..").size(LabelSize::Small))
+                        .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
+                            this.current_dir = parent.clone();
+                            cx.notify();
+                            window.focus(&this.menu_focus);
+                        }))
+                        .into_any_element(),
+                );
+            }
+
+            let query = self.search_editor.read(cx).text(cx).to_lowercase();
+            if let Ok(read_dir) = std::fs::read_dir(&self.current_dir) {
+                let mut entries: Vec<std::path::PathBuf> = Vec::new();
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if !query.is_empty() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if !name.to_lowercase().contains(&query) { continue; }
+                            }
+                        }
+                        entries.push(path);
+                    }
+                }
+                entries.sort_by(|a, b| {
+                    let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    (an.starts_with('.'), an.to_lowercase()).cmp(&(bn.starts_with('.'), bn.to_lowercase()))
+                });
+
+                for abs in entries {
+                    let name = abs
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| abs.to_string_lossy().to_string());
+                    let icon = FileIcons::get_folder_icon(false, cx)
+                        .map(Icon::from_path)
+                        .unwrap_or_else(|| Icon::new(IconName::Folder));
+                    let abs_clone = abs.clone();
+                    children.push(
+                        ui::ListItem::new(Arc::from(abs.clone()))
+                            .start_slot(icon.size(IconSize::Small).color(Color::Muted))
+                            .child(Label::new(name))
+                            .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
+                                if let Some(parent) = this.parent.upgrade() {
+                                    let _ = parent.update(cx, |parent, cx| {
+                                        parent.cwd = Some(abs_clone.clone());
+                                        cx.notify();
+                                    });
+                                }
+                                this.menu_focus.dispatch_action(&menu::Cancel, window, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            } else {
+                children.push(Label::new("~").color(Color::Muted).into_any_element());
+            }
         }
 
         let settings = ThemeSettings::get_global(cx);
@@ -200,7 +282,6 @@ impl Render for DirBrowser {
 
         v_flex()
             .w(px(420.0))
-            .h(px(360.0))
             .gap_1()
             .child(
                 EditorElement::new(
@@ -459,8 +540,12 @@ impl MessageEditor {
             cx.new(|cx| ProfileSelector::new(fs, thread.clone(), editor.focus_handle(cx), cx));
 
         let project = thread.read(cx).project().clone();
-        // Default cwd to the user's home directory
-        let initial_cwd = Some(paths::home_dir().clone());
+        // Default cwd to the project's root when available; otherwise fallback to the user's home directory
+        let initial_cwd = project
+            .read(cx)
+            .first_project_directory(cx)
+            .or_else(|| project.read(cx).active_project_directory(cx).map(|p| p.to_path_buf()))
+            .or_else(|| Some(paths::home_dir().clone()));
 
         let this = Self {
             editor: editor.clone(),
@@ -678,27 +763,27 @@ impl MessageEditor {
 
         log::info!("Executing direct terminal command: {}", command);
 
+        // Intercept cd to update the working directory state
+        let mut effective_command = command.clone();
+        if let Some(new_cwd) = Self::resolve_cd_command(&command, self.cwd.clone(), &self.project, cx) {
+            self.cwd = Some(new_cwd);
+            cx.notify();
+            // Run pwd to reflect new state to the user
+            effective_command = "pwd".to_string();
+        }
+
         // Execute the terminal command directly using the run_command tool
-        let ui_text = format!("$ {}", command);
+        let ui_text = format!("$ {}", effective_command);
         // Determine a valid working directory for the terminal tool. If `self.cwd`
         // is not inside any project worktree, fall back to "." so the tool
         // resolves it according to workspace settings.
-        let cd_value = {
-            let mut cd = String::from(".");
-            if let Some(cwd) = &self.cwd {
-                let project = self.project.read(cx);
-                let in_worktree = project.worktrees(cx).any(|wt| {
-                    let wt_path = wt.read(cx).abs_path();
-                    cwd.starts_with(&wt_path)
-                });
-                if in_worktree {
-                    cd = cwd.to_string_lossy().to_string();
-                }
-            }
-            cd
-        };
+        let cd_value = self
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
         let tool_input = serde_json::json!({
-            "command": command,
+            "command": effective_command,
             "cd": cd_value
         });
 
@@ -757,6 +842,42 @@ impl MessageEditor {
         // Emit event to scroll to bottom to show the new message
         cx.emit(MessageEditorEvent::ScrollThreadToBottom);
         cx.notify();
+    }
+
+    fn resolve_cd_command(
+        command: &str,
+        current: Option<PathBuf>,
+        project: &Entity<Project>,
+        cx: &App,
+    ) -> Option<PathBuf> {
+        // Accept commands like: cd, cd .., cd path, cd "path with spaces"
+        let trimmed = command.trim_start();
+        if !trimmed.starts_with("cd") { return None; }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let first = parts.next()?;
+        if first != "cd" { return None; }
+        let arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        let base = current
+            .or_else(|| project.read(cx).first_project_directory(cx))
+            .unwrap_or_else(|| paths::home_dir().clone());
+
+        let target: PathBuf = match arg {
+            None => paths::home_dir().clone(),
+            Some(path_str) => {
+                // Remove surrounding quotes if present
+                let unquoted = path_str
+                    .trim_matches('"')
+                    .trim_matches('\'');
+                // Tilde expansion
+                let expanded = shellexpand::full(unquoted).unwrap_or_else(|_| unquoted.into()).to_string();
+                let p = std::path::PathBuf::from(&expanded);
+                if p.is_absolute() { p } else { base.join(p) }
+            }
+        };
+
+        // Only accept directories that exist
+        if target.is_dir() { Some(target) } else { None }
     }
 
     #[allow(dead_code)]
@@ -1138,6 +1259,38 @@ impl MessageEditor {
     //         }))
     // }
 
+    fn render_token_count(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.thread.read(cx);
+        let total_token_usage = thread.total_token_usage()?;
+
+        if total_token_usage.total == 0 {
+            return None;
+        }
+
+        let token_color = match total_token_usage.ratio() {
+            TokenUsageRatio::Normal => Color::Muted,
+            TokenUsageRatio::Warning => Color::Warning,
+            TokenUsageRatio::Exceeded => Color::Error,
+        };
+
+        Some(
+            h_flex()
+                .id("token-count")
+                .gap_0p5()
+                .child(
+                    Label::new(humanize_token_count(total_token_usage.total))
+                        .size(LabelSize::Small)
+                        .color(token_color),
+                )
+                .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Label::new(humanize_token_count(total_token_usage.max))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        )
+    }
+
     fn render_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let thread = self.thread.read(cx);
         let model = thread.configured_model();
@@ -1223,19 +1376,27 @@ impl MessageEditor {
                             .menu({
                                 let workspace = self.workspace.clone();
                                 let project = self.project.clone();
+                                let parent = cx.entity().downgrade();
+                                // Start in the last selected cwd if available; otherwise fall back to project root or home
                                 let start_dir = self
                                     .cwd
                                     .clone()
-                                    .or_else(|| project.read(cx).first_project_directory(cx))
-                                    .unwrap_or_else(|| paths::home_dir().clone());
+                                    .unwrap_or_else(|| {
+                                        project
+                                            .read(cx)
+                                            .first_project_directory(cx)
+                                            .unwrap_or_else(|| paths::home_dir().clone())
+                                    });
                                 move |window, cx| {
                                     let proj = project.clone();
                                     let ws = workspace.clone();
+                                    let parent = parent.clone();
                                     let dir = start_dir.clone();
                                     Some(ContextMenu::build_persistent(window, cx, move |mut menu, window, cx| {
                                         let menu_focus = menu.focus_handle(cx);
-                                        let browser = cx.new(|cx| DirBrowser::new(proj.clone(), ws.clone(), dir.clone(), menu_focus.clone(), window, cx));
+                                        let browser = cx.new(|cx| DirBrowser::new(parent.clone(), proj.clone(), ws.clone(), dir.clone(), menu_focus.clone(), window, cx));
                                         menu = menu
+                                            .on_blur_subscription(Subscription::new(|| {}))
                                             .keep_open_on_confirm(true)
                                             .custom_row(move |_window, _cx| browser.clone().into_any_element());
                                         menu
@@ -1243,11 +1404,13 @@ impl MessageEditor {
                                 }
                             })
                     }))
-                    // Right: Options menu trigger
+                    // Right: Token count and options menu trigger
                     .child(
                         h_flex()
                             .flex_none()
                             .items_center()
+                            .gap_2()
+                            .children(self.render_token_count(cx))
                             .child(self.render_agent_options_menu(window, cx))
                     ),
             )

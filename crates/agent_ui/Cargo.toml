@@ -97,6 +97,7 @@ zed_llm_client.workspace = true
 git.workspace = true
 git_ui.workspace = true
 copilot.workspace = true
+shellexpand.workspace = true
 
 [dev-dependencies]
 assistant_tools.workspace = true

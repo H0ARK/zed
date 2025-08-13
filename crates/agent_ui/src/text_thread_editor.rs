@@ -2560,6 +2560,55 @@ struct SelectedCreaseMetadata {
 impl EventEmitter<EditorEvent> for TextThreadEditor {}
 impl EventEmitter<SearchEvent> for TextThreadEditor {}
 
+impl TextThreadEditor {
+    fn render_token_count(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (token_count_color, token_count, max_token_count, tooltip) = match token_state(&self.context, cx)?
+        {
+            TokenState::NoTokensLeft {
+                max_token_count,
+                token_count,
+            } => (
+                Color::Error,
+                token_count,
+                max_token_count,
+                Some("Token Limit Reached"),
+            ),
+            TokenState::HasMoreTokens {
+                max_token_count,
+                token_count,
+                over_warn_threshold,
+            } => {
+                let (color, tooltip) = if over_warn_threshold {
+                    (Color::Warning, Some("Token Limit is Close to Exhaustion"))
+                } else {
+                    (Color::Muted, None)
+                };
+                (color, token_count, max_token_count, tooltip)
+            }
+        };
+
+        Some(
+            h_flex()
+                .id("token-count")
+                .gap_0p5()
+                .child(
+                    Label::new(humanize_token_count(token_count))
+                        .size(LabelSize::Small)
+                        .color(token_count_color),
+                )
+                .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Label::new(humanize_token_count(max_token_count))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .when_some(tooltip, |element, tooltip| {
+                    element.tooltip(Tooltip::text(tooltip))
+                }),
+        )
+    }
+}
+
 impl Render for TextThreadEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let provider = LanguageModelRegistry::read_global(cx)
@@ -2635,6 +2684,7 @@ impl Render for TextThreadEditor {
                     .child(
                         h_flex()
                             .gap_1()
+                            .children(self.render_token_count(cx))
                             .child(self.render_language_model_selector(window, cx))
                             .child(self.render_send_button(window, cx)),
                     ),
@@ -2931,57 +2981,6 @@ pub struct ContextEditorToolbarItem {
 
 impl ContextEditorToolbarItem {}
 
-pub fn render_remaining_tokens(
-    context_editor: &Entity<TextThreadEditor>,
-    cx: &App,
-) -> Option<impl IntoElement + use<>> {
-    let context = &context_editor.read(cx).context;
-
-    let (token_count_color, token_count, max_token_count, tooltip) = match token_state(context, cx)?
-    {
-        TokenState::NoTokensLeft {
-            max_token_count,
-            token_count,
-        } => (
-            Color::Error,
-            token_count,
-            max_token_count,
-            Some("Token Limit Reached"),
-        ),
-        TokenState::HasMoreTokens {
-            max_token_count,
-            token_count,
-            over_warn_threshold,
-        } => {
-            let (color, tooltip) = if over_warn_threshold {
-                (Color::Warning, Some("Token Limit is Close to Exhaustion"))
-            } else {
-                (Color::Muted, None)
-            };
-            (color, token_count, max_token_count, tooltip)
-        }
-    };
-
-    Some(
-        h_flex()
-            .id("token-count")
-            .gap_0p5()
-            .child(
-                Label::new(humanize_token_count(token_count))
-                    .size(LabelSize::Small)
-                    .color(token_count_color),
-            )
-            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
-            .child(
-                Label::new(humanize_token_count(max_token_count))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .when_some(tooltip, |element, tooltip| {
-                element.tooltip(Tooltip::text(tooltip))
-            }),
-    )
-}
 
 impl Render for ContextEditorToolbarItem {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3023,12 +3022,8 @@ impl Render for ContextEditorToolbarItem {
             //     scan_items_remaining
             //         .map(|remaining_items| format!("Files to scan: {}", remaining_items))
             // })
-            .children(
-                self.active_context_editor
-                    .as_ref()
-                    .and_then(|editor| editor.upgrade())
-                    .and_then(|editor| render_remaining_tokens(&editor, cx)),
-            );
+            // Token count now displayed directly in the TextThreadEditor
+            ;
 
         h_flex()
             .px_0p5()
