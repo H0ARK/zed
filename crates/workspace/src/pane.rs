@@ -1,5 +1,5 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, OpenInTerminal, OpenOptions, OpenTerminal,
+    CloseWindow, NewFile, NewTerminal, OpenAgentTab, OpenInTerminal, OpenOptions, OpenTerminal,
     OpenVisible, SplitDirection, ToggleZoom, Workspace, WorkspaceItemBuilder,
     item::{
         ActivateOnClose, ClosePosition, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
@@ -2757,35 +2757,35 @@ impl Pane {
                 }
             })
             .tooltip(Tooltip::text("Toggle left dock"));
-        let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
-            .icon_size(IconSize::Small)
-            .on_click({
-                let entity = cx.entity().clone();
-                move |_, window, cx| {
-                    entity.update(cx, |pane, cx| pane.navigate_backward(window, cx))
-                }
-            })
-            .disabled(!self.can_navigate_backward())
-            .tooltip({
-                let focus_handle = focus_handle.clone();
-                move |window, cx| {
-                    Tooltip::for_action_in("Go Back", &GoBack, &focus_handle, window, cx)
-                }
-            });
+        // let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
+        //     .icon_size(IconSize::Small)
+        //     .on_click({
+        //         let entity = cx.entity().clone();
+        //         move |_, window, cx| {
+        //             entity.update(cx, |pane, cx| pane.navigate_backward(window, cx))
+        //         }
+        //     })
+        //     .disabled(!self.can_navigate_backward())
+        //     .tooltip({
+        //         let focus_handle = focus_handle.clone();
+        //         move |window, cx| {
+        //             Tooltip::for_action_in("Go Back", &GoBack, &focus_handle, window, cx)
+        //         }
+        //     });
 
-        let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
-            .icon_size(IconSize::Small)
-            .on_click({
-                let entity = cx.entity().clone();
-                move |_, window, cx| entity.update(cx, |pane, cx| pane.navigate_forward(window, cx))
-            })
-            .disabled(!self.can_navigate_forward())
-            .tooltip({
-                let focus_handle = focus_handle.clone();
-                move |window, cx| {
-                    Tooltip::for_action_in("Go Forward", &GoForward, &focus_handle, window, cx)
-                }
-            });
+        // let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
+        //     .icon_size(IconSize::Small)
+        //     .on_click({
+        //         let entity = cx.entity().clone();
+        //         move |_, window, cx| entity.update(cx, |pane, cx| pane.navigate_forward(window, cx))
+        //     })
+        //     .disabled(!self.can_navigate_forward())
+        //     .tooltip({
+        //         let focus_handle = focus_handle.clone();
+        //         move |window, cx| {
+        //             Tooltip::for_action_in("Go Forward", &GoForward, &focus_handle, window, cx)
+        //         }
+        //     });
 
         let mut tab_items = self
             .items
@@ -2823,8 +2823,8 @@ impl Pane {
                         tab_bar
                     } else {
                         tab_bar
-                            .start_child(navigate_backward)
-                            .start_child(navigate_forward)
+                    //         .start_child(navigate_backward)
+                    //         .start_child(navigate_forward)
                     }
                 },
             )
@@ -3323,8 +3323,11 @@ fn default_render_tab_bar_buttons(
                 .with_handle(pane.new_item_context_menu_handle.clone())
                 .menu(move |window, cx| {
                     Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        // Open a new Agent Panel (currently implemented as a terminal tab in the center pane)
-                        menu.action("New Agent Panel", NewCenterTerminal.boxed_clone())
+                        // Offer common items that can be added to the main (center) page
+                        menu
+                            .action("New File", NewFile.boxed_clone())
+                            .action("New Terminal", NewTerminal.boxed_clone())
+                            .action("New Agent Panel", OpenAgentTab.boxed_clone())
                     }))
                 }),
         )

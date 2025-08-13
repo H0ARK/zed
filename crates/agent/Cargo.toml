@@ -36,6 +36,7 @@ git.workspace = true
 gpui.workspace = true
 heed.workspace = true
 icons.workspace = true
+indexmap.workspace = true
 indoc.workspace = true
 http_client.workspace = true
 itertools.workspace = true

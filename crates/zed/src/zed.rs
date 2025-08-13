@@ -65,7 +65,7 @@ use vim_mode_setting::VimModeSetting;
 use welcome::{BaseKeymap, DOCS_URL, MultibufferHint};
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 use workspace::{
-    AppState, NewFile, NewWindow, OpenLog, SplitDirection, Toast, Workspace, WorkspaceSettings,
+    AppState, NewFile, NewWindow, OpenLog, Toast, Workspace, WorkspaceSettings,
     create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
     open_new,
 };
@@ -540,7 +540,26 @@ fn initialize_panels(
 
                 workspace
                     .register_action(agent_ui::AgentPanel::toggle_focus)
-                    .register_action(agent_ui::InlineAssistant::inline_assist);
+                    .register_action(agent_ui::InlineAssistant::inline_assist)
+                    .register_action({
+                        let prompt_builder = prompt_builder.clone();
+                        move |workspace, _: &agent_ui::NewAgentTab, window, cx| {
+                            let task = agent_ui::AgentItem::load(
+                                workspace.weak_handle(),
+                                prompt_builder.clone(),
+                                window.to_async(cx),
+                            );
+                            cx.spawn_in(window, async move |workspace, cx| {
+                                if let Ok(agent_item) = task.await {
+                                    workspace.update_in(cx, |workspace, window, cx| {
+                                        workspace.add_item_to_active_pane(Box::new(agent_item), None, true, window, cx);
+                                    })?;
+                                }
+                                anyhow::Ok(())
+                            })
+                            .detach_and_log_err(cx);
+                        }
+                    });
             }
         })?;
 
@@ -851,7 +870,7 @@ fn register_actions(
         })
         .register_action({
             let prompt_builder = prompt_builder.clone();
-            move |workspace, _: &OpenAgentTab, window, cx| {
+            move |workspace, _: &workspace::OpenAgentTab, window, cx| {
                 let task = AgentItem::load(
                     workspace.weak_handle(),
                     prompt_builder.clone(),
@@ -860,16 +879,7 @@ fn register_actions(
                 cx.spawn_in(window, async move |workspace, cx| {
                     if let Ok(agent_item) = task.await {
                         workspace.update_in(cx, |workspace, window, cx| {
-                            // Create a new pane by splitting to the right
-                            let new_pane = workspace.split_pane(
-                                workspace.active_pane().clone(),
-                                SplitDirection::Right,
-                                window,
-                                cx,
-                            );
-                            new_pane.update(cx, |pane, cx| {
-                                pane.add_item(Box::new(agent_item), true, true, None, window, cx);
-                            });
+                            workspace.add_item_to_active_pane(Box::new(agent_item), None, true, window, cx);
                         })?;
                     }
                     anyhow::Ok(())

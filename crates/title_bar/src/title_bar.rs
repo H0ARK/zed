@@ -156,7 +156,7 @@ impl Render for TitleBar {
         if title_bar_settings.show_onboarding_banner {
             left_children.push(self.banner.clone().into_any_element());
         }
-        let left_container = h_flex().gap_1().children(left_children).into_any_element();
+        let left_container = h_flex().children(left_children).into_any_element();
 
         // Build center block (tabs) if enabled, otherwise a flexible spacer
         let center_container = if workspace::TabBarSettings::get_global(cx).show_in_title_bar {
@@ -187,8 +187,6 @@ impl Render for TitleBar {
         // Build right block
         let right_container =
             h_flex()
-                .gap_1()
-                .pr_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(self.render_call_controls(window, cx))
                 .map(|el| {

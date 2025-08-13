@@ -127,7 +127,7 @@ impl AgentContext {
 
 /// ID created at time of context add, for use in ElementId. This is not the stable identity of a
 /// context, instead that's handled by the `PartialEq` and `Hash` impls of `AgentContextKey`.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ContextId(u64);
 
 impl ContextId {

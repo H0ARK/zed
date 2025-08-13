@@ -8,7 +8,7 @@ use client::{Client, ProxySettings, UserStore, parse_zed_link};
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
 use db::kvp::{GLOBAL_KEY_VALUE_STORE, KEY_VALUE_STORE};
-use editor::Editor;
+// use editor::Editor;
 use extension::ExtensionHostProxy;
 use extension_host::ExtensionStore;
 use fs::{Fs, RealFs};

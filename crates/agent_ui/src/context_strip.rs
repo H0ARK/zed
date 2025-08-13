@@ -1,6 +1,7 @@
+use crate::{FocusLeft, FocusRight};
 use crate::{
-    AcceptSuggestedContext, AgentPanel, FocusDown, FocusLeft, FocusRight, FocusUp,
-    ModelUsageContext, RemoveAllContext, RemoveFocusedContext, ToggleContextPicker,
+    AcceptSuggestedContext, AgentPanel, FocusDown, FocusUp, ModelUsageContext, RemoveAllContext,
+    RemoveFocusedContext, ToggleContextPicker,
     context_picker::ContextPicker,
     ui::{AddedContext, ContextPill},
 };

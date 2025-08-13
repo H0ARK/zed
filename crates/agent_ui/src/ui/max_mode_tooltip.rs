@@ -7,10 +7,12 @@ pub struct MaxModeTooltip {
 }
 
 impl MaxModeTooltip {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self { selected: false }
     }
 
+    #[allow(dead_code)]
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self

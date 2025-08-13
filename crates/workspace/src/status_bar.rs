@@ -8,6 +8,7 @@ use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{h_flex, prelude::*};
 use util::ResultExt;
 
+#[allow(dead_code)]
 pub trait StatusItemView: Render {
     fn set_active_pane_item(
         &mut self,
@@ -17,6 +18,7 @@ pub trait StatusItemView: Render {
     );
 }
 
+#[allow(dead_code)]
 trait StatusItemViewHandle: Send {
     fn to_any(&self) -> AnyView;
     fn set_active_pane_item(
@@ -28,6 +30,7 @@ trait StatusItemViewHandle: Send {
     fn item_type(&self) -> TypeId;
 }
 
+#[allow(dead_code)]
 pub struct StatusBar {
     left_items: Vec<Box<dyn StatusItemViewHandle>>,
     right_items: Vec<Box<dyn StatusItemViewHandle>>,

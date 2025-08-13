@@ -107,24 +107,24 @@ impl ProfileSelector {
         settings: &AgentSettings,
         cx: &App,
     ) -> ContextMenuEntry {
-        let documentation = match profile_name.to_lowercase().as_str() {
-            builtin_profiles::WRITE => Some("Get help to write anything."),
-            builtin_profiles::ASK => Some("Chat about your codebase."),
-            builtin_profiles::MINIMAL => Some("Chat about anything with no tools."),
-            _ => None,
-        };
+        // let documentation = match profile_name.to_lowercase().as_str() {
+        //     builtin_profiles::WRITE => Some("Get help to write anything."),
+        //     builtin_profiles::ASK => Some("Chat about your codebase."),
+        //     builtin_profiles::MINIMAL => Some("Chat about anything with no tools."),
+        //     _ => None,
+        // };
         let thread_profile_id = self.thread.read(cx).profile().id();
 
         let entry = ContextMenuEntry::new(profile_name.clone())
             .toggleable(IconPosition::End, &profile_id == thread_profile_id);
 
-        let entry = if let Some(doc_text) = documentation {
-            entry.documentation_aside(documentation_side(settings.dock), move |_| {
-                Label::new(doc_text).into_any_element()
-            })
-        } else {
-            entry
-        };
+        // let entry = if let Some(doc_text) = documentation {
+        //     entry.documentation_aside(documentation_side(settings.dock), move |_| {
+        //         Label::new(doc_text).into_any_element()
+        //     })
+        // } else {
+        //     entry
+        // };
 
         entry.handler({
             let fs = self.fs.clone();
