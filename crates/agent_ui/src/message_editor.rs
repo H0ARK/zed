@@ -309,7 +309,7 @@ use crate::{
 };
 use gpui::Action;
 use agent::{
-    MessageCrease, Thread, TokenUsageRatio,
+    MessageCrease, Thread, TokenUsageRatio, TotalTokenUsage,
     context_store::ContextStore,
     thread_store::{TextThreadStore, ThreadStore},
 };
@@ -1261,13 +1261,26 @@ impl MessageEditor {
 
     fn render_token_count(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
-        let total_token_usage = thread.total_token_usage()?;
+        let unsent_tokens = self.last_estimated_token_count().unwrap_or(0);
+        let is_estimating = unsent_tokens > 0;
 
-        if total_token_usage.total == 0 {
+        // Get conversation token usage, or use default if no conversation yet
+        let conversation_token_usage = thread.total_token_usage().unwrap_or_else(|| {
+            TotalTokenUsage { total: 0, max: 8192 } // Default reasonable max tokens
+        });
+
+        let combined_usage = conversation_token_usage.add(unsent_tokens);
+
+        // Show token count if we have tokens or estimated tokens  
+        if combined_usage.total == 0 && !is_estimating {
             return None;
         }
 
-        let token_color = match total_token_usage.ratio() {
+        let is_generating = thread.is_generating();
+        let is_waiting_to_update_token_count = self.is_waiting_to_update_token_count();
+
+        let token_color = match combined_usage.ratio() {
+            TokenUsageRatio::Normal if is_estimating => Color::Default,
             TokenUsageRatio::Normal => Color::Muted,
             TokenUsageRatio::Warning => Color::Warning,
             TokenUsageRatio::Exceeded => Color::Error,
@@ -1277,14 +1290,55 @@ impl MessageEditor {
             h_flex()
                 .id("token-count")
                 .gap_0p5()
+                .when(!is_generating && is_estimating, |parent| {
+                    parent
+                        .child(
+                            h_flex()
+                                .mr_1()
+                                .size_2p5()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(cx.theme().colors().text.opacity(0.1))
+                                .child(
+                                    div().size_1().rounded_full().bg(cx.theme().colors().text),
+                                ),
+                        )
+                        .tooltip(move |window, cx| {
+                            Tooltip::with_meta(
+                                "Estimated New Token Count",
+                                None,
+                                format!(
+                                    "Current Conversation Tokens: {}",
+                                    humanize_token_count(total_token_usage.total)
+                                ),
+                                window,
+                                cx,
+                            )
+                        })
+                })
                 .child(
-                    Label::new(humanize_token_count(total_token_usage.total))
+                    Label::new(humanize_token_count(combined_usage.total))
                         .size(LabelSize::Small)
-                        .color(token_color),
+                        .color(token_color)
+                        .map(|label| {
+                            if is_generating || is_waiting_to_update_token_count {
+                                label
+                                    .with_animation(
+                                        "used-tokens-label",
+                                        Animation::new(Duration::from_secs(2))
+                                            .repeat()
+                                            .with_easing(pulsating_between(0.6, 1.0)),
+                                        |label, delta| label.alpha(delta),
+                                    )
+                                    .into_any()
+                            } else {
+                                label.into_any_element()
+                            }
+                        }),
                 )
                 .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
                 .child(
-                    Label::new(humanize_token_count(total_token_usage.max))
+                    Label::new(humanize_token_count(combined_usage.max))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 ),

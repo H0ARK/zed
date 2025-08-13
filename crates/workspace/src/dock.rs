@@ -783,7 +783,35 @@ impl Render for Dock {
                         .icon_size(IconSize::Small)
                         .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
                 };
-                buttons.insert(0, add_quick("quick-project-panel", IconName::Folder, crate::ToggleLeftDock.boxed_clone()));
+                buttons.insert(
+                    0,
+                    IconButton::new("quick-project-panel", IconName::Folder)
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener(|this: &mut Dock, _event, window, cx| {
+                            this
+                                .workspace
+                                .update(cx, |workspace, cx| {
+                                    for dock in workspace.all_docks() {
+                                        if let Some(ix) = dock
+                                            .read(cx)
+                                            .panel_index_for_persistent_name("Project Panel", cx)
+                                        {
+                                            dock.update(cx, |dock, cx| {
+                                                dock.set_open(true, window, cx);
+                                                dock.activate_panel(ix, window, cx);
+                                                if let Some(panel) = dock.active_panel() {
+                                                    let focus_handle = panel.panel_focus_handle(cx);
+                                                    window.focus(&focus_handle);
+                                                }
+                                            });
+                                            return;
+                                        }
+                                    }
+                                    workspace.toggle_dock(DockPosition::Left, window, cx);
+                                })
+                                .ok();
+                        })),
+                );
                 buttons.push(add_quick("quick-search", IconName::MagnifyingGlass, crate::NewSearch.boxed_clone()));
                 buttons.push(add_quick("quick-diagnostics", IconName::BugOff, crate::ClearAllNotifications.boxed_clone()));
                 buttons.push(add_quick("quick-terminal", IconName::Terminal, crate::NewTerminal.boxed_clone()));
