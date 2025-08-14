@@ -6,14 +6,17 @@ use anyhow::{Context as _, anyhow};
 use core::fmt::Debug;
 use derive_more::{Add, AddAssign, Div, DivAssign, Mul, Neg, Sub, SubAssign};
 use refineable::Refineable;
-use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
+use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use std::borrow::Cow;
+use std::ops::Range;
 use std::{
     cmp::{self, PartialOrd},
     fmt::{self, Display},
     hash::Hash,
     ops::{Add, Div, Mul, MulAssign, Neg, Sub},
 };
+use taffy::prelude::{TaffyGridLine, TaffyGridSpan};
 
 use crate::{App, DisplayId};
 
@@ -3229,20 +3232,14 @@ impl TryFrom<&'_ str> for AbsoluteLength {
 }
 
 impl JsonSchema for AbsoluteLength {
-    fn schema_name() -> String {
-        "AbsoluteLength".to_string()
+    fn schema_name() -> Cow<'static, str> {
+        "AbsoluteLength".into()
     }
 
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::{InstanceType, SchemaObject, StringValidation};
-
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                pattern: Some(r"^-?\d+(\.\d+)?(px|rem)$".to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": r"^-?\d+(\.\d+)?(px|rem)$"
         })
     }
 }
@@ -3366,20 +3363,14 @@ impl TryFrom<&'_ str> for DefiniteLength {
 }
 
 impl JsonSchema for DefiniteLength {
-    fn schema_name() -> String {
-        "DefiniteLength".to_string()
+    fn schema_name() -> Cow<'static, str> {
+        "DefiniteLength".into()
     }
 
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::{InstanceType, SchemaObject, StringValidation};
-
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                pattern: Some(r"^-?\d+(\.\d+)?(px|rem|%)$".to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": r"^-?\d+(\.\d+)?(px|rem|%)$"
         })
     }
 }
@@ -3480,20 +3471,14 @@ impl TryFrom<&'_ str> for Length {
 }
 
 impl JsonSchema for Length {
-    fn schema_name() -> String {
-        "Length".to_string()
+    fn schema_name() -> Cow<'static, str> {
+        "Length".into()
     }
 
-    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::{InstanceType, SchemaObject, StringValidation};
-
-        Schema::Object(SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                pattern: Some(r"^(auto|-?\d+(\.\d+)?(px|rem|%))$".to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": r"^(auto|-?\d+(\.\d+)?(px|rem|%))$"
         })
     }
 }
@@ -3539,7 +3524,7 @@ impl Serialize for Length {
 /// # Returns
 ///
 /// A `DefiniteLength` representing the relative length as a fraction of the parent's size.
-pub fn relative(fraction: f32) -> DefiniteLength {
+pub const fn relative(fraction: f32) -> DefiniteLength {
     DefiniteLength::Fraction(fraction)
 }
 
@@ -3622,6 +3607,37 @@ impl Default for Length {
 impl From<()> for Length {
     fn from(_: ()) -> Self {
         Self::Definite(DefiniteLength::default())
+    }
+}
+
+/// A location in a grid layout.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub struct GridLocation {
+    /// The rows this item uses within the grid.
+    pub row: Range<GridPlacement>,
+    /// The columns this item uses within the grid.
+    pub column: Range<GridPlacement>,
+}
+
+/// The placement of an item within a grid layout's column or row.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
+pub enum GridPlacement {
+    /// The grid line index to place this item.
+    Line(i16),
+    /// The number of grid lines to span.
+    Span(u16),
+    /// Automatically determine the placement, equivalent to Span(1)
+    #[default]
+    Auto,
+}
+
+impl From<GridPlacement> for taffy::GridPlacement {
+    fn from(placement: GridPlacement) -> Self {
+        match placement {
+            GridPlacement::Line(index) => taffy::GridPlacement::from_line_index(index),
+            GridPlacement::Span(span) => taffy::GridPlacement::from_span(span),
+            GridPlacement::Auto => taffy::GridPlacement::Auto,
+        }
     }
 }
 

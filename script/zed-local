@@ -36,7 +36,9 @@ if (process.env.SEED_PATH) {
     const defaultUsers = users;
     const customUsers = require("../crates/collab/seed.json").admins;
     assert(customUsers.length > 0);
-    users = customUsers.concat(defaultUsers.filter((user) => !customUsers.includes(user)));
+    users = customUsers.concat(
+      defaultUsers.filter((user) => !customUsers.includes(user)),
+    );
   } catch (_) {}
 }
 
@@ -89,7 +91,9 @@ if (platform === "darwin") {
       encoding: "utf8",
     }),
   );
-  const mainDisplayResolution = displayInfo?.SPDisplaysDataType?.flatMap((display) => display?.spdisplays_ndrvs)
+  const mainDisplayResolution = displayInfo?.SPDisplaysDataType?.flatMap(
+    (display) => display?.spdisplays_ndrvs,
+  )
     ?.find((entry) => entry?.spdisplays_main === "spdisplays_yes")
     ?._spdisplays_resolution?.match(RESOLUTION_REGEX);
   if (!mainDisplayResolution) {
@@ -182,7 +186,10 @@ setTimeout(() => {
     if (platform == "win32") {
       position = [column * instanceWidth, row * instanceHeight].join(",");
     } else {
-      position = [column * instanceWidth, row * instanceHeight + titleBarHeight].join(",");
+      position = [
+        column * instanceWidth,
+        row * instanceHeight + titleBarHeight,
+      ].join(",");
     }
     const size = [instanceWidth, instanceHeight].join(",");
     let binaryPath = zedBinary;
@@ -198,9 +205,15 @@ setTimeout(() => {
         ZED_WINDOW_POSITION: position,
         ZED_STATELESS: isStateful && i == 0 ? "" : "1",
         ZED_ALWAYS_ACTIVE: "1",
-        ZED_SERVER_URL: platform === "win32" ? "http://127.0.0.1:3000" : "http://localhost:3000",
-        ZED_RPC_URL: platform === "win32" ? "http://127.0.0.1:8080/rpc" : "http://localhost:8080/rpc",
-        ZED_ADMIN_API_TOKEN: "secret",
+        ZED_SERVER_URL:
+          platform === "win32"
+            ? "http://127.0.0.1:3000"
+            : "http://localhost:3000",
+        ZED_RPC_URL:
+          platform === "win32"
+            ? "http://127.0.0.1:8080/rpc"
+            : "http://localhost:8080/rpc",
+        ZED_ADMIN_API_TOKEN: "internal-api-key-secret",
         ZED_WINDOW_SIZE: size,
         ZED_CLIENT_CHECKSUM_SEED: "development-checksum-seed",
         RUST_LOG: process.env.RUST_LOG || "info",

@@ -1,8 +1,6 @@
 use crate::{
-    language_model_selector::{
-        LanguageModelSelector, ToggleModelSelector, language_model_selector,
-    },
-    max_mode_tooltip::MaxModeTooltip,
+    burn_mode_tooltip::BurnModeTooltip,
+    language_model_selector::{LanguageModelSelector, language_model_selector},
 };
 use agent_settings::{AgentSettings, CompletionMode};
 use anyhow::Result;
@@ -14,14 +12,13 @@ use assistant_slash_commands::{
 use client::{proto, zed_urls};
 use collections::{BTreeSet, HashMap, HashSet, hash_map};
 use editor::{
-    Anchor, Editor, EditorEvent, MenuInlineCompletionsPolicy, MultiBuffer, MultiBufferSnapshot,
+    Anchor, Editor, EditorEvent, MenuEditPredictionsPolicy, MultiBuffer, MultiBufferSnapshot,
     RowExt, ToOffset as _, ToPoint,
     actions::{MoveToEndOfLine, Newline, ShowCompletions},
     display_map::{
         BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseMetadata, CustomBlockId, FoldId,
         RenderBlock, ToDisplayPoint,
     },
-    scroll::Autoscroll,
 };
 use editor::{FoldPlaceholder, display_map::CreaseId};
 use fs::Fs;
@@ -39,8 +36,7 @@ use language::{
     language_settings::{SoftWrap, all_language_settings},
 };
 use language_model::{
-    ConfigurationError, LanguageModelImage, LanguageModelProviderTosView, LanguageModelRegistry,
-    Role,
+    ConfigurationError, LanguageModelExt, LanguageModelImage, LanguageModelRegistry, Role,
 };
 use multi_buffer::MultiBufferRow;
 use picker::{Picker, popover_menu::PickerPopoverMenu};
@@ -69,12 +65,13 @@ use workspace::{
     searchable::{Direction, SearchableItemHandle},
 };
 use workspace::{
-    Save, Toast, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
+    Save, Toast, Workspace,
     item::{self, FollowableItem, Item, ItemHandle},
     notifications::NotificationId,
     pane,
     searchable::{SearchEvent, SearchableItem},
 };
+use zed_actions::agent::ToggleModelSelector;
 
 use crate::{slash_command::SlashCommandCompletionProvider, slash_command_picker};
 use assistant_context::{
@@ -86,16 +83,24 @@ use assistant_context::{
 actions!(
     assistant,
     [
+        /// Sends the current message to the assistant.
         Assist,
+        /// Confirms and executes the entered slash command.
         ConfirmCommand,
+        /// Copies code from the assistant's response to the clipboard.
         CopyCode,
+        /// Cycles between user and assistant message roles.
         CycleMessageRole,
+        /// Inserts the selected text into the active editor.
         InsertIntoEditor,
+        /// Quotes the current selection in the assistant conversation.
         QuoteSelection,
+        /// Splits the conversation at the current cursor position.
         Split,
     ]
 );
 
+/// Inserts files that were dragged and dropped into the assistant conversation.
 #[derive(PartialEq, Clone, Action)]
 #[action(namespace = assistant, no_json, no_register)]
 pub enum InsertDraggedFiles {
@@ -249,7 +254,7 @@ impl TextThreadEditor {
             editor.set_show_wrap_guides(false, cx);
             editor.set_show_indent_guides(false, cx);
             editor.set_completion_provider(Some(Rc::new(completion_provider)));
-            editor.set_menu_inline_completions_policy(MenuInlineCompletionsPolicy::Never);
+            editor.set_menu_edit_predictions_policy(MenuEditPredictionsPolicy::Never);
             editor.set_collaboration_hub(Box::new(project.clone()));
 
             let show_edit_predictions = all_language_settings(None, cx)
@@ -389,7 +394,7 @@ impl TextThreadEditor {
                 cursor..cursor
             };
             self.editor.update(cx, |editor, cx| {
-                editor.change_selections(Some(Autoscroll::fit()), window, cx, |selections| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
                     selections.select_ranges([new_selection])
                 });
             });
@@ -449,8 +454,7 @@ impl TextThreadEditor {
         if let Some(command) = self.slash_commands.command(name, cx) {
             self.editor.update(cx, |editor, cx| {
                 editor.transact(window, cx, |editor, window, cx| {
-                    editor
-                        .change_selections(Some(Autoscroll::fit()), window, cx, |s| s.try_cancel());
+                    editor.change_selections(Default::default(), window, cx, |s| s.try_cancel());
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
                     let newest_cursor = editor.selections.newest::<Point>(cx).head();
                     if newest_cursor.column > 0
@@ -1250,7 +1254,6 @@ impl TextThreadEditor {
                 ),
                 priority: usize::MAX,
                 render: render_block(MessageMetadata::from(message)),
-                render_in_minimap: false,
             };
             let mut new_blocks = vec![];
             let mut block_index_to_message = vec![];
@@ -1583,7 +1586,7 @@ impl TextThreadEditor {
 
             self.editor.update(cx, |editor, cx| {
                 editor.transact(window, cx, |this, window, cx| {
-                    this.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
+                    this.change_selections(Default::default(), window, cx, |s| {
                         s.select(selections);
                     });
                     this.insert("", window, cx);
@@ -1852,7 +1855,6 @@ impl TextThreadEditor {
                                 .into_any_element()
                         }),
                         priority: 0,
-                        render_in_minimap: false,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1889,108 +1891,6 @@ impl TextThreadEditor {
     pub fn regenerate_summary(&mut self, cx: &mut Context<Self>) {
         self.context
             .update(cx, |context, cx| context.summarize(true, cx));
-    }
-
-    fn render_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // This was previously gated behind the `zed-pro` feature flag. Since we
-        // aren't planning to ship that right now, we're just hard-coding this
-        // value to not show the nudge.
-        let nudge = Some(false);
-
-        let model_registry = LanguageModelRegistry::read_global(cx);
-
-        if nudge.map_or(false, |value| value) {
-            Some(
-                h_flex()
-                    .p_3()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .bg(cx.theme().colors().editor_background)
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(Icon::new(IconName::ZedAssistant).color(Color::Accent))
-                            .child(Label::new("Zed AI is here! Get started by signing in →")),
-                    )
-                    .child(
-                        Button::new("sign-in", "Sign in")
-                            .size(ButtonSize::Compact)
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                let client = this
-                                    .workspace
-                                    .read_with(cx, |workspace, _| workspace.client().clone())
-                                    .log_err();
-
-                                if let Some(client) = client {
-                                    cx.spawn(async move |context_editor, cx| {
-                                        match client.authenticate_and_connect(true, cx).await {
-                                            util::ConnectionResult::Timeout => {
-                                                log::error!("Authentication timeout")
-                                            }
-                                            util::ConnectionResult::ConnectionReset => {
-                                                log::error!("Connection reset")
-                                            }
-                                            util::ConnectionResult::Result(r) => {
-                                                if r.log_err().is_some() {
-                                                    context_editor
-                                                        .update(cx, |_, cx| cx.notify())
-                                                        .ok();
-                                                }
-                                            }
-                                        }
-                                    })
-                                    .detach()
-                                }
-                            })),
-                    )
-                    .into_any_element(),
-            )
-        } else if let Some(configuration_error) =
-            model_registry.configuration_error(model_registry.default_model(), cx)
-        {
-            Some(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .bg(cx.theme().colors().editor_background)
-                    .justify_between()
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(
-                                Icon::new(IconName::Warning)
-                                    .size(IconSize::Small)
-                                    .color(Color::Warning),
-                            )
-                            .child(Label::new(configuration_error.to_string())),
-                    )
-                    .child(
-                        Button::new("open-configuration", "Configure Providers")
-                            .size(ButtonSize::Compact)
-                            .icon(Some(IconName::SlidersVertical))
-                            .icon_size(IconSize::Small)
-                            .icon_position(IconPosition::Start)
-                            .style(ButtonStyle::Filled)
-                            .on_click({
-                                let focus_handle = self.focus_handle(cx).clone();
-                                move |_event, window, cx| {
-                                    focus_handle.dispatch_action(
-                                        &zed_actions::agent::OpenConfiguration,
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            }),
-                    )
-                    .into_any_element(),
-            )
-        } else {
-            None
-        }
     }
 
     fn render_send_button(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2075,12 +1975,12 @@ impl TextThreadEditor {
         )
     }
 
-    fn render_max_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let context = self.context().read(cx);
         let active_model = LanguageModelRegistry::read_global(cx)
             .default_model()
             .map(|default| default.model)?;
-        if !active_model.supports_max_mode() {
+        if !active_model.supports_burn_mode() {
             return None;
         }
 
@@ -2107,7 +2007,7 @@ impl TextThreadEditor {
                     });
                 }))
                 .tooltip(move |_window, cx| {
-                    cx.new(|_| MaxModeTooltip::new().selected(burn_mode_enabled))
+                    cx.new(|_| BurnModeTooltip::new().selected(burn_mode_enabled))
                         .into()
                 })
                 .into_any_element(),
@@ -2122,11 +2022,21 @@ impl TextThreadEditor {
         let active_model = LanguageModelRegistry::read_global(cx)
             .default_model()
             .map(|default| default.model);
-        let focus_handle = self.editor().focus_handle(cx).clone();
         let model_name = match active_model {
             Some(model) => model.name().0,
-            None => SharedString::from("No model selected"),
+            None => SharedString::from("Select Model"),
         };
+
+        let active_provider = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.provider);
+
+        let provider_icon = match active_provider {
+            Some(provider) => provider.icon(),
+            None => IconName::Ai,
+        };
+
+        let focus_handle = self.editor().focus_handle(cx).clone();
 
         PickerPopoverMenu::new(
             self.language_model_selector.clone(),
@@ -2136,9 +2046,15 @@ impl TextThreadEditor {
                     h_flex()
                         .gap_0p5()
                         .child(
+                            Icon::new(provider_icon)
+                                .color(Color::Muted)
+                                .size(IconSize::XSmall),
+                        )
+                        .child(
                             Label::new(model_name)
+                                .color(Color::Muted)
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .ml_0p5(),
                         )
                         .child(
                             Icon::new(IconName::ChevronDown)
@@ -2317,7 +2233,7 @@ fn render_thought_process_fold_icon_button(
         let button = match status {
             ThoughtProcessStatus::Pending => button
                 .child(
-                    Icon::new(IconName::LightBulb)
+                    Icon::new(IconName::ToolThink)
                         .size(IconSize::Small)
                         .color(Color::Muted),
                 )
@@ -2332,7 +2248,7 @@ fn render_thought_process_fold_icon_button(
                 ),
             ThoughtProcessStatus::Completed => button
                 .style(ButtonStyle::Filled)
-                .child(Icon::new(IconName::LightBulb).size(IconSize::Small))
+                .child(Icon::new(IconName::ToolThink).size(IconSize::Small))
                 .child(Label::new("Thought Process").single_line()),
         };
 
@@ -2560,71 +2476,9 @@ struct SelectedCreaseMetadata {
 impl EventEmitter<EditorEvent> for TextThreadEditor {}
 impl EventEmitter<SearchEvent> for TextThreadEditor {}
 
-impl TextThreadEditor {
-    fn render_token_count(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (token_count_color, token_count, max_token_count, tooltip) = match token_state(&self.context, cx)?
-        {
-            TokenState::NoTokensLeft {
-                max_token_count,
-                token_count,
-            } => (
-                Color::Error,
-                token_count,
-                max_token_count,
-                Some("Token Limit Reached"),
-            ),
-            TokenState::HasMoreTokens {
-                max_token_count,
-                token_count,
-                over_warn_threshold,
-            } => {
-                let (color, tooltip) = if over_warn_threshold {
-                    (Color::Warning, Some("Token Limit is Close to Exhaustion"))
-                } else {
-                    (Color::Muted, None)
-                };
-                (color, token_count, max_token_count, tooltip)
-            }
-        };
-
-        Some(
-            h_flex()
-                .id("token-count")
-                .gap_0p5()
-                .child(
-                    Label::new(humanize_token_count(token_count))
-                        .size(LabelSize::Small)
-                        .color(token_count_color),
-                )
-                .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
-                .child(
-                    Label::new(humanize_token_count(max_token_count))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .when_some(tooltip, |element, tooltip| {
-                    element.tooltip(Tooltip::text(tooltip))
-                }),
-        )
-    }
-}
-
 impl Render for TextThreadEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let provider = LanguageModelRegistry::read_global(cx)
-            .default_model()
-            .map(|default| default.provider);
-
-        let accept_terms = if self.show_accept_terms {
-            provider.as_ref().and_then(|provider| {
-                provider.render_accept_terms(LanguageModelProviderTosView::PromptEditorPopup, cx)
-            })
-        } else {
-            None
-        };
-
         let language_model_selector = self.language_model_selector_menu_handle.clone();
-        let max_mode_toggle = self.render_max_mode_toggle(cx);
 
         v_flex()
             .key_context("ContextEditor")
@@ -2641,28 +2495,12 @@ impl Render for TextThreadEditor {
                 language_model_selector.toggle(window, cx);
             })
             .size_full()
-            .children(self.render_notice(cx))
             .child(
                 div()
                     .flex_grow()
                     .bg(cx.theme().colors().editor_background)
                     .child(self.editor.clone()),
             )
-            .when_some(accept_terms, |this, element| {
-                this.child(
-                    div()
-                        .absolute()
-                        .right_3()
-                        .bottom_12()
-                        .max_w_96()
-                        .py_2()
-                        .px_3()
-                        .elevation_2(cx)
-                        .bg(cx.theme().colors().surface_background)
-                        .occlude()
-                        .child(element),
-                )
-            })
             .children(self.render_last_error(cx))
             .child(
                 h_flex()
@@ -2679,12 +2517,11 @@ impl Render for TextThreadEditor {
                         h_flex()
                             .gap_0p5()
                             .child(self.render_inject_context_menu(cx))
-                            .when_some(max_mode_toggle, |this, element| this.child(element)),
+                            .children(self.render_burn_mode_toggle(cx)),
                     )
                     .child(
                         h_flex()
                             .gap_1()
-                            .children(self.render_token_count(cx))
                             .child(self.render_language_model_selector(window, cx))
                             .child(self.render_send_button(window, cx)),
                     ),
@@ -2974,101 +2811,57 @@ impl FollowableItem for TextThreadEditor {
     }
 }
 
-pub struct ContextEditorToolbarItem {
-    active_context_editor: Option<WeakEntity<TextThreadEditor>>,
-    model_summary_editor: Entity<Editor>,
-}
+pub fn render_remaining_tokens(
+    context_editor: &Entity<TextThreadEditor>,
+    cx: &App,
+) -> Option<impl IntoElement + use<>> {
+    let context = &context_editor.read(cx).context;
 
-impl ContextEditorToolbarItem {}
-
-
-impl Render for ContextEditorToolbarItem {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let left_side = h_flex()
-            .group("chat-title-group")
-            .gap_1()
-            .items_center()
-            .flex_grow()
-            .child(
-                div()
-                    .w_full()
-                    .when(self.active_context_editor.is_some(), |left_side| {
-                        left_side.child(self.model_summary_editor.clone())
-                    }),
-            )
-            .child(
-                div().visible_on_hover("chat-title-group").child(
-                    IconButton::new("regenerate-context", IconName::RefreshTitle)
-                        .shape(ui::IconButtonShape::Square)
-                        .tooltip(Tooltip::text("Regenerate Title"))
-                        .on_click(cx.listener(move |_, _, _window, cx| {
-                            cx.emit(ContextEditorToolbarItemEvent::RegenerateSummary)
-                        })),
-                ),
-            );
-
-        let right_side = h_flex()
-            .gap_2()
-            // TODO display this in a nicer way, once we have a design for it.
-            // .children({
-            //     let project = self
-            //         .workspace
-            //         .upgrade()
-            //         .map(|workspace| workspace.read(cx).project().downgrade());
-            //
-            //     let scan_items_remaining = cx.update_global(|db: &mut SemanticDb, cx| {
-            //         project.and_then(|project| db.remaining_summaries(&project, cx))
-            //     });
-            //     scan_items_remaining
-            //         .map(|remaining_items| format!("Files to scan: {}", remaining_items))
-            // })
-            // Token count now displayed directly in the TextThreadEditor
-            ;
-
-        h_flex()
-            .px_0p5()
-            .size_full()
-            .gap_2()
-            .justify_between()
-            .child(left_side)
-            .child(right_side)
-    }
-}
-
-impl ToolbarItemView for ContextEditorToolbarItem {
-    fn set_active_pane_item(
-        &mut self,
-        active_pane_item: Option<&dyn ItemHandle>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> ToolbarItemLocation {
-        self.active_context_editor = active_pane_item
-            .and_then(|item| item.act_as::<TextThreadEditor>(cx))
-            .map(|editor| editor.downgrade());
-        cx.notify();
-        if self.active_context_editor.is_none() {
-            ToolbarItemLocation::Hidden
-        } else {
-            ToolbarItemLocation::PrimaryRight
+    let (token_count_color, token_count, max_token_count, tooltip) = match token_state(context, cx)?
+    {
+        TokenState::NoTokensLeft {
+            max_token_count,
+            token_count,
+        } => (
+            Color::Error,
+            token_count,
+            max_token_count,
+            Some("Token Limit Reached"),
+        ),
+        TokenState::HasMoreTokens {
+            max_token_count,
+            token_count,
+            over_warn_threshold,
+        } => {
+            let (color, tooltip) = if over_warn_threshold {
+                (Color::Warning, Some("Token Limit is Close to Exhaustion"))
+            } else {
+                (Color::Muted, None)
+            };
+            (color, token_count, max_token_count, tooltip)
         }
-    }
+    };
 
-    fn pane_focus_update(
-        &mut self,
-        _pane_focused: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.notify();
-    }
+    Some(
+        h_flex()
+            .id("token-count")
+            .gap_0p5()
+            .child(
+                Label::new(humanize_token_count(token_count))
+                    .size(LabelSize::Small)
+                    .color(token_count_color),
+            )
+            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new(humanize_token_count(max_token_count))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .when_some(tooltip, |element, tooltip| {
+                element.tooltip(Tooltip::text(tooltip))
+            }),
+    )
 }
-
-impl EventEmitter<ToolbarItemEvent> for ContextEditorToolbarItem {}
-
-pub enum ContextEditorToolbarItemEvent {
-    RegenerateSummary,
-}
-impl EventEmitter<ContextEditorToolbarItemEvent> for ContextEditorToolbarItem {}
 
 enum PendingSlashCommand {}
 
@@ -3136,7 +2929,7 @@ fn token_state(context: &Entity<AssistantContext>, cx: &App) -> Option<TokenStat
         .default_model()?
         .model;
     let token_count = context.read(cx).token_count()?;
-    let max_token_count = model.max_token_count();
+    let max_token_count = model.max_token_count_for_mode(context.read(cx).completion_mode().into());
     let token_state = if max_token_count.saturating_sub(token_count) == 0 {
         TokenState::NoTokensLeft {
             max_token_count,
@@ -3235,6 +3028,7 @@ pub fn make_lsp_adapter_delegate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editor::SelectionEffects;
     use fs::FakeFs;
     use gpui::{App, TestAppContext, VisualTestContext};
     use indoc::indoc;
@@ -3460,7 +3254,9 @@ mod tests {
     ) {
         context_editor.update_in(cx, |context_editor, window, cx| {
             context_editor.editor.update(cx, |editor, cx| {
-                editor.change_selections(None, window, cx, |s| s.select_ranges([range]));
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                    s.select_ranges([range])
+                });
             });
 
             context_editor.copy(&Default::default(), window, cx);

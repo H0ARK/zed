@@ -4,7 +4,7 @@ pub mod popover_menu;
 
 use anyhow::Result;
 use editor::{
-    Editor,
+    Editor, SelectionEffects,
     actions::{MoveDown, MoveUp},
     scroll::Autoscroll,
 };
@@ -34,7 +34,13 @@ pub enum Direction {
     Down,
 }
 
-actions!(picker, [ConfirmCompletion]);
+actions!(
+    picker,
+    [
+        /// Confirms the selected completion in the picker.
+        ConfirmCompletion
+    ]
+);
 
 /// ConfirmInput is an alternative editor action which - instead of selecting active picker entry - treats pickers editor input literally,
 /// performing some kind of action on it.
@@ -286,7 +292,7 @@ impl<D: PickerDelegate> Picker<D> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let element_container = Self::create_element_container(container, cx);
+        let element_container = Self::create_element_container(container);
         let scrollbar_state = match &element_container {
             ElementContainer::UniformList(scroll_handle) => {
                 ScrollbarState::new(scroll_handle.clone())
@@ -317,31 +323,13 @@ impl<D: PickerDelegate> Picker<D> {
         this
     }
 
-    fn create_element_container(
-        container: ContainerKind,
-        cx: &mut Context<Self>,
-    ) -> ElementContainer {
+    fn create_element_container(container: ContainerKind) -> ElementContainer {
         match container {
             ContainerKind::UniformList => {
                 ElementContainer::UniformList(UniformListScrollHandle::new())
             }
             ContainerKind::List => {
-                let entity = cx.entity().downgrade();
-                ElementContainer::List(ListState::new(
-                    0,
-                    gpui::ListAlignment::Top,
-                    px(1000.),
-                    move |ix, window, cx| {
-                        entity
-                            .upgrade()
-                            .map(|entity| {
-                                entity.update(cx, |this, cx| {
-                                    this.render_element(window, cx, ix).into_any_element()
-                                })
-                            })
-                            .unwrap_or_else(|| div().into_any_element())
-                    },
-                ))
+                ElementContainer::List(ListState::new(0, gpui::ListAlignment::Top, px(1000.)))
             }
         }
     }
@@ -695,9 +683,12 @@ impl<D: PickerDelegate> Picker<D> {
             editor.update(cx, |editor, cx| {
                 editor.set_text(query, window, cx);
                 let editor_offset = editor.buffer().read(cx).len(cx);
-                editor.change_selections(Some(Autoscroll::Next), window, cx, |s| {
-                    s.select_ranges(Some(editor_offset..editor_offset))
-                });
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::Next),
+                    window,
+                    cx,
+                    |s| s.select_ranges(Some(editor_offset..editor_offset)),
+                );
             });
         }
     }
@@ -777,11 +768,16 @@ impl<D: PickerDelegate> Picker<D> {
             .py_1()
             .track_scroll(scroll_handle.clone())
             .into_any_element(),
-            ElementContainer::List(state) => list(state.clone())
-                .with_sizing_behavior(sizing_behavior)
-                .flex_grow()
-                .py_2()
-                .into_any_element(),
+            ElementContainer::List(state) => list(
+                state.clone(),
+                cx.processor(|this, ix, window, cx| {
+                    this.render_element(window, cx, ix).into_any_element()
+                }),
+            )
+            .with_sizing_behavior(sizing_behavior)
+            .flex_grow()
+            .py_2()
+            .into_any_element(),
         }
     }
 

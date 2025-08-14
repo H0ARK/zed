@@ -248,7 +248,7 @@ impl Render for SshPrompt {
         text_style.refine(&refinement);
         let markdown_style = MarkdownStyle {
             base_text_style: text_style,
-            selection_background_color: cx.theme().players().local().selection,
+            selection_background_color: cx.theme().colors().element_selection_background,
             ..Default::default()
         };
 
@@ -357,7 +357,7 @@ impl RenderOnce for SshConnectionHeader {
             .rounded_t_sm()
             .w_full()
             .gap_1p5()
-            .child(Icon::new(IconName::Server).size(IconSize::XSmall))
+            .child(Icon::new(IconName::Server).size(IconSize::Small))
             .child(
                 h_flex()
                     .gap_1()

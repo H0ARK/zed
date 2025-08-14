@@ -162,7 +162,7 @@ impl ContextStrip {
         let workspace = self.workspace.upgrade()?;
         let panel = workspace.read(cx).panel::<AgentPanel>(cx)?.read(cx);
 
-        if let Some(active_thread) = panel.active_thread() {
+        if let Some(active_thread) = panel.active_thread(cx) {
             let weak_active_thread = active_thread.downgrade();
 
             let active_thread = active_thread.read(cx);
@@ -505,7 +505,7 @@ impl Render for ContextStrip {
                         )
                         .on_click({
                             Rc::new(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                if event.down.click_count > 1 {
+                                if event.click_count() > 1 {
                                     this.open_context(&context, window, cx);
                                 } else {
                                     this.focused_index = Some(i);

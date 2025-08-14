@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use uuid;
 
+use crate::agent_diff::AgentDiffThread;
 use crate::agent_model_selector::AgentModelSelector;
-use crate::language_model_selector::ToggleModelSelector;
 use crate::tool_compatibility::{IncompatibleToolsState, IncompatibleToolsTooltip};
 use crate::ui::{
+    MaxModeTooltip,
     preview::{AgentPreview, UsageCallout},
 };
+use agent::history_store::HistoryStore;
 use agent::{
     context::{AgentContextKey, ContextLoadResult, load_context},
     context_store::ContextStoreEvent,
 };
 use agent_settings::{AgentSettings, CompletionMode};
+use ai_onboarding::ApiKeysWithProviders;
 use buffer_diff::BufferDiff;
-use client::UserStore;
+use cloud_llm_client::CompletionIntent;
 use collections::{HashMap, HashSet};
 use editor::actions::{MoveUp, Paste};
 use editor::display_map::CreaseId;
@@ -26,293 +28,47 @@ use editor::{
 use file_icons::FileIcons;
 use fs::Fs;
 use futures::future::Shared;
-use futures::{FutureExt as _, StreamExt, future};
+use futures::{FutureExt as _, future};
 use gpui::{
-    Animation, AnimationExt, App, Entity, EventEmitter, FocusHandle, Focusable,
-    StatefulInteractiveElement as _, Subscription, Task, TextStyle, WeakEntity, linear_color_stop,
-    linear_gradient, point, pulsating_between,
+    Animation, AnimationExt, App, Entity, EventEmitter, Focusable, IntoElement, KeyContext,
+    Subscription, Task, TextStyle, WeakEntity, linear_color_stop, linear_gradient, point,
+    pulsating_between,
 };
 use language::{Buffer, Language, Point};
 use language_model::{
-    ConfiguredModel, LanguageModelRequestMessage, LanguageModelToolUseId, MessageContent,
+    ConfiguredModel, LanguageModelRegistry, LanguageModelRequestMessage, MessageContent,
     ZED_CLOUD_PROVIDER_ID,
 };
 use multi_buffer;
 use project::Project;
 use prompt_store::PromptStore;
-use proto::Plan;
 use settings::Settings;
-use std::path::PathBuf;
 use std::time::Duration;
-// use util::TryFutureExt as _;
-use util::paths;
-
-// use util::ResultExt;
 use theme::ThemeSettings;
 use ui::{
-    Callout, ContextMenu, Disclosure, Divider, DividerColor, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProgressBar, Tooltip, prelude::*,
+    Callout, Disclosure, Divider, DividerColor, KeyBinding, PopoverMenuHandle, Tooltip, prelude::*,
 };
-use client::zed_urls;
-use zed_llm_client::UsageLimit;
-use zed_actions::agent::OpenConfiguration;
-use zed_actions::assistant::OpenRulesLibrary;
-use crate::{AddContextServer, NewTextThread, ToggleOptionsMenu, OpenHistory, text_thread_editor::humanize_token_count};
-use workspace::ToggleZoom;
-use gpui::{AsyncApp, AsyncWindowContext, Corner, StatefulInteractiveElement as _};
-use copilot::copilot_chat;
-use util::ResultExt;
-struct DirBrowser {
-    parent: WeakEntity<MessageEditor>,
-    project: Entity<Project>,
-    workspace: WeakEntity<Workspace>,
-    current_dir: PathBuf,
-    search_editor: Entity<Editor>,
-    menu_focus: FocusHandle,
-    _subscriptions: Vec<Subscription>,
-}
-
-impl DirBrowser {
-    fn new(
-        parent: WeakEntity<MessageEditor>,
-        project: Entity<Project>,
-        workspace: WeakEntity<Workspace>,
-        start_dir: PathBuf,
-        menu_focus: FocusHandle,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let search_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Filter files…", cx);
-            editor
-        });
-
-        let mut this = Self {
-            parent,
-            project,
-            workspace,
-            current_dir: start_dir,
-            search_editor: search_editor.clone(),
-            menu_focus,
-            _subscriptions: Vec::new(),
-        };
-
-        // Re-render on search edits so filtering updates live.
-        this._subscriptions.push(cx.subscribe(&search_editor, |_this, _, event, cx| match event {
-            EditorEvent::BufferEdited => cx.notify(),
-            _ => {}
-        }));
-
-        this
-    }
-}
-
-impl Render for DirBrowser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Resolve a worktree and relative path for current_dir; if outside, fall back to first project dir
-        let (worktree, rel): (Option<Entity<project::Worktree>>, PathBuf) =
-            if let Some((wt, rel)) = self.project.read(cx).find_worktree(&self.current_dir, cx) {
-                (Some(wt), rel)
-            } else if let Some(abs) = self.project.read(cx).first_project_directory(cx) {
-                self.current_dir = abs.clone();
-                if let Some((wt, rel)) = self.project.read(cx).find_worktree(&abs, cx) {
-                    (Some(wt), rel)
-                } else {
-                    (None, PathBuf::new())
-                }
-            } else {
-                (None, PathBuf::new())
-            };
-
-        let mut children: Vec<AnyElement> = Vec::new();
-
-        // Add ".." navigation if not at worktree root
-        if let Some(wt) = worktree.as_ref() {
-            if !rel.as_os_str().is_empty() {
-                let parent_rel = rel.parent().unwrap_or_else(|| std::path::Path::new("")).to_path_buf();
-                let wt_clone = wt.clone();
-                children.push(
-                    ui::ListItem::new("go-up")
-                        .child(Label::new("..").size(LabelSize::Small))
-                        .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
-                            if let Ok(parent_abs) = wt_clone.read(cx).absolutize(&parent_rel) {
-                                this.current_dir = parent_abs;
-                                cx.notify();
-                            }
-                            window.focus(&this.menu_focus);
-                        }))
-                        .into_any_element(),
-                );
-            }
-        }
-
-        // Build entries for current directory
-        if let Some(wt) = worktree.as_ref() {
-            let wt = wt.read(cx);
-            let snapshot = wt.snapshot();
-            let query = self.search_editor.read(cx).text(cx).to_lowercase();
-
-            let mut dir_items: Vec<(Arc<std::path::Path>, String, Option<PathBuf>)> = Vec::new();
-            for entry in snapshot.child_entries(&rel) {
-                if !entry.is_dir() { continue; }
-                let name = entry
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| entry.path.to_string_lossy().to_string());
-                if !query.is_empty() && !name.to_lowercase().contains(&query) {
-                    continue;
-                }
-                let abs = wt.absolutize(&entry.path).ok();
-                dir_items.push((entry.path.clone(), name, abs));
-            }
-
-            dir_items.sort_by(|a, b| {
-                let (a_hidden, b_hidden) = (a.1.starts_with('.'), b.1.starts_with('.'));
-                (a_hidden as u8, a.1.to_lowercase()).cmp(&(b_hidden as u8, b.1.to_lowercase()))
-            });
-
-            for (rel_path, name, abs) in dir_items {
-                let icon = FileIcons::get_folder_icon(false, cx)
-                    .map(Icon::from_path)
-                    .unwrap_or_else(|| Icon::new(IconName::Folder));
-                let abs_clone = abs.clone();
-                children.push(
-                    ui::ListItem::new(rel_path.clone())
-                        .start_slot(icon.size(IconSize::Small).color(Color::Muted))
-                        .child(Label::new(name.clone()))
-                        .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
-                            if let Some(abs) = abs_clone.clone() {
-                                // Set parent cwd and close the menu instead of navigating within
-                                if let Some(parent) = this.parent.upgrade() {
-                                    let _ = parent.update(cx, |parent, cx| {
-                                        parent.cwd = Some(abs);
-                                        cx.notify();
-                                    });
-                                }
-                                this.menu_focus.dispatch_action(&menu::Cancel, window, cx);
-                            }
-                        }))
-                        .into_any_element(),
-                );
-            }
-        } else {
-            // Fallback to browsing the filesystem directly (e.g., home directory) when no project worktree
-            if !self.current_dir.is_dir() {
-                self.current_dir = paths::home_dir().clone();
-            }
-
-            // Parent navigation when possible
-            if let Some(parent) = self.current_dir.parent() {
-                let parent = parent.to_path_buf();
-                children.push(
-                    ui::ListItem::new("go-up-fs")
-                        .child(Label::new("..").size(LabelSize::Small))
-                        .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
-                            this.current_dir = parent.clone();
-                            cx.notify();
-                            window.focus(&this.menu_focus);
-                        }))
-                        .into_any_element(),
-                );
-            }
-
-            let query = self.search_editor.read(cx).text(cx).to_lowercase();
-            if let Ok(read_dir) = std::fs::read_dir(&self.current_dir) {
-                let mut entries: Vec<std::path::PathBuf> = Vec::new();
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if !query.is_empty() {
-                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                if !name.to_lowercase().contains(&query) { continue; }
-                            }
-                        }
-                        entries.push(path);
-                    }
-                }
-                entries.sort_by(|a, b| {
-                    let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    (an.starts_with('.'), an.to_lowercase()).cmp(&(bn.starts_with('.'), bn.to_lowercase()))
-                });
-
-                for abs in entries {
-                    let name = abs
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| abs.to_string_lossy().to_string());
-                    let icon = FileIcons::get_folder_icon(false, cx)
-                        .map(Icon::from_path)
-                        .unwrap_or_else(|| Icon::new(IconName::Folder));
-                    let abs_clone = abs.clone();
-                    children.push(
-                        ui::ListItem::new(Arc::from(abs.clone()))
-                            .start_slot(icon.size(IconSize::Small).color(Color::Muted))
-                            .child(Label::new(name))
-                            .on_click(cx.listener(move |this: &mut Self, _e, window, cx| {
-                                if let Some(parent) = this.parent.upgrade() {
-                                    let _ = parent.update(cx, |parent, cx| {
-                                        parent.cwd = Some(abs_clone.clone());
-                                        cx.notify();
-                                    });
-                                }
-                                this.menu_focus.dispatch_action(&menu::Cancel, window, cx);
-                            }))
-                            .into_any_element(),
-                    );
-                }
-            } else {
-                children.push(Label::new("~").color(Color::Muted).into_any_element());
-            }
-        }
-
-        let settings = ThemeSettings::get_global(cx);
-        let text_style = TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.ui_font.family.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_fallbacks: settings.ui_font.fallbacks.clone(),
-            font_size: rems(0.875).into(),
-            line_height: relative(1.3),
-            ..Default::default()
-        };
-
-        v_flex()
-            .w(px(420.0))
-            .gap_1()
-            .child(
-                EditorElement::new(
-                    &self.search_editor,
-                    EditorStyle { text: text_style, ..Default::default() },
-                ),
-            )
-            .child(div().border_t_1().border_color(cx.theme().colors().border_variant))
-            .child(v_flex().children(children))
-    }
-}
-
-// Not exported as a component; used only as a child element via Render
-// Removed Git and project panel popovers from message editor header
+use util::ResultExt as _;
 use workspace::{CollaboratorId, Workspace};
-use zed_llm_client::CompletionIntent;
+use zed_actions::agent::Chat;
+use zed_actions::agent::ToggleModelSelector;
 
 use crate::context_picker::{ContextPicker, ContextPickerCompletionProvider, crease_for_mention};
 use crate::context_strip::{ContextStrip, ContextStripEvent, SuggestContextKind};
 use crate::profile_selector::ProfileSelector;
 use crate::{
-    ActiveThread, AgentDiffPane, Chat, ChatWithFollow, ExpandMessageEditor, Follow, KeepAll,
+    ActiveThread, AgentDiffPane, ChatWithFollow, ExpandMessageEditor, Follow, KeepAll,
     ModelUsageContext, NewThread, OpenAgentDiff, RejectAll, RemoveAllContext, ToggleBurnMode,
     ToggleContextPicker, ToggleProfileSelector, register_agent_preview,
 };
-use gpui::Action;
 use agent::{
-    MessageCrease, Thread, TokenUsageRatio, TotalTokenUsage,
+    MessageCrease, Thread, TokenUsageRatio,
     context_store::ContextStore,
     thread_store::{TextThreadStore, ThreadStore},
 };
+
+pub const MIN_EDITOR_LINES: usize = 4;
+pub const MAX_EDITOR_LINES: usize = 8;
 
 #[derive(RegisterComponent)]
 pub struct MessageEditor {
@@ -321,26 +77,21 @@ pub struct MessageEditor {
     editor: Entity<Editor>,
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
-    user_store: Entity<UserStore>,
     context_store: Entity<ContextStore>,
     prompt_store: Option<Entity<PromptStore>>,
+    history_store: Option<WeakEntity<HistoryStore>>,
     context_strip: Entity<ContextStrip>,
     context_picker_menu_handle: PopoverMenuHandle<ContextPicker>,
     model_selector: Entity<AgentModelSelector>,
-    last_loaded_context: ContextLoadResult,
-    load_context_task: Option<Shared<Task<ContextLoadResult>>>,
+    last_loaded_context: Option<ContextLoadResult>,
+    load_context_task: Option<Shared<Task<()>>>,
     profile_selector: Entity<ProfileSelector>,
     edits_expanded: bool,
     editor_is_expanded: bool,
     last_estimated_token_count: Option<u64>,
     update_token_count_task: Option<Task<()>>,
-    refining_prompt: bool,
     _subscriptions: Vec<Subscription>,
-    cwd: Option<PathBuf>,
 }
-
-const MIN_EDITOR_LINES: usize = 1;
-const MAX_EDITOR_LINES: usize = 8;
 
 pub(crate) fn create_editor(
     workspace: WeakEntity<Workspace>,
@@ -383,6 +134,7 @@ pub(crate) fn create_editor(
             placement: Some(ContextMenuPlacement::Above),
         });
         editor.register_addon(ContextCreasesAddon::new());
+        editor.register_addon(MessageEditorAddon::new());
         editor
     });
 
@@ -401,81 +153,14 @@ pub(crate) fn create_editor(
 }
 
 impl MessageEditor {
-    fn refine_prompt_with_copilot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.refining_prompt {
-            return;
-        }
-        let current_text = self.editor.read(cx).text_option(cx); // trim/empty handling
-        let Some(prompt_text) = current_text else {
-            return;
-        };
-
-        self.refining_prompt = true;
-        cx.notify();
-
-        let editor = self.editor.clone();
-        let handle = cx.entity().downgrade();
-        cx.spawn_in(window, async move |_, mut cx| {
-            // Build Copilot Chat request targeting GPT-4.1 where available
-            let request = copilot_chat::Request {
-                intent: true,
-                n: 1,
-                stream: false,
-                temperature: 0.2,
-                model: "gpt-4.1".to_string(),
-                messages: vec![
-                    copilot_chat::ChatMessage::System { content: "You refine user prompts for coding assistants. Rewrite the user's prompt to be clearer, concise, and actionable for a coding agent. Preserve intent; improve specificity and remove fluff. Return only the improved prompt text.".to_string() },
-                    copilot_chat::ChatMessage::User { content: prompt_text.clone().into() },
-                ],
-                tools: vec![],
-                tool_choice: None,
-            };
-
-            let app: AsyncApp = AsyncApp::clone(&cx);
-            let result = copilot_chat::CopilotChat::stream_completion(request, app).await;
-
-            let refined = match result {
-                Ok(mut events) => {
-                    // Non-streaming: a single event is produced
-                    let mut refined = String::new();
-                    while let Some(evt) = events.next().await {
-                        let Ok(evt) = evt else { continue };
-                        if let Some(choice) = evt.choices.first() {
-                            let delta = choice.message.as_ref().or(choice.delta.as_ref());
-                            if let Some(delta) = delta {
-                                if let Some(content) = &delta.content { refined.push_str(content); }
-                            }
-                        }
-                    }
-                    if refined.trim().is_empty() { None } else { Some(refined) }
-                }
-                Err(_) => None,
-            };
-
-            editor
-                .update_in(cx, |editor, window, cx| {
-                    if let Some(text) = refined {
-                        editor.set_text(text, window, cx);
-                    }
-                })
-                .log_err();
-
-            handle
-                .update::<AsyncWindowContext, _>(&mut cx, |this: &mut Self, _| {
-                    this.refining_prompt = false;
-                })
-                .ok();
-        })
-        .detach();
-    }
     pub fn new(
         fs: Arc<dyn Fs>,
         workspace: WeakEntity<Workspace>,
-        user_store: Entity<UserStore>,
         context_store: Entity<ContextStore>,
         prompt_store: Option<Entity<PromptStore>>,
         thread_store: WeakEntity<ThreadStore>,
         text_thread_store: WeakEntity<TextThreadStore>,
+        history_store: Option<WeakEntity<HistoryStore>>,
         thread: Entity<Thread>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -539,41 +224,27 @@ impl MessageEditor {
         let profile_selector =
             cx.new(|cx| ProfileSelector::new(fs, thread.clone(), editor.focus_handle(cx), cx));
 
-        let project = thread.read(cx).project().clone();
-        // Default cwd to the project's root when available; otherwise fallback to the user's home directory
-        let initial_cwd = project
-            .read(cx)
-            .first_project_directory(cx)
-            .or_else(|| project.read(cx).active_project_directory(cx).map(|p| p.to_path_buf()))
-            .or_else(|| Some(paths::home_dir().clone()));
-
-        let this = Self {
+        Self {
             editor: editor.clone(),
-            project,
-            user_store,
+            project: thread.read(cx).project().clone(),
             thread,
             incompatible_tools_state: incompatible_tools.clone(),
             workspace,
             context_store,
             prompt_store,
+            history_store,
             context_strip,
             context_picker_menu_handle,
             load_context_task: None,
-            last_loaded_context: ContextLoadResult::default(),
+            last_loaded_context: None,
             model_selector,
             edits_expanded: false,
             editor_is_expanded: false,
             profile_selector,
             last_estimated_token_count: None,
             update_token_count_task: None,
-            refining_prompt: false,
             _subscriptions: subscriptions,
-            cwd: initial_cwd,
-        };
-
-        // Do not auto-create a "/" worktree; scanning the entire filesystem can cause permission errors.
-
-        this
+        }
     }
 
     pub fn context_store(&self) -> &Entity<ContextStore> {
@@ -673,7 +344,7 @@ impl MessageEditor {
             .update(cx, |this, cx| {
                 this.follow(CollaboratorId::Agent, window, cx)
             })
-            .ok();
+            .log_err();
 
         self.chat(&Chat, window, cx);
     }
@@ -699,23 +370,12 @@ impl MessageEditor {
             return;
         }
 
-        let (user_message, user_message_creases, should_execute_command) =
-            self.editor.update(cx, |editor, cx| {
-                let creases = extract_message_creases(editor, cx);
-                let text = editor.text(cx);
-
-                // Detect bang-prefixed command (e.g., "!ls -la")
-                let should_execute = text.trim_start().starts_with('!');
-
-                editor.clear(window, cx);
-                (text, creases, should_execute)
-            });
-
-        // If command should be executed directly, do it and return early
-        if should_execute_command {
-            self.execute_direct_command(&user_message, cx);
-            return;
-        }
+        let (user_message, user_message_creases) = self.editor.update(cx, |editor, cx| {
+            let creases = extract_message_creases(editor, cx);
+            let text = editor.text(cx);
+            editor.clear(window, cx);
+            (text, creases)
+        });
 
         self.last_estimated_token_count.take();
         cx.emit(MessageEditorEvent::EstimatedTokenCount);
@@ -728,211 +388,33 @@ impl MessageEditor {
 
         cx.spawn(async move |_this, cx| {
             let (checkpoint, loaded_context) = future::join(checkpoint, context_task).await;
+            let loaded_context = loaded_context.unwrap_or_default();
 
-            let _ = thread.update(cx, |thread, cx| {
-                thread.insert_user_message(
-                    user_message,
-                    loaded_context,
-                    checkpoint.ok(),
-                    user_message_creases,
-                    cx,
-                );
-            });
-
-            let _ = thread.update(cx, |thread, cx| {
-                thread.advance_prompt_id();
-                thread.send_to_model(model, CompletionIntent::UserPrompt, Some(window_handle), cx);
-            });
-        })
-        .detach();
-    }
-
-    fn execute_direct_command(&mut self, text: &str, cx: &mut Context<Self>) {
-        // Extract the actual command after the leading '!'
-        let command = text
-            .trim_start()
-            .strip_prefix('!')
-            .unwrap_or(text)
-            .trim()
-            .to_string();
-
-        if command.is_empty() {
-            log::warn!("Empty command after stripping '!' prefix");
-            return;
-        }
-
-        log::info!("Executing direct terminal command: {}", command);
-
-        // Intercept cd to update the working directory state
-        let mut effective_command = command.clone();
-        if let Some(new_cwd) = Self::resolve_cd_command(&command, self.cwd.clone(), &self.project, cx) {
-            self.cwd = Some(new_cwd);
-            cx.notify();
-            // Run pwd to reflect new state to the user
-            effective_command = "pwd".to_string();
-        }
-
-        // Execute the terminal command directly using the run_command tool
-        let ui_text = format!("$ {}", effective_command);
-        // Determine a valid working directory for the terminal tool. If `self.cwd`
-        // is not inside any project worktree, fall back to "." so the tool
-        // resolves it according to workspace settings.
-        let cd_value = self
-            .cwd
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        let tool_input = serde_json::json!({
-            "command": effective_command,
-            "cd": cd_value
-        });
-
-        // Run inside thread context so results stream into the active thread as a tool-use
-        let thread = self.thread.clone();
-        thread.update(cx, |thread, cx| {
-            let Some(configured_model) = thread.configured_model() else {
-                log::error!("No configured model available for terminal command execution");
-                return;
-            };
-
-            let tool_name = "terminal";
-            let tools = thread.tools();
-            if tools.read(cx).tool(tool_name, cx).is_none() {
-                log::error!("Terminal tool not found in tool working set");
-                // List available tools for debugging
-                let available_tools: Vec<String> =
-                    tools.read(cx).tools(cx).iter().map(|t| t.name()).collect();
-                log::info!("Available tools: {:?}", available_tools);
-                return;
-            }
-
-            log::info!("Found terminal tool, executing command: {}", tool_input);
-
-            // Create an assistant message to associate the tool use with
-            let assistant_message_id = thread.insert_assistant_message(vec![], cx);
-
-            // Generate a shorter tool use ID that fits within the 40-character API limit
-            // Format: "term-{first_8_chars_of_uuid}" = 4 + 1 + 8 = 13 characters total
-            let uuid = uuid::Uuid::new_v4();
-            let short_uuid = uuid.to_string().chars().take(8).collect::<String>();
-            let tool_use_id = LanguageModelToolUseId::from(format!("term-{}", short_uuid));
-
-            log::info!(
-                "About to call run_tool_with_message with tool_use_id: {}",
-                tool_use_id
-            );
-
-            // Use the new method that handles tool use registration and execution
-            // Pass false for should_generate_response since direct commands should not trigger AI responses
-            let _ = thread.run_tool_with_message(
-                tool_use_id,
-                ui_text,
-                tool_input,
-                tool_name,
-                assistant_message_id,
-                configured_model.model.clone(),
-                false, // Don't generate AI response for direct commands
-                None,
-                cx,
-            );
-
-            log::info!("Terminal tool execution initiated");
-        });
-
-        // Emit event to scroll to bottom to show the new message
-        cx.emit(MessageEditorEvent::ScrollThreadToBottom);
-        cx.notify();
-    }
-
-    fn resolve_cd_command(
-        command: &str,
-        current: Option<PathBuf>,
-        project: &Entity<Project>,
-        cx: &App,
-    ) -> Option<PathBuf> {
-        // Accept commands like: cd, cd .., cd path, cd "path with spaces"
-        let trimmed = command.trim_start();
-        if !trimmed.starts_with("cd") { return None; }
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let first = parts.next()?;
-        if first != "cd" { return None; }
-        let arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
-
-        let base = current
-            .or_else(|| project.read(cx).first_project_directory(cx))
-            .unwrap_or_else(|| paths::home_dir().clone());
-
-        let target: PathBuf = match arg {
-            None => paths::home_dir().clone(),
-            Some(path_str) => {
-                // Remove surrounding quotes if present
-                let unquoted = path_str
-                    .trim_matches('"')
-                    .trim_matches('\'');
-                // Tilde expansion
-                let expanded = shellexpand::full(unquoted).unwrap_or_else(|_| unquoted.into()).to_string();
-                let p = std::path::PathBuf::from(&expanded);
-                if p.is_absolute() { p } else { base.join(p) }
-            }
-        };
-
-        // Only accept directories that exist
-        if target.is_dir() { Some(target) } else { None }
-    }
-
-    #[allow(dead_code)]
-    fn run_command_tool(&mut self, tool_name: &str, args: &[String], cx: &mut Context<Self>) {
-        // Create the tool input for terminal command
-        let cd_value = {
-            let mut cd = String::from(".");
-            if let Some(cwd) = &self.cwd {
-                let project = self.project.read(cx);
-                let in_worktree = project.worktrees(cx).any(|wt| {
-                    let wt_path = wt.read(cx).abs_path();
-                    cwd.starts_with(&wt_path)
-                });
-                if in_worktree {
-                    cd = cwd.to_string_lossy().to_string();
-                }
-            }
-            cd
-        };
-        let input = serde_json::json!({
-            "command": args.get(0).cloned().unwrap_or_default(),
-            "cd": cd_value
-        });
-
-        // Execute the terminal tool directly
-        self.thread.update(cx, |thread, cx| {
-            if let Some(configured_model) = thread.configured_model() {
-                let tool_use_id = LanguageModelToolUseId::from(format!(
-                    "direct-terminal-{}",
-                    uuid::Uuid::new_v4()
-                ));
-                let ui_text = format!("Run command: {}", args.get(0).cloned().unwrap_or_default());
-
-                // Get the terminal tool
-                if let Some(tool) = thread.tools().read(cx).tool(tool_name, cx) {
-                    let request = Arc::new(thread.to_completion_request(
-                        configured_model.model.clone(),
-                        CompletionIntent::ToolResults,
-                        cx,
-                    ));
-
-                    // Run the tool directly, bypassing confirmation
-                    thread.run_tool(
-                        tool_use_id,
-                        ui_text,
-                        input,
-                        request,
-                        tool,
-                        configured_model.model.clone(),
-                        None,
+            thread
+                .update(cx, |thread, cx| {
+                    thread.insert_user_message(
+                        user_message,
+                        loaded_context,
+                        checkpoint.ok(),
+                        user_message_creases,
                         cx,
                     );
-                }
-            }
-        });
+                })
+                .log_err();
+
+            thread
+                .update(cx, |thread, cx| {
+                    thread.advance_prompt_id();
+                    thread.send_to_model(
+                        model,
+                        CompletionIntent::UserPrompt,
+                        Some(window_handle),
+                        cx,
+                    );
+                })
+                .log_err();
+        })
+        .detach();
     }
 
     fn stop_current_and_send_new_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -982,7 +464,7 @@ impl MessageEditor {
 
     fn handle_review_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.edits_expanded = true;
-        AgentDiffPane::deploy(self.thread.clone(), self.workspace.clone(), window, cx).ok();
+        AgentDiffPane::deploy(self.thread.clone(), self.workspace.clone(), window, cx).log_err();
         cx.notify();
     }
 
@@ -997,9 +479,12 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Ok(diff) =
-            AgentDiffPane::deploy(self.thread.clone(), self.workspace.clone(), window, cx)
-        {
+        if let Ok(diff) = AgentDiffPane::deploy(
+            AgentDiffThread::Native(self.thread.clone()),
+            self.workspace.clone(),
+            window,
+            cx,
+        ) {
             let path_key = multi_buffer::PathKey::for_buffer(&buffer, cx);
             diff.update(cx, |diff, cx| diff.move_to_path(path_key, window, cx));
         }
@@ -1095,254 +580,80 @@ impl MessageEditor {
         cx.notify();
     }
 
-    fn render_agent_options_menu(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
-        let user_store = self.user_store.read(cx);
-        let thread_id = thread.id().clone();
-        let is_empty = thread.is_empty();
-        let usage = user_store.model_request_usage();
-        let account_url = zed_urls::account_url(cx);
-        let focus_handle = self.editor.focus_handle(cx);
-        let zoom_in_label = if self.editor_is_expanded { "Zoom Out" } else { "Zoom In" };
-        PopoverMenu::new("agent-options-menu")
-            .trigger_with_tooltip(
-                IconButton::new("agent-options-menu", IconName::Ellipsis)
-                    .icon_size(IconSize::Small),
-                {
-                    let focus_handle = focus_handle.clone();
-                    move |window, cx| {
-                        Tooltip::for_action_in(
-                            "Toggle Agent Menu",
-                            &ToggleOptionsMenu,
-                            &focus_handle,
-                            window,
-                            cx,
-                        )
-                    }
-                },
-            )
-            .attach(Corner::TopRight)
-            .anchor(Corner::BottomRight)
-            .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |mut menu, _window, _cx| {
-                    menu = menu
-                        .action("New Thread", NewThread::default().boxed_clone())
-                        .action("New Text Thread", NewTextThread.boxed_clone())
-                        .action("View All Threads", OpenHistory.boxed_clone())
-                        .when(!is_empty, |menu| {
-                            menu.action(
-                                "New From Summary",
-                                Box::new(NewThread { from_thread_id: Some(thread_id.clone()) }),
-                            )
-                        })
-                        .separator();
-
-                    menu = menu
-                        .header("MCP Servers")
-                        .action(
-                            "View Server Extensions",
-                            Box::new(zed_actions::Extensions {
-                                category_filter: Some(zed_actions::ExtensionCategoryFilter::ContextServers),
-                            }),
-                        )
-                        .action("Add Custom Server…", Box::new(AddContextServer))
-                        .separator();
-
-                    if let Some(usage) = usage {
-                        menu = menu
-                            .header_with_link("Prompt Usage", "Manage", account_url.clone())
-                            .custom_entry(
-                                move |_window, cx| {
-                                    let used_percentage = match usage.limit {
-                                        UsageLimit::Limited(limit) => Some(((usage.amount as f32) / (limit as f32)) * 100.0),
-                                        UsageLimit::Unlimited => None,
-                                    };
-
-                                    h_flex()
-                                        .flex_1()
-                                        .gap_1p5()
-                                        .children(used_percentage.map(|percent| ProgressBar::new("usage", percent, 100.0, cx)))
-                                        .child(
-                                            Label::new(match usage.limit {
-                                                UsageLimit::Limited(limit) => { format!("{} / {limit}", usage.amount) }
-                                                UsageLimit::Unlimited => { format!("{} / ∞", usage.amount) }
-                                            })
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                        )
-                                        .into_any_element()
-                                },
-                                move |_, cx| cx.open_url(&zed_urls::account_url(cx)),
-                            )
-                            .separator();
-                    }
-
-                    menu = menu
-                        .action("Rules…", Box::new(OpenRulesLibrary::default()))
-                        .action("Settings", Box::new(OpenConfiguration))
-                        .action(zoom_in_label, Box::new(ToggleZoom));
-                    menu
-                }))
-            })
-    }
-
-    // #[allow(dead_code)]
-    // fn render_burn_mode_toggle(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-    //     let thread = self.thread.read(cx);
-    //     let model = thread.configured_model();
-    //     if !model?.model.supports_max_mode() {
-    //         return None;
-    //     }
-
-    //     let active_completion_mode = thread.completion_mode();
-    //     let burn_mode_enabled = active_completion_mode == CompletionMode::Burn;
-    //     let icon = if burn_mode_enabled {
-    //         IconName::ZedBurnModeOn
-    //     } else {
-    //         IconName::ZedBurnMode
-    //     };
-
-    //     Some(
-    //         IconButton::new("burn-mode", icon)
-    //             .icon_size(IconSize::Small)
-    //             .icon_color(Color::Muted)
-    //             .toggle_state(burn_mode_enabled)
-    //             .selected_icon_color(Color::Error)
-    //             .on_click(cx.listener(|this, _event, window, cx| {
-    //                 this.toggle_burn_mode(&ToggleBurnMode, window, cx);
-    //             }))
-    //             .tooltip(move |_window, cx| {
-    //                 cx.new(|_| MaxModeTooltip::new().selected(burn_mode_enabled))
-    //                     .into()
-    //             })
-    //             .into_any_element(),
-    //     )
-    // }
-
-    // #[allow(dead_code)]
-    // fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-    //     let following = self
-    //         .workspace
-    //         .read_with(cx, |workspace, _| {
-    //             workspace.is_being_followed(CollaboratorId::Agent)
-    //         })
-    //         .unwrap_or(false);
-
-    //     IconButton::new("follow-agent", IconName::Crosshair)
-    //         .icon_size(IconSize::Small)
-    //         .icon_color(Color::Muted)
-    //         .toggle_state(following)
-    //         .selected_icon_color(Some(Color::Custom(cx.theme().players().agent().cursor)))
-    //         .tooltip(move |window, cx| {
-    //             if following {
-    //                 Tooltip::for_action("Stop Following Agent", &Follow, window, cx)
-    //             } else {
-    //                 Tooltip::with_meta(
-    //                     "Follow Agent",
-    //                     Some(&Follow),
-    //                     "Track the agent's location as it reads and edits files.",
-    //                     window,
-    //                     cx,
-    //                 )
-    //             }
-    //         })
-    //         .on_click(cx.listener(move |this, _, window, cx| {
-    //             this.workspace
-    //                 .update(cx, |workspace, cx| {
-    //                     if following {
-    //                         workspace.unfollow(CollaboratorId::Agent, window, cx);
-    //                     } else {
-    //                         workspace.follow(CollaboratorId::Agent, window, cx);
-    //                     }
-    //                 })
-    //                 .ok();
-    //         }))
-    // }
-
-    fn render_token_count(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let thread = self.thread.read(cx);
-        let unsent_tokens = self.last_estimated_token_count().unwrap_or(0);
-        let is_estimating = unsent_tokens > 0;
-
-        // Get conversation token usage, or use default if no conversation yet
-        let conversation_token_usage = thread.total_token_usage().unwrap_or_else(|| {
-            TotalTokenUsage { total: 0, max: 8192 } // Default reasonable max tokens
-        });
-
-        let combined_usage = conversation_token_usage.add(unsent_tokens);
-
-        // Show token count if we have tokens or estimated tokens  
-        if combined_usage.total == 0 && !is_estimating {
+        let model = thread.configured_model();
+        if !model?.model.supports_burn_mode() {
             return None;
         }
 
-        let is_generating = thread.is_generating();
-        let is_waiting_to_update_token_count = self.is_waiting_to_update_token_count();
-
-        let token_color = match combined_usage.ratio() {
-            TokenUsageRatio::Normal if is_estimating => Color::Default,
-            TokenUsageRatio::Normal => Color::Muted,
-            TokenUsageRatio::Warning => Color::Warning,
-            TokenUsageRatio::Exceeded => Color::Error,
+        let active_completion_mode = thread.completion_mode();
+        let burn_mode_enabled = active_completion_mode == CompletionMode::Burn;
+        let icon = if burn_mode_enabled {
+            IconName::ZedBurnModeOn
+        } else {
+            IconName::ZedBurnMode
         };
 
         Some(
-            h_flex()
-                .id("token-count")
-                .gap_0p5()
-                .when(!is_generating && is_estimating, |parent| {
-                    parent
-                        .child(
-                            h_flex()
-                                .mr_1()
-                                .size_2p5()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(cx.theme().colors().text.opacity(0.1))
-                                .child(
-                                    div().size_1().rounded_full().bg(cx.theme().colors().text),
-                                ),
-                        )
-                        .tooltip(move |window, cx| {
-                            Tooltip::with_meta(
-                                "Estimated New Token Count",
-                                None,
-                                format!(
-                                    "Current Conversation Tokens: {}",
-                                    humanize_token_count(total_token_usage.total)
-                                ),
-                                window,
-                                cx,
-                            )
-                        })
+            IconButton::new("burn-mode", icon)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .toggle_state(burn_mode_enabled)
+                .selected_icon_color(Color::Error)
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.toggle_burn_mode(&ToggleBurnMode, window, cx);
+                }))
+                .tooltip(move |_window, cx| {
+                    cx.new(|_| MaxModeTooltip::new().selected(burn_mode_enabled))
+                        .into()
                 })
-                .child(
-                    Label::new(humanize_token_count(combined_usage.total))
-                        .size(LabelSize::Small)
-                        .color(token_color)
-                        .map(|label| {
-                            if is_generating || is_waiting_to_update_token_count {
-                                label
-                                    .with_animation(
-                                        "used-tokens-label",
-                                        Animation::new(Duration::from_secs(2))
-                                            .repeat()
-                                            .with_easing(pulsating_between(0.6, 1.0)),
-                                        |label, delta| label.alpha(delta),
-                                    )
-                                    .into_any()
-                            } else {
-                                label.into_any_element()
-                            }
-                        }),
-                )
-                .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
-                .child(
-                    Label::new(humanize_token_count(combined_usage.max))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
+                .into_any_element(),
         )
+    }
+
+    fn render_follow_toggle(
+        &self,
+        is_model_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let following = self
+            .workspace
+            .read_with(cx, |workspace, _| {
+                workspace.is_being_followed(CollaboratorId::Agent)
+            })
+            .unwrap_or(false);
+
+        IconButton::new("follow-agent", IconName::Crosshair)
+            .disabled(!is_model_selected)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .toggle_state(following)
+            .selected_icon_color(Some(Color::Custom(cx.theme().players().agent().cursor)))
+            .tooltip(move |window, cx| {
+                if following {
+                    Tooltip::for_action("Stop Following Agent", &Follow, window, cx)
+                } else {
+                    Tooltip::with_meta(
+                        "Follow Agent",
+                        Some(&Follow),
+                        "Track the agent's location as it reads and edits files.",
+                        window,
+                        cx,
+                    )
+                }
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.workspace
+                    .update(cx, |workspace, cx| {
+                        if following {
+                            workspace.unfollow(CollaboratorId::Agent, window, cx);
+                        } else {
+                            workspace.follow(CollaboratorId::Agent, window, cx);
+                        }
+                    })
+                    .ok();
+            }))
     }
 
     fn render_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -1370,6 +681,11 @@ impl MessageEditor {
             .unwrap_or_default();
 
         let is_editor_expanded = self.editor_is_expanded;
+        let expand_icon = if is_editor_expanded {
+            IconName::Minimize
+        } else {
+            IconName::Maximize
+        };
 
         v_flex()
             .key_context("MessageEditor")
@@ -1389,7 +705,7 @@ impl MessageEditor {
             .on_action(cx.listener(Self::remove_all_context))
             .on_action(cx.listener(Self::move_up))
             .on_action(cx.listener(Self::expand_message_editor))
-            // .on_action(cx.listener(Self::toggle_burn_mode))
+            .on_action(cx.listener(Self::toggle_burn_mode))
             .on_action(
                 cx.listener(|this, _: &KeepAll, window, cx| this.handle_accept_all(window, cx)),
             )
@@ -1397,80 +713,47 @@ impl MessageEditor {
                 cx.listener(|this, _: &RejectAll, window, cx| this.handle_reject_all(window, cx)),
             )
             .capture_action(cx.listener(Self::paste))
-            .gap_2()
             .p_2()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
             .bg(editor_bg_color)
-            .relative()
-            // Wrapped in a card at the panel level; no top border here
             .child(
                 h_flex()
-                    .w_full()
-                    .gap_1p5()
                     .justify_between()
-                    .items_center()
-                    // Left: Directory popover with inlined file browser and searchable list
-                    .child(h_flex().gap_1p5().flex_shrink_0().items_center().child({
-                        let current_path = self.cwd.clone();
-                        PopoverMenu::new("dir-browser-menu")
-                            .attach(gpui::Corner::BottomLeft)
-                            .anchor(gpui::Corner::TopLeft)
-                            .trigger({
-                                // Button shows folder icon + current path, truncating if needed
-                                let label = current_path
-                                    .as_ref()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "~".to_string());
-                                Button::new("dir-browser-trigger", label)
-                                    .icon(IconName::Folder)
-                                    .icon_position(IconPosition::Start)
-                                    .label_size(LabelSize::XSmall)
-                                    .truncate(true)
-                                    .tooltip(Tooltip::text("Browse project files"))
-                            })
-                            .menu({
-                                let workspace = self.workspace.clone();
-                                let project = self.project.clone();
-                                let parent = cx.entity().downgrade();
-                                // Start in the last selected cwd if available; otherwise fall back to project root or home
-                                let start_dir = self
-                                    .cwd
-                                    .clone()
-                                    .unwrap_or_else(|| {
-                                        project
-                                            .read(cx)
-                                            .first_project_directory(cx)
-                                            .unwrap_or_else(|| paths::home_dir().clone())
-                                    });
-                                move |window, cx| {
-                                    let proj = project.clone();
-                                    let ws = workspace.clone();
-                                    let parent = parent.clone();
-                                    let dir = start_dir.clone();
-                                    Some(ContextMenu::build_persistent(window, cx, move |mut menu, window, cx| {
-                                        let menu_focus = menu.focus_handle(cx);
-                                        let browser = cx.new(|cx| DirBrowser::new(parent.clone(), proj.clone(), ws.clone(), dir.clone(), menu_focus.clone(), window, cx));
-                                        menu = menu
-                                            .on_blur_subscription(Subscription::new(|| {}))
-                                            .keep_open_on_confirm(true)
-                                            .custom_row(move |_window, _cx| browser.clone().into_any_element());
-                                        menu
-                                    }))
-                                }
-                            })
-                    }))
-                    // Right: Token count and options menu trigger
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .children(self.render_token_count(cx))
-                            .child(self.render_agent_options_menu(window, cx))
-                    ),
+                    .child(self.context_strip.clone())
+                    .when(focus_handle.is_focused(window), |this| {
+                        this.child(
+                            IconButton::new("toggle-height", expand_icon)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |window, cx| {
+                                        let expand_label = if is_editor_expanded {
+                                            "Minimize Message Editor".to_string()
+                                        } else {
+                                            "Expand Message Editor".to_string()
+                                        };
+
+                                        Tooltip::for_action_in(
+                                            expand_label,
+                                            &ExpandMessageEditor,
+                                            &focus_handle,
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    window.dispatch_action(Box::new(ExpandMessageEditor), cx);
+                                })),
+                        )
+                    }),
             )
             .child(
                 v_flex()
-                    .w_full()
+                    .size_full()
                     .gap_1()
                     .when(is_editor_expanded, |this| {
                         this.h(vh(0.8, window)).justify_between()
@@ -1492,25 +775,17 @@ impl MessageEditor {
                             ..Default::default()
                         };
 
-                        div()
-                            .w_full()
-                            .flex_none()
-                            // Keep the editor compact by default; it will grow with content
-                            .min_h(px(f32::from(line_height) * 1.0))
-                            .max_h(px(f32::from(line_height) * 4.0))
-                            .child(
-                                EditorElement::new(
-                                    &self.editor,
-                                    EditorStyle {
-                                        background: editor_bg_color,
-                                        local_player: cx.theme().players().local(),
-                                        text: text_style,
-                                        syntax: cx.theme().syntax().clone(),
-                                        ..Default::default()
-                                    },
-                                ),
-                            )
-                            .into_any()
+                        EditorElement::new(
+                            &self.editor,
+                            EditorStyle {
+                                background: editor_bg_color,
+                                local_player: cx.theme().players().local(),
+                                text: text_style,
+                                syntax: cx.theme().syntax().clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .into_any()
                     })
                     .child(
                         h_flex()
@@ -1518,7 +793,9 @@ impl MessageEditor {
                             .flex_wrap()
                             .justify_between()
                             .child(
-                                h_flex().gap_1().child(self.context_strip.clone()),
+                                h_flex()
+                                    .child(self.render_follow_toggle(is_model_selected, cx))
+                                    .children(self.render_burn_mode_toggle(cx)),
                             )
                             .child(
                                 h_flex()
@@ -1554,7 +831,7 @@ impl MessageEditor {
                                                         parent.child(
                                                             IconButton::new(
                                                                 "stop-generation",
-                                                                IconName::StopFilled,
+                                                                IconName::Stop,
                                                             )
                                                             .icon_color(Color::Error)
                                                             .style(ButtonStyle::Tinted(
@@ -1623,19 +900,7 @@ impl MessageEditor {
                                                         )
                                                     })
                                             } else {
-                                                parent
-                                                    .when(!is_editor_empty, |parent| {
-                                                        parent.child(
-                                                            IconButton::new("refine-prompt", IconName::Sparkle)
-                                                                .icon_size(IconSize::Small)
-                                                                .tooltip(Tooltip::text("Refine prompt with Copilot GPT-4.1"))
-                                                                .disabled(self.refining_prompt)
-                                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                                    this.refine_prompt_with_copilot(window, cx)
-                                                                }))
-                                                        )
-                                                    })
-                                                    .child(
+                                                parent.child(
                                                     IconButton::new("send-message", IconName::Send)
                                                         .icon_color(Color::Accent)
                                                         .style(ButtonStyle::Filled)
@@ -1645,6 +910,10 @@ impl MessageEditor {
                                                         .on_click({
                                                             let focus_handle = focus_handle.clone();
                                                             move |_event, window, cx| {
+                                                                telemetry::event!(
+                                                                    "Agent Message Sent",
+                                                                    agent = "zed",
+                                                                );
                                                                 focus_handle.dispatch_action(
                                                                     &Chat, window, cx,
                                                                 );
@@ -1705,12 +974,12 @@ impl MessageEditor {
             .border_1()
             .border_b_0()
             .border_color(border_color)
-            .rounded_t_xl()
+            .rounded_t_md()
             .shadow(vec![gpui::BoxShadow {
                 color: gpui::black().opacity(0.15),
-                offset: point(px(1.0), px(-1.0)),
-                blur_radius: px(3.0),
-                spread_radius: px(0.0),
+                offset: point(px(1.), px(-1.)),
+                blur_radius: px(3.),
+                spread_radius: px(0.),
             }])
             .child(
                 h_flex()
@@ -1818,7 +1087,7 @@ impl MessageEditor {
                                             window,
                                             cx,
                                         )
-                                        .map(|kb| kb.size(rems_from_px(10.0))),
+                                        .map(|kb| kb.size(rems_from_px(10.))),
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.handle_reject_all(window, cx)
@@ -1838,7 +1107,7 @@ impl MessageEditor {
                                             window,
                                             cx,
                                         )
-                                        .map(|kb| kb.size(rems_from_px(10.0))),
+                                        .map(|kb| kb.size(rems_from_px(10.))),
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.handle_accept_all(window, cx)
@@ -1888,9 +1157,9 @@ impl MessageEditor {
                                 });
 
                             let overlay_gradient = linear_gradient(
-                                90.0,
-                                linear_color_stop(editor_bg_color, 1.0),
-                                linear_color_stop(editor_bg_color.opacity(0.2), 0.0),
+                                90.,
+                                linear_color_stop(editor_bg_color, 1.),
+                                linear_color_stop(editor_bg_color.opacity(0.2), 0.),
                             );
 
                             let element = h_flex()
@@ -1908,7 +1177,7 @@ impl MessageEditor {
                                 })
                                 .child(
                                     h_flex()
-                                        .id("file-name")
+                                        .id(("file-name", index))
                                         .pr_8()
                                         .gap_1p5()
                                         .max_w_full()
@@ -1919,9 +1188,16 @@ impl MessageEditor {
                                                 .gap_0p5()
                                                 .children(file_name)
                                                 .children(file_path),
-                                        ), // TODO: Implement line diff
-                                           // .child(Label::new("+").color(Color::Created))
-                                           // .child(Label::new("-").color(Color::Deleted)),
+                                        )
+                                        .on_click({
+                                            let buffer = buffer.clone();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.handle_file_click(buffer.clone(), window, cx);
+                                            })
+                                        }), // TODO: Implement line diff
+                                            // .child(Label::new("+").color(Color::Created))
+                                            // .child(Label::new("-").color(Color::Deleted)),
+                                            //
                                 )
                                 .child(
                                     h_flex()
@@ -1983,7 +1259,7 @@ impl MessageEditor {
                                         .w_12()
                                         .top_0()
                                         .bottom_0()
-                                        .right(px(152.0))
+                                        .right(px(152.))
                                         .bg(overlay_gradient),
                                 );
 
@@ -1998,9 +1274,7 @@ impl MessageEditor {
         self.thread
             .read(cx)
             .configured_model()
-            .map_or(false, |model| {
-                model.provider.id().0 == ZED_CLOUD_PROVIDER_ID
-            })
+            .map_or(false, |model| model.provider.id() == ZED_CLOUD_PROVIDER_ID)
     }
 
     fn render_usage_callout(&self, line_height: Pixels, cx: &mut Context<Self>) -> Option<Div> {
@@ -2008,24 +1282,12 @@ impl MessageEditor {
             return None;
         }
 
-        let user_store = self.user_store.read(cx);
-
-        let ubb_enable = user_store
-            .usage_based_billing_enabled()
-            .map_or(false, |enabled| enabled);
-
-        if ubb_enable {
+        let user_store = self.project.read(cx).user_store().read(cx);
+        if user_store.is_usage_based_billing_enabled() {
             return None;
         }
 
-        let plan = user_store
-            .current_plan()
-            .map(|plan| match plan {
-                Plan::Free => zed_llm_client::Plan::ZedFree,
-                Plan::ZedPro => zed_llm_client::Plan::ZedPro,
-                Plan::ZedProTrial => zed_llm_client::Plan::ZedProTrial,
-            })
-            .unwrap_or(zed_llm_client::Plan::ZedFree);
+        let plan = user_store.plan().unwrap_or(cloud_llm_client::Plan::ZedFree);
 
         let usage = user_store.model_request_usage()?;
 
@@ -2043,7 +1305,7 @@ impl MessageEditor {
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let icon = if token_usage_ratio == TokenUsageRatio::Exceeded {
-            Icon::new(IconName::X)
+            Icon::new(IconName::Close)
                 .color(Color::Error)
                 .size(IconSize::XSmall)
         } else {
@@ -2104,34 +1366,33 @@ impl MessageEditor {
         self.update_token_count_task.is_some()
     }
 
-    fn reload_context(&mut self, cx: &mut Context<Self>) -> Task<ContextLoadResult> {
+    fn reload_context(&mut self, cx: &mut Context<Self>) -> Task<Option<ContextLoadResult>> {
         let load_task = cx.spawn(async move |this, cx| {
-            let load_task = this.update(cx, |this, cx| {
+            let Ok(load_task) = this.update(cx, |this, cx| {
                 let new_context = this
                     .context_store
                     .read(cx)
                     .new_context_for_thread(this.thread.read(cx), None);
                 load_context(new_context, &this.project, &this.prompt_store, cx)
-            });
-            let result = match load_task {
-                Ok(task) => task.await,
-                Err(_) => ContextLoadResult::default(),
+            }) else {
+                return;
             };
+            let result = load_task.await;
             this.update(cx, |this, cx| {
-                this.last_loaded_context = result.clone();
+                this.last_loaded_context = Some(result);
                 this.load_context_task = None;
                 this.message_or_context_changed(false, cx);
             })
             .ok();
-            result
         });
         // Replace existing load task, if any, causing it to be cancelled.
         let load_task = load_task.shared();
         self.load_context_task = Some(load_task.clone());
-        cx.spawn(async move |this: WeakEntity<MessageEditor>, cx| {
-            let _ = load_task.await;
-            this.update(cx, |this, _cx| this.last_loaded_context.clone())
-                .unwrap_or_default()
+        cx.spawn(async move |this, cx| {
+            load_task.await;
+            this.read_with(cx, |this, _cx| this.last_loaded_context.clone())
+                .ok()
+                .flatten()
         })
     }
 
@@ -2154,16 +1415,20 @@ impl MessageEditor {
             if debounce {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
-                    .map(|_| ())
                     .await;
             }
 
             let token_count = if let Some(task) = this
                 .update(cx, |this, cx| {
-                    let loaded_context = &this.last_loaded_context.loaded_context;
+                    let loaded_context = this
+                        .last_loaded_context
+                        .as_ref()
+                        .map(|context_load_result| &context_load_result.loaded_context);
                     let message_text = editor.read(cx).text(cx);
 
-                    if message_text.is_empty() && loaded_context.is_empty() {
+                    if message_text.is_empty()
+                        && loaded_context.map_or(true, |loaded_context| loaded_context.is_empty())
+                    {
                         return None;
                     }
 
@@ -2173,7 +1438,9 @@ impl MessageEditor {
                         cache: false,
                     };
 
-                    loaded_context.add_to_request_message(&mut request_message);
+                    if let Some(loaded_context) = loaded_context {
+                        loaded_context.add_to_request_message(&mut request_message);
+                    }
 
                     if !message_text.is_empty() {
                         request_message
@@ -2191,6 +1458,7 @@ impl MessageEditor {
                         tool_choice: None,
                         stop: vec![],
                         temperature: AgentSettings::temperature_for_model(&model.model, cx),
+                        thinking_allowed: true,
                     };
 
                     Some(model.model.count_tokens(request, cx))
@@ -2198,7 +1466,7 @@ impl MessageEditor {
                 .ok()
                 .flatten()
             {
-                task.await.ok()
+                task.await.log_err()
             } else {
                 Some(0)
             };
@@ -2219,6 +1487,31 @@ impl MessageEditor {
 pub struct ContextCreasesAddon {
     creases: HashMap<AgentContextKey, Vec<(CreaseId, SharedString)>>,
     _subscription: Option<Subscription>,
+}
+
+pub struct MessageEditorAddon {}
+
+impl MessageEditorAddon {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Addon for MessageEditorAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn to_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn extend_key_context(&self, key_context: &mut KeyContext, cx: &App) {
+        let settings = agent_settings::AgentSettings::get_global(cx);
+        if settings.use_modifier_to_send {
+            key_context.add("use_modifier_to_send");
+        }
+    }
 }
 
 impl Addon for ContextCreasesAddon {
@@ -2270,7 +1563,7 @@ impl ContextCreasesAddon {
                     cx.notify();
                 }
             },
-        ));
+        ))
     }
 
     pub fn into_inner(self) -> HashMap<AgentContextKey, Vec<(CreaseId, SharedString)>> {
@@ -2356,9 +1649,38 @@ impl Render for MessageEditor {
 
         let line_height = TextSize::Small.rems(cx).to_pixels(window.rem_size()) * 1.5;
 
+        let has_configured_providers = LanguageModelRegistry::read_global(cx)
+            .providers()
+            .iter()
+            .filter(|provider| {
+                provider.is_authenticated(cx) && provider.id() != ZED_CLOUD_PROVIDER_ID
+            })
+            .count()
+            > 0;
+
+        let is_signed_out = self
+            .workspace
+            .read_with(cx, |workspace, _| {
+                workspace.client().status().borrow().is_signed_out()
+            })
+            .unwrap_or(true);
+
+        let has_history = self
+            .history_store
+            .as_ref()
+            .and_then(|hs| hs.update(cx, |hs, cx| hs.entries(cx).len() > 0).ok())
+            .unwrap_or(false)
+            || self
+                .thread
+                .read_with(cx, |thread, _| thread.messages().len() > 0);
+
         v_flex()
-            .w_full()
-            .gap_1()
+            .size_full()
+            .bg(cx.theme().colors().panel_background)
+            .when(
+                !has_history && is_signed_out && has_configured_providers,
+                |this| this.child(cx.new(ApiKeysWithProviders::new)),
+            )
             .when(changed_buffers.len() > 0, |parent| {
                 parent.child(self.render_edits_bar(&changed_buffers, window, cx))
             })
@@ -2430,7 +1752,6 @@ impl AgentPreview for MessageEditor {
     ) -> Option<AnyElement> {
         if let Some(workspace) = workspace.upgrade() {
             let fs = workspace.read(cx).app_state().fs.clone();
-            let user_store = workspace.read(cx).app_state().user_store.clone();
             let project = workspace.read(cx).project().clone();
             let weak_project = project.downgrade();
             let context_store = cx.new(|_cx| ContextStore::new(weak_project, None));
@@ -2443,11 +1764,11 @@ impl AgentPreview for MessageEditor {
                 MessageEditor::new(
                     fs,
                     workspace.downgrade(),
-                    user_store,
                     context_store,
                     None,
                     thread_store.downgrade(),
                     text_thread_store.downgrade(),
+                    None,
                     thread,
                     window,
                     cx,
@@ -2460,7 +1781,7 @@ impl AgentPreview for MessageEditor {
                     .children(vec![single_example(
                         "Default Message Editor",
                         div()
-                            .w(px(540.0))
+                            .w(px(540.))
                             .pt_12()
                             .bg(cx.theme().colors().panel_background)
                             .border_1()
@@ -2477,4 +1798,3 @@ impl AgentPreview for MessageEditor {
 }
 
 register_agent_preview!(MessageEditor);
-

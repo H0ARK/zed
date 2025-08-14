@@ -422,7 +422,12 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
             "Rust",
             FakeLspAdapter {
                 name: "rust-analyzer",
-                ..Default::default()
+                capabilities: lsp::ServerCapabilities {
+                    completion_provider: Some(lsp::CompletionOptions::default()),
+                    rename_provider: Some(lsp::OneOf::Left(true)),
+                    ..lsp::ServerCapabilities::default()
+                },
+                ..FakeLspAdapter::default()
             },
         )
     });
@@ -430,7 +435,11 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
     let mut fake_lsp = server_cx.update(|cx| {
         headless.read(cx).languages.register_fake_language_server(
             LanguageServerName("rust-analyzer".into()),
-            Default::default(),
+            lsp::ServerCapabilities {
+                completion_provider: Some(lsp::CompletionOptions::default()),
+                rename_provider: Some(lsp::OneOf::Left(true)),
+                ..lsp::ServerCapabilities::default()
+            },
             None,
         )
     });
@@ -1715,7 +1724,7 @@ async fn test_remote_agent_fs_tool_calls(cx: &mut TestAppContext, server_cx: &mu
         .await
         .unwrap();
 
-    let action_log = cx.new(|_| assistant_tool::ActionLog::new(project.clone()));
+    let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
     let model = Arc::new(FakeLanguageModel::default());
     let request = Arc::new(LanguageModelRequest::default());
 
