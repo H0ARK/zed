@@ -107,7 +107,7 @@ impl ZedAiOnboarding {
             .child(
                 Button::new("terms_of_service", "Review Terms of Service")
                     .full_width()
-                    .style(ButtonStyle::Outlined)
+                    .style(ButtonStyle::Transparent)
                     .icon(IconName::ArrowUpRight)
                     .icon_color(Color::Muted)
                     .icon_size(IconSize::Small)
@@ -335,7 +335,7 @@ impl ZedAiOnboarding {
             .child(
                 Button::new("pro", "Continue with Zed Pro")
                     .full_width()
-                    .style(ButtonStyle::Outlined)
+                    .style(ButtonStyle::Transparent)
                     .on_click({
                         let callback = self.continue_with_zed_ai.clone();
                         move |_, window, cx| {

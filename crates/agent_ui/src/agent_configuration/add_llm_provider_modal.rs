@@ -330,7 +330,7 @@ impl AddLlmProviderModal {
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Outlined)
+                        .style(ButtonStyle::Subtle)
                         .full_width()
                         .on_click(cx.listener(move |this, _, _window, cx| {
                             this.input.remove_model(ix);

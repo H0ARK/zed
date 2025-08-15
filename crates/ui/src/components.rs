@@ -35,6 +35,7 @@ mod stack;
 mod sticky_items;
 mod tab;
 mod tab_bar;
+mod table;
 mod toggle;
 mod tooltip;
 
@@ -78,6 +79,7 @@ pub use stack::*;
 pub use sticky_items::*;
 pub use tab::*;
 pub use tab_bar::*;
+pub use table::*;
 pub use toggle::*;
 pub use tooltip::*;
 

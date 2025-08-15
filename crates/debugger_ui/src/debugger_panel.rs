@@ -1837,12 +1837,15 @@ impl workspace::DebuggerProvider for DebuggerProvider {
         definition: DebugScenario,
         context: TaskContext,
         buffer: Option<Entity<Buffer>>,
-        worktree_id: Option<WorktreeId>,
         window: &mut Window,
         cx: &mut App,
     ) {
         self.0.update(cx, |_, cx| {
             cx.defer_in(window, move |this, window, cx| {
+                let worktree_id = buffer.as_ref().and_then(|buffer| {
+                    let file = buffer.read(cx).file()?;
+                    Some(file.worktree_id(cx))
+                });
                 this.start_session(definition, context, buffer, worktree_id, window, cx);
             })
         })

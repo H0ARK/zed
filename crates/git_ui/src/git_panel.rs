@@ -130,36 +130,41 @@ fn git_panel_context_menu(
     ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
             .context(focus_handle)
-            .action_disabled_when(
-                !state.has_unstaged_changes,
-                "Stage All",
-                StageAll.boxed_clone(),
-            )
-            .action_disabled_when(
-                !state.has_staged_changes,
-                "Unstage All",
-                UnstageAll.boxed_clone(),
-            )
+            .when(state.has_unstaged_changes, |menu| {
+                menu.action("Stage All", StageAll.boxed_clone())
+            })
+            .when(!state.has_unstaged_changes, |menu| {
+                menu.disabled_action("Stage All", StageAll.boxed_clone())
+            })
+            .when(state.has_staged_changes, |menu| {
+                menu.action("Unstage All", UnstageAll.boxed_clone())
+            })
+            .when(!state.has_staged_changes, |menu| {
+                menu.disabled_action("Unstage All", UnstageAll.boxed_clone())
+            })
             .separator()
-            .action_disabled_when(
-                !(state.has_new_changes || state.has_tracked_changes),
-                "Stash All",
-                StashAll.boxed_clone(),
-            )
+            .when(state.has_new_changes || state.has_tracked_changes, |menu| {
+                menu.action("Stash All", StashAll.boxed_clone())
+            })
+            .when(!(state.has_new_changes || state.has_tracked_changes), |menu| {
+                menu.disabled_action("Stash All", StashAll.boxed_clone())
+            })
             .action("Stash Pop", StashPop.boxed_clone())
             .separator()
             .action("Open Diff", project_diff::Diff.boxed_clone())
             .separator()
-            .action_disabled_when(
-                !state.has_tracked_changes,
-                "Discard Tracked Changes",
-                RestoreTrackedFiles.boxed_clone(),
-            )
-            .action_disabled_when(
-                !state.has_new_changes,
-                "Trash Untracked Files",
-                TrashUntrackedFiles.boxed_clone(),
-            )
+            .when(state.has_tracked_changes, |menu| {
+                menu.action("Discard Tracked Changes", RestoreTrackedFiles.boxed_clone())
+            })
+            .when(!state.has_tracked_changes, |menu| {
+                menu.disabled_action("Discard Tracked Changes", RestoreTrackedFiles.boxed_clone())
+            })
+            .when(state.has_new_changes, |menu| {
+                menu.action("Trash Untracked Files", TrashUntrackedFiles.boxed_clone())
+            })
+            .when(!state.has_new_changes, |menu| {
+                menu.disabled_action("Trash Untracked Files", TrashUntrackedFiles.boxed_clone())
+            })
     })
 }
 
@@ -4302,15 +4307,15 @@ impl GitPanel {
                             .disabled(!has_write_access)
                             .fill()
                             .elevation(ElevationIndex::Surface)
-                            .on_click_ext({
+                            .on_click({
                                 let entry = entry.clone();
                                 let this = cx.weak_entity();
-                                move |_, click, window, cx| {
+                                move |_click, window, cx| {
                                     this.update(cx, |this, cx| {
                                         if !has_write_access {
                                             return;
                                         }
-                                        if click.modifiers().shift {
+                                        if window.modifiers().shift {
                                             this.stage_bulk(ix, cx);
                                         } else {
                                             this.toggle_staged_for_entry(

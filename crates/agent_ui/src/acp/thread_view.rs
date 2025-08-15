@@ -1461,7 +1461,7 @@ impl AcpThreadView {
             .child(
                 Button::new(button_id, "Collapse Output")
                     .full_width()
-                    .style(ButtonStyle::Outlined)
+                    .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .icon(IconName::ChevronUp)
                     .icon_color(Color::Muted)

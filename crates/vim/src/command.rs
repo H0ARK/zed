@@ -6,7 +6,7 @@ use editor::{
     actions::{SortLinesCaseInsensitive, SortLinesCaseSensitive},
     display_map::ToDisplayPoint,
 };
-use gpui::{Action, App, AppContext as _, Context, Global, Keystroke, Window, actions};
+use gpui::{Action, App, AppContext as _, Context, Global, Keystroke, Task, Window, actions};
 use itertools::Itertools;
 use language::Point;
 use multi_buffer::MultiBufferRow;
@@ -28,7 +28,7 @@ use std::{
 use task::{HideStrategy, RevealStrategy, SpawnInTerminal, TaskId};
 use ui::ActiveTheme;
 use util::ResultExt;
-use workspace::{Item, SaveIntent, notifications::NotifyResultExt};
+use workspace::{Item, SaveIntent, SendKeystrokes, notifications::NotifyResultExt};
 use workspace::{SplitDirection, notifications::DetachAndPromptErr};
 use zed_actions::{OpenDocs, RevealTarget};
 
@@ -456,10 +456,10 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 
     Vim::action(editor, cx, |vim, action: &VimNorm, window, cx| {
-        let keystrokes = action
+        let keystrokes: String = action
             .command
             .chars()
-            .map(|c| Keystroke::parse(&c.to_string()).unwrap())
+            .map(|c| c.to_string())
             .collect();
         vim.switch_mode(Mode::Normal, true, window, cx);
         let initial_selections =
@@ -489,8 +489,10 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         let Some(workspace) = vim.workspace(window) else {
             return;
         };
+        let send_keystrokes_action = SendKeystrokes(keystrokes);
         let task = workspace.update(cx, |workspace, cx| {
-            workspace.send_keystrokes_impl(keystrokes, window, cx)
+            window.dispatch_action(send_keystrokes_action.boxed_clone(), cx);
+            Task::ready(())
         });
         let had_range = action.range.is_some();
 
@@ -1191,12 +1193,12 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
         ),
         VimCommand::new(
             ("tabo", "nly"),
-            workspace::CloseOtherItems {
+            workspace::CloseInactiveItems {
                 save_intent: Some(SaveIntent::Close),
                 close_pinned: false,
             },
         )
-        .bang(workspace::CloseOtherItems {
+        .bang(workspace::CloseInactiveItems {
             save_intent: Some(SaveIntent::Skip),
             close_pinned: false,
         }),

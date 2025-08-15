@@ -9,14 +9,14 @@ use theme::{
     ThemeSettings,
 };
 use ui::{
-    ParentElement as _, StatefulInteractiveElement, SwitchField, ToggleButtonGroup,
-    ToggleButtonSimple, ToggleButtonWithIcon, prelude::*, rems_from_px,
+    ParentElement as _, RadioWithLabel, StatefulInteractiveElement, SwitchWithLabel,
+    prelude::*, rems_from_px,
 };
 use vim_mode_setting::VimModeSetting;
 
 use crate::theme_preview::{ThemePreviewStyle, ThemePreviewTile};
 
-fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+fn render_theme_section(cx: &mut App) -> impl IntoElement {
     let theme_selection = ThemeSettings::get_global(cx).theme_selection.clone();
     let system_appearance = theme::SystemAppearance::global(cx);
     let theme_selection = theme_selection.unwrap_or_else(|| ThemeSelection::Dynamic {
@@ -38,39 +38,53 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
     return v_flex()
         .gap_2()
         .child(
-            h_flex().justify_between().child(Label::new("Theme")).child(
-                ToggleButtonGroup::single_row(
-                    "theme-selector-onboarding-dark-light",
-                    [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System].map(|mode| {
-                        const MODE_NAMES: [SharedString; 3] = [
-                            SharedString::new_static("Light"),
-                            SharedString::new_static("Dark"),
-                            SharedString::new_static("System"),
-                        ];
-                        ToggleButtonSimple::new(
-                            MODE_NAMES[mode as usize].clone(),
-                            move |_, _, cx| {
-                                write_mode_change(mode, cx);
-                            },
+            v_flex()
+                .gap_2()
+                .child(Label::new("Theme"))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            RadioWithLabel::new(
+                                "theme-light",
+                                Label::new("Light"),
+                                theme_mode == ThemeMode::Light,
+                                |_, _, cx| {
+                                    write_mode_change(ThemeMode::Light, cx);
+                                },
+                            )
                         )
-                    }),
-                )
-                .tab_index(tab_index)
-                .selected_index(theme_mode as usize)
-                .style(ui::ToggleButtonGroupStyle::Outlined)
-                .width(rems_from_px(3. * 64.)),
-            ),
+                        .child(
+                            RadioWithLabel::new(
+                                "theme-dark",
+                                Label::new("Dark"),
+                                theme_mode == ThemeMode::Dark,
+                                |_, _, cx| {
+                                    write_mode_change(ThemeMode::Dark, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "theme-system",
+                                Label::new("System"),
+                                theme_mode == ThemeMode::System,
+                                |_, _, cx| {
+                                    write_mode_change(ThemeMode::System, cx);
+                                },
+                            )
+                        )
+                ),
         )
         .child(
             h_flex()
                 .gap_4()
                 .justify_between()
-                .children(render_theme_previews(tab_index, &theme_selection, cx)),
+                .children(render_theme_previews(&theme_selection, cx)),
         );
 
     fn render_theme_previews(
-        tab_index: &mut isize,
-        theme_selection: &ThemeSelection,
+                theme_selection: &ThemeSelection,
         cx: &mut App,
     ) -> [impl IntoElement; 3] {
         let system_appearance = SystemAppearance::global(cx);
@@ -129,10 +143,6 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
                             } else {
                                 this.opacity(0.8).hover(|s| s.border_color(colors.border))
                             }
-                        })
-                        .tab_index({
-                            *tab_index += 1;
-                            *tab_index - 1
                         })
                         .focus(|mut style| {
                             style.border_color = Some(colors.border_focused);
@@ -197,7 +207,7 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
     }
 }
 
-fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement {
+fn render_telemetry_section(cx: &App) -> impl IntoElement {
     let fs = <dyn Fs>::global(cx);
 
     v_flex()
@@ -206,10 +216,9 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
         .border_t_1()
         .border_color(cx.theme().colors().border_variant.opacity(0.5))
         .child(Label::new("Telemetry").size(LabelSize::Large))
-        .child(SwitchField::new(
+        .child(SwitchWithLabel::new(
             "onboarding-telemetry-metrics",
-            "Help Improve Zed",
-            Some("Anonymous usage data helps us build the right features and improve your experience.".into()),
+            Label::new("Help Improve Zed"),
             if TelemetrySettings::get_global(cx).metrics {
                 ui::ToggleState::Selected
             } else {
@@ -230,14 +239,10 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
                     move |setting, _| setting.metrics = Some(enabled),
                 );
             }},
-        ).tab_index({
-            *tab_index += 1;
-            *tab_index
-        }))
-        .child(SwitchField::new(
+        ))
+        .child(SwitchWithLabel::new(
             "onboarding-telemetry-crash-reports",
-            "Help Fix Zed",
-            Some("Send crash reports so we can fix critical issues fast.".into()),
+            Label::new("Help Fix Zed"),
             if TelemetrySettings::get_global(cx).diagnostics {
                 ui::ToggleState::Selected
             } else {
@@ -259,13 +264,10 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
                     );
                 }
             }
-        ).tab_index({
-                    *tab_index += 1;
-                    *tab_index
-                }))
+        ))
 }
 
-fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+fn render_base_keymap_section(cx: &mut App) -> impl IntoElement {
     let base_keymap = match BaseKeymap::get_global(cx) {
         BaseKeymap::VSCode => Some(0),
         BaseKeymap::JetBrains => Some(1),
@@ -276,40 +278,81 @@ fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoE
         BaseKeymap::TextMate | BaseKeymap::None => None,
     };
 
-    return v_flex().gap_2().child(Label::new("Base Keymap")).child(
-        ToggleButtonGroup::two_rows(
-            "base_keymap_selection",
-            [
-                ToggleButtonWithIcon::new("VS Code", IconName::EditorVsCode, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::VSCode, cx);
-                }),
-                ToggleButtonWithIcon::new("Jetbrains", IconName::EditorJetBrains, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::JetBrains, cx);
-                }),
-                ToggleButtonWithIcon::new("Sublime Text", IconName::EditorSublime, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::SublimeText, cx);
-                }),
-            ],
-            [
-                ToggleButtonWithIcon::new("Atom", IconName::EditorAtom, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::Atom, cx);
-                }),
-                ToggleButtonWithIcon::new("Emacs", IconName::EditorEmacs, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::Emacs, cx);
-                }),
-                ToggleButtonWithIcon::new("Cursor", IconName::EditorCursor, |_, _, cx| {
-                    write_keymap_base(BaseKeymap::Cursor, cx);
-                }),
-            ],
-        )
-        .when_some(base_keymap, |this, base_keymap| {
-            this.selected_index(base_keymap)
-        })
-        .full_width()
-        .tab_index(tab_index)
-        .size(ui::ToggleButtonGroupSize::Medium)
-        .style(ui::ToggleButtonGroupStyle::Outlined),
-    );
+    return v_flex()
+        .gap_2()
+        .child(Label::new("Base Keymap"))
+        .child(
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            RadioWithLabel::new(
+                                "keymap-vscode",
+                                Label::new("VS Code"),
+                                *BaseKeymap::get_global(cx) == BaseKeymap::VSCode,
+                                |_, _, cx| {
+                                    write_keymap_base(BaseKeymap::VSCode, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "keymap-jetbrains",
+                                Label::new("JetBrains"),
+                                *BaseKeymap::get_global(cx) == BaseKeymap::JetBrains,
+                                |_, _, cx| {
+                                    write_keymap_base(BaseKeymap::JetBrains, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "keymap-sublime",
+                                Label::new("Sublime Text"),
+                                *BaseKeymap::get_global(cx) == BaseKeymap::SublimeText,
+                                |_, _, cx| {
+                                    write_keymap_base(BaseKeymap::SublimeText, cx);
+                                },
+                            )
+                        )
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            RadioWithLabel::new(
+                                "keymap-atom",
+                                Label::new("Atom"),
+                                *BaseKeymap::get_global(cx) == BaseKeymap::Atom,
+                                |_, _, cx| {
+                                    write_keymap_base(BaseKeymap::Atom, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "keymap-emacs",
+                                Label::new("Emacs"),
+                                *BaseKeymap::get_global(cx) == BaseKeymap::Emacs,
+                                |_, _, cx| {
+                                    write_keymap_base(BaseKeymap::Emacs, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "keymap-cursor",
+                                Label::new("Cursor"),
+                                *BaseKeymap::get_global(cx) == BaseKeymap::Cursor,
+                                |_, _, cx| {
+                                    write_keymap_base(BaseKeymap::Cursor, cx);
+                                },
+                            )
+                        )
+                )
+        );
 
     fn write_keymap_base(keymap_base: BaseKeymap, cx: &App) {
         let fs = <dyn Fs>::global(cx);
@@ -320,16 +363,15 @@ fn render_base_keymap_section(tab_index: &mut isize, cx: &mut App) -> impl IntoE
     }
 }
 
-fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
+fn render_vim_mode_switch(cx: &mut App) -> impl IntoElement {
     let toggle_state = if VimModeSetting::get_global(cx).0 {
         ui::ToggleState::Selected
     } else {
         ui::ToggleState::Unselected
     };
-    SwitchField::new(
+    SwitchWithLabel::new(
         "onboarding-vim-mode",
-        "Vim Mode",
-        Some("Coming from Neovim? Use our first-class implementation of Vim Mode.".into()),
+        Label::new("Vim Mode"),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -344,18 +386,13 @@ fn render_vim_mode_switch(tab_index: &mut isize, cx: &mut App) -> impl IntoEleme
             }
         },
     )
-    .tab_index({
-        *tab_index += 1;
-        *tab_index - 1
-    })
 }
 
 pub(crate) fn render_basics_page(cx: &mut App) -> impl IntoElement {
-    let mut tab_index = 0;
     v_flex()
         .gap_6()
-        .child(render_theme_section(&mut tab_index, cx))
-        .child(render_base_keymap_section(&mut tab_index, cx))
-        .child(render_vim_mode_switch(&mut tab_index, cx))
-        .child(render_telemetry_section(&mut tab_index, cx))
+        .child(render_theme_section(cx))
+        .child(render_base_keymap_section(cx))
+        .child(render_vim_mode_switch(cx))
+        .child(render_telemetry_section(cx))
 }

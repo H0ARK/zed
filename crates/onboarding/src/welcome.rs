@@ -124,9 +124,8 @@ impl SectionEntry {
         cx: &App,
     ) -> impl IntoElement {
         ButtonLike::new(("onboarding-button-id", button_index))
-            .tab_index(button_index as isize)
             .full_width()
-            .size(ButtonSize::Medium)
+            .size(ButtonSize::Default)
             .child(
                 h_flex()
                     .w_full()
@@ -141,10 +140,6 @@ impl SectionEntry {
                             )
                             .child(Label::new(self.title)),
                     )
-                    .children(
-                        KeyBinding::for_action_in(self.action, focus, window, cx)
-                            .map(|s| s.size(rems_from_px(12.))),
-                    ),
             )
             .on_click(|_, window, cx| window.dispatch_action(self.action.boxed_clone(), cx))
     }
@@ -236,7 +231,6 @@ impl Render for WelcomePage {
                                             .border_dashed()
                                             .child(
                                                     Button::new("welcome-exit", "Return to Setup")
-                                                        .tab_index(last_index as isize)
                                                         .full_width()
                                                         .label_size(LabelSize::XSmall)
                                                         .on_click(|_, window, cx| {

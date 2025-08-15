@@ -622,7 +622,7 @@ impl BreakpointList {
             .bottom_0()
             .w(px(12.))
             .cursor_default()
-            .children(Scrollbar::vertical(self.scrollbar_state.clone()).map(|s| s.auto_hide(cx)))
+            .children(Scrollbar::vertical(self.scrollbar_state.clone()))
     }
 
     pub(crate) fn render_control_strip(&self) -> AnyElement {

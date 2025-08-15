@@ -239,25 +239,34 @@ pub fn deploy_context_menu(
                 .action("Copy and Trim", Box::new(CopyAndTrim))
                 .action("Paste", Box::new(Paste))
                 .separator()
-                .action_disabled_when(
-                    !has_reveal_target,
-                    if cfg!(target_os = "macos") {
+                .when(!has_reveal_target, |menu| {
+                    let label = if cfg!(target_os = "macos") {
                         "Reveal in Finder"
                     } else {
                         "Reveal in File Manager"
-                    },
-                    Box::new(RevealInFileManager),
-                )
-                .action_disabled_when(
-                    !has_reveal_target,
-                    "Open in Terminal",
-                    Box::new(OpenInTerminal),
-                )
-                .action_disabled_when(
-                    !has_git_repo,
-                    "Copy Permalink",
-                    Box::new(CopyPermalinkToLine),
-                );
+                    };
+                    menu.disabled_action(label, Box::new(RevealInFileManager))
+                })
+                .when(has_reveal_target, |menu| {
+                    let label = if cfg!(target_os = "macos") {
+                        "Reveal in Finder"
+                    } else {
+                        "Reveal in File Manager"
+                    };
+                    menu.action(label, Box::new(RevealInFileManager))
+                })
+                .when(!has_reveal_target, |menu| {
+                    menu.disabled_action("Open in Terminal", Box::new(OpenInTerminal))
+                })
+                .when(has_reveal_target, |menu| {
+                    menu.action("Open in Terminal", Box::new(OpenInTerminal))
+                })
+                .when(!has_git_repo, |menu| {
+                    menu.disabled_action("Copy Permalink", Box::new(CopyPermalinkToLine))
+                })
+                .when(has_git_repo, |menu| {
+                    menu.action("Copy Permalink", Box::new(CopyPermalinkToLine))
+                });
             match focus {
                 Some(focus) => builder.context(focus),
                 None => builder,

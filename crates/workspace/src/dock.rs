@@ -1,6 +1,6 @@
+use crate::Workspace;
 use crate::persistence::model::DockData;
 use crate::{DraggedDock, Event, ModalLayer, Pane};
-use crate::Workspace;
 use anyhow::Context as _;
 use client::proto;
 use gpui::{
@@ -221,9 +221,9 @@ pub enum DockPosition {
 impl DockPosition {
     fn label(&self) -> &'static str {
         match self {
-            Self::Left => "Left",
-            Self::Bottom => "Bottom",
-            Self::Right => "Right",
+            Self::Left => "left",
+            Self::Bottom => "bottom",
+            Self::Right => "right",
         }
     }
 
@@ -242,7 +242,6 @@ struct PanelEntry {
 
 pub struct PanelButtons {
     dock: Entity<Dock>,
-    _settings_subscription: Subscription,
 }
 
 impl Dock {
@@ -751,71 +750,34 @@ impl Render for Dock {
                             IconButton::new(entry.panel.persistent_name(), icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
-                                .on_click(cx.listener(move |this: &mut Dock, _event, window, cx| {
-                                    if is_active_button {
-                                        let action = this.toggle_action().boxed_clone();
-                                        window.dispatch_action(action, cx);
-                                    } else {
-                                        if let Some(ix) = this
-                                            .panel_entries
-                                            .iter()
-                                            .position(|e| e.panel.panel_id() == target_panel_id)
-                                        {
-                                            this.set_open(true, window, cx);
-                                            this.activate_panel(ix, window, cx);
-                                            if let Some(panel) = this.active_panel() {
-                                                let focus_handle = panel.panel_focus_handle(cx);
-                                                window.focus(&focus_handle);
+                                .on_click(cx.listener(
+                                    move |this: &mut Dock, _event, window, cx| {
+                                        if is_active_button {
+                                            let action = this.toggle_action().boxed_clone();
+                                            window.dispatch_action(action, cx);
+                                        } else {
+                                            if let Some(ix) = this
+                                                .panel_entries
+                                                .iter()
+                                                .position(|e| e.panel.panel_id() == target_panel_id)
+                                            {
+                                                this.set_open(true, window, cx);
+                                                this.activate_panel(ix, window, cx);
+                                                if let Some(panel) = this.active_panel() {
+                                                    let focus_handle = panel.panel_focus_handle(cx);
+                                                    window.focus(&focus_handle);
+                                                }
                                             }
                                         }
-                                    }
-                                }))
-                                .tooltip({
-                                    move |window, cx| Tooltip::text(tooltip)(window, cx)
-                                }),
+                                    },
+                                ))
+                                .tooltip({ move |window, cx| Tooltip::text(tooltip)(window, cx) }),
                         )
                     })
                     .collect();
 
-                // Add fixed quick-access buttons: Project Search, Project Panel, Diagnostics, Terminal
-                // Reuse existing actions where available.
-                let add_quick = |id: &'static str, icon: IconName, action: Box<dyn Action>| {
-                    IconButton::new(id, icon)
-                        .icon_size(IconSize::Small)
-                        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-                };
-                buttons.insert(
-                    0,
-                    IconButton::new("quick-project-panel", IconName::Folder)
-                        .icon_size(IconSize::Small)
-                        .on_click(cx.listener(|this: &mut Dock, _event, window, cx| {
-                            this
-                                .workspace
-                                .update(cx, |workspace, cx| {
-                                    for dock in workspace.all_docks() {
-                                        if let Some(ix) = dock
-                                            .read(cx)
-                                            .panel_index_for_persistent_name("Project Panel", cx)
-                                        {
-                                            dock.update(cx, |dock, cx| {
-                                                dock.set_open(true, window, cx);
-                                                dock.activate_panel(ix, window, cx);
-                                                if let Some(panel) = dock.active_panel() {
-                                                    let focus_handle = panel.panel_focus_handle(cx);
-                                                    window.focus(&focus_handle);
-                                                }
-                                            });
-                                            return;
-                                        }
-                                    }
-                                    workspace.toggle_dock(DockPosition::Left, window, cx);
-                                })
-                                .ok();
-                        })),
-                );
-                buttons.push(add_quick("quick-search", IconName::MagnifyingGlass, crate::NewSearch.boxed_clone()));
-                buttons.push(add_quick("quick-diagnostics", IconName::BugOff, crate::ClearAllNotifications.boxed_clone()));
-                buttons.push(add_quick("quick-terminal", IconName::Terminal, crate::NewTerminal.boxed_clone()));
+                // The buttons array already contains all the panel buttons from self.panel_entries
+                // No need to add redundant quick-access buttons
                 h_flex()
                     .flex_none()
                     .gap(DynamicSpacing::Base04.rems(cx))
@@ -907,15 +869,12 @@ impl Render for Dock {
                             Axis::Vertical => this.min_h(size).w_full(),
                         })
                         .child(
-                            v_flex()
-                                .size_full()
-                                .child(header_buttons)
-                                .child(
-                                    entry
-                                        .panel
-                                        .to_any()
-                                        .cached(StyleRefinement::default().v_flex().size_full()),
-                                ),
+                            v_flex().size_full().child(header_buttons).child(
+                                entry
+                                    .panel
+                                    .to_any()
+                                    .cached(StyleRefinement::default().v_flex().size_full()),
+                            ),
                         ),
                 )
                 .when(self.resizable(cx), |this| {
@@ -932,11 +891,7 @@ impl Render for Dock {
 impl PanelButtons {
     pub fn new(dock: Entity<Dock>, cx: &mut Context<Self>) -> Self {
         cx.observe(&dock, |_, _, cx| cx.notify()).detach();
-        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
-        Self {
-            dock,
-            _settings_subscription: settings_subscription,
-        }
+        Self { dock }
     }
 }
 
@@ -967,7 +922,7 @@ impl Render for PanelButtons {
                     let action = dock.toggle_action();
 
                     let tooltip: SharedString =
-                        format!("Close {} Dock", dock.position.label()).into();
+                        format!("Close {} dock", dock.position.label()).into();
 
                     (action, tooltip)
                 } else {
@@ -975,8 +930,6 @@ impl Render for PanelButtons {
 
                     (action, icon_tooltip.into())
                 };
-
-                let focus_handle = dock.focus_handle(cx);
 
                 Some(
                     right_click_menu(name)
@@ -1007,14 +960,13 @@ impl Render for PanelButtons {
                         })
                         .anchor(menu_anchor)
                         .attach(menu_attach)
-                        .trigger(move |is_active, _window, _cx| {
+                        .trigger(move |is_active| {
                             IconButton::new(name, icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(is_active_button)
                                 .on_click({
                                     let action = action.boxed_clone();
                                     move |_, window, cx| {
-                                        window.focus(&focus_handle);
                                         window.dispatch_action(action.boxed_clone(), cx)
                                     }
                                 })
@@ -1029,13 +981,8 @@ impl Render for PanelButtons {
             .collect();
 
         let has_buttons = !buttons.is_empty();
-
         h_flex()
             .gap_1()
-            .when(
-                has_buttons && dock.position == DockPosition::Bottom,
-                |this| this.child(Divider::vertical().color(DividerColor::Border)),
-            )
             .children(buttons)
             .when(has_buttons && dock.position == DockPosition::Left, |this| {
                 this.child(Divider::vertical().color(DividerColor::Border))

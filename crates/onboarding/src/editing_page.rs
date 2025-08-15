@@ -12,8 +12,8 @@ use project::project_settings::ProjectSettings;
 use settings::{Settings as _, update_settings_file};
 use theme::{FontFamilyCache, FontFamilyName, ThemeSettings};
 use ui::{
-    ButtonLike, ListItem, ListItemSpacing, NumericStepper, PopoverMenu, SwitchField,
-    ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, ToggleState, Tooltip,
+    ButtonLike, ListItem, ListItemSpacing, NumericStepper, PopoverMenu, RadioWithLabel, SwitchWithLabel,
+    ToggleState, Tooltip,
     prelude::*,
 };
 
@@ -189,7 +189,6 @@ fn write_format_on_save(format_on_save: bool, cx: &mut App) {
 }
 
 fn render_setting_import_button(
-    tab_index: isize,
     label: SharedString,
     icon_name: IconName,
     action: &dyn Action,
@@ -199,9 +198,8 @@ fn render_setting_import_button(
     h_flex().w_full().child(
         ButtonLike::new(label.clone())
             .full_width()
-            .style(ButtonStyle::Outlined)
+            .style(ButtonStyle::Subtle)
             .size(ButtonSize::Large)
-            .tab_index(tab_index)
             .child(
                 h_flex()
                     .w_full()
@@ -237,7 +235,7 @@ fn render_setting_import_button(
     )
 }
 
-fn render_import_settings_section(tab_index: &mut isize, cx: &App) -> impl IntoElement {
+fn render_import_settings_section(cx: &App) -> impl IntoElement {
     let import_state = SettingsImportState::global(cx);
     let imports: [(SharedString, IconName, &dyn Action, bool); 2] = [
         (
@@ -255,8 +253,7 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &App) -> impl IntoE
     ];
 
     let [vscode, cursor] = imports.map(|(label, icon_name, action, imported)| {
-        *tab_index += 1;
-        render_setting_import_button(*tab_index - 1, label, icon_name, action, imported)
+        render_setting_import_button(label, icon_name, action, imported)
     });
 
     v_flex()
@@ -273,7 +270,6 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &App) -> impl IntoE
 }
 
 fn render_font_customization_section(
-    tab_index: &mut isize,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -319,13 +315,9 @@ fn render_font_customization_section(
                                 })
                                 .trigger(
                                     ButtonLike::new("ui-font-family-button")
-                                        .style(ButtonStyle::Outlined)
-                                        .size(ButtonSize::Medium)
+                                        .style(ButtonStyle::Subtle)
+                                        .size(ButtonSize::Default)
                                         .full_width()
-                                        .tab_index({
-                                            *tab_index += 1;
-                                            *tab_index - 1
-                                        })
                                         .child(
                                             h_flex()
                                                 .w_full()
@@ -357,11 +349,7 @@ fn render_font_customization_section(
                                     write_ui_font_size(ui_font_size + px(1.), cx);
                                 },
                             )
-                            .style(ui::NumericStepperStyle::Outlined)
-                            .tab_index({
-                                *tab_index += 2;
-                                *tab_index - 2
-                            }),
+,
                         ),
                 ),
         )
@@ -383,13 +371,9 @@ fn render_font_customization_section(
                                 })
                                 .trigger(
                                     ButtonLike::new("buffer-font-family-button")
-                                        .style(ButtonStyle::Outlined)
-                                        .size(ButtonSize::Medium)
+                                        .style(ButtonStyle::Subtle)
+                                        .size(ButtonSize::Default)
                                         .full_width()
-                                        .tab_index({
-                                            *tab_index += 1;
-                                            *tab_index - 1
-                                        })
                                         .child(
                                             h_flex()
                                                 .w_full()
@@ -421,11 +405,7 @@ fn render_font_customization_section(
                                     write_buffer_font_size(buffer_font_size + px(1.), cx);
                                 },
                             )
-                            .style(ui::NumericStepperStyle::Outlined)
-                            .tab_index({
-                                *tab_index += 2;
-                                *tab_index - 2
-                            }),
+,
                         ),
                 ),
         )
@@ -601,7 +581,6 @@ fn font_picker(
 }
 
 fn render_popular_settings_section(
-    tab_index: &mut isize,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -614,12 +593,11 @@ fn render_popular_settings_section(
         .border_t_1()
         .border_color(cx.theme().colors().border_variant.opacity(0.5))
         .child(Label::new("Popular Settings").size(LabelSize::Large))
-        .child(render_font_customization_section(tab_index, window, cx))
+        .child(render_font_customization_section(window, cx))
         .child(
-            SwitchField::new(
+            SwitchWithLabel::new(
                 "onboarding-font-ligatures",
-                "Font Ligatures",
-                Some("Combine text characters into their associated symbols.".into()),
+                Label::new("Font Ligatures"),
                 if read_font_ligatures(cx) {
                     ui::ToggleState::Selected
                 } else {
@@ -634,18 +612,12 @@ fn render_popular_settings_section(
 
                     write_font_ligatures(enabled, cx);
                 },
-            )
-            .tab_index({
-                *tab_index += 1;
-                *tab_index - 1
-            })
-            .tooltip(Tooltip::text(LIGATURE_TOOLTIP)),
+            ),
         )
         .child(
-            SwitchField::new(
+            SwitchWithLabel::new(
                 "onboarding-format-on-save",
-                "Format on Save",
-                Some("Format code automatically when saving.".into()),
+                Label::new("Format on Save"),
                 if read_format_on_save(cx) {
                     ui::ToggleState::Selected
                 } else {
@@ -661,16 +633,12 @@ fn render_popular_settings_section(
                     write_format_on_save(enabled, cx);
                 },
             )
-            .tab_index({
-                *tab_index += 1;
-                *tab_index - 1
-            }),
+,
         )
         .child(
-            SwitchField::new(
+            SwitchWithLabel::new(
                 "onboarding-enable-inlay-hints",
-                "Inlay Hints",
-                Some("See parameter names for function and method calls inline.".into()),
+                Label::new("Inlay Hints"),
                 if read_inlay_hints(cx) {
                     ui::ToggleState::Selected
                 } else {
@@ -686,16 +654,12 @@ fn render_popular_settings_section(
                     write_inlay_hints(enabled, cx);
                 },
             )
-            .tab_index({
-                *tab_index += 1;
-                *tab_index - 1
-            }),
+,
         )
         .child(
-            SwitchField::new(
+            SwitchWithLabel::new(
                 "onboarding-git-blame-switch",
-                "Inline Git Blame",
-                Some("See who committed each line on a given file.".into()),
+                Label::new("Inline Git Blame"),
                 if read_git_blame(cx) {
                     ui::ToggleState::Selected
                 } else {
@@ -711,10 +675,7 @@ fn render_popular_settings_section(
                     write_git_blame(enabled, cx);
                 },
             )
-            .tab_index({
-                *tab_index += 1;
-                *tab_index - 1
-            }),
+,
         )
         .child(
             h_flex()
@@ -727,39 +688,45 @@ fn render_popular_settings_section(
                     ),
                 )
                 .child(
-                    ToggleButtonGroup::single_row(
-                        "onboarding-show-mini-map",
-                        [
-                            ToggleButtonSimple::new("Auto", |_, _, cx| {
-                                write_show_mini_map(ShowMinimap::Auto, cx);
-                            })
-                            .tooltip(Tooltip::text(
-                                "Show the minimap if the editor's scrollbar is visible.",
-                            )),
-                            ToggleButtonSimple::new("Always", |_, _, cx| {
-                                write_show_mini_map(ShowMinimap::Always, cx);
-                            }),
-                            ToggleButtonSimple::new("Never", |_, _, cx| {
-                                write_show_mini_map(ShowMinimap::Never, cx);
-                            }),
-                        ],
-                    )
-                    .selected_index(match read_show_mini_map(cx) {
-                        ShowMinimap::Auto => 0,
-                        ShowMinimap::Always => 1,
-                        ShowMinimap::Never => 2,
-                    })
-                    .tab_index(tab_index)
-                    .style(ToggleButtonGroupStyle::Outlined)
-                    .width(ui::rems_from_px(3. * 64.)),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            RadioWithLabel::new(
+                                "minimap-auto",
+                                Label::new("Auto"),
+                                read_show_mini_map(cx) == ShowMinimap::Auto,
+                                |_, _, cx| {
+                                    write_show_mini_map(ShowMinimap::Auto, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "minimap-always",
+                                Label::new("Always"),
+                                read_show_mini_map(cx) == ShowMinimap::Always,
+                                |_, _, cx| {
+                                    write_show_mini_map(ShowMinimap::Always, cx);
+                                },
+                            )
+                        )
+                        .child(
+                            RadioWithLabel::new(
+                                "minimap-never",
+                                Label::new("Never"),
+                                read_show_mini_map(cx) == ShowMinimap::Never,
+                                |_, _, cx| {
+                                    write_show_mini_map(ShowMinimap::Never, cx);
+                                },
+                            )
+                        ),
                 ),
         )
 }
 
 pub(crate) fn render_editing_page(window: &mut Window, cx: &mut App) -> impl IntoElement {
-    let mut tab_index = 0;
     v_flex()
         .gap_6()
-        .child(render_import_settings_section(&mut tab_index, cx))
-        .child(render_popular_settings_section(&mut tab_index, window, cx))
+        .child(render_import_settings_section(cx))
+        .child(render_popular_settings_section(window, cx))
 }

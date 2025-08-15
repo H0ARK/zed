@@ -4814,18 +4814,19 @@ impl OutlinePanel {
                 .track_scroll(self.scroll_handle.clone())
                 .when(show_indent_guides, |list| {
                     list.with_decoration(
-                        ui::indent_guides(px(indent_size), IndentGuideColors::panel(cx))
-                            .with_compute_indents_fn(
-                                cx.entity().clone(),
-                                |outline_panel, range, _, _| {
-                                    let entries = outline_panel.cached_entries.get(range);
-                                    if let Some(entries) = entries {
-                                        entries.into_iter().map(|item| item.depth).collect()
-                                    } else {
-                                        smallvec::SmallVec::new()
-                                    }
-                                },
-                            )
+                        ui::indent_guides(
+                            cx.entity().clone(),
+                            px(indent_size),
+                            IndentGuideColors::panel(cx),
+                            |outline_panel, range, _, _| {
+                                let entries = outline_panel.cached_entries.get(range);
+                                if let Some(entries) = entries {
+                                    entries.into_iter().map(|item| item.depth).collect()
+                                } else {
+                                    smallvec::SmallVec::new()
+                                }
+                            },
+                        )
                             .with_render_fn(
                                 cx.entity().clone(),
                                 move |outline_panel, params, _, _| {

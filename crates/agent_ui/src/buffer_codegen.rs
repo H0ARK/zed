@@ -6,7 +6,6 @@ use agent::{
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use client::telemetry::Telemetry;
-use cloud_llm_client::CompletionIntent;
 use collections::HashSet;
 use editor::{Anchor, AnchorRangeExt, MultiBuffer, MultiBufferSnapshot, ToOffset as _, ToPoint};
 use futures::{
@@ -36,6 +35,7 @@ use std::{
 };
 use streaming_diff::{CharOperation, LineDiff, LineOperation, StreamingDiff};
 use telemetry_events::{AssistantEventData, AssistantKind, AssistantPhase};
+use cloud_llm_client::CompletionIntent;
 
 pub struct BufferCodegen {
     alternatives: Vec<Entity<CodegenAlternative>>,
@@ -1095,8 +1095,14 @@ mod tests {
     };
     use language_model::{LanguageModelRegistry, TokenUsage};
     use rand::prelude::*;
+    use serde::Serialize;
     use settings::SettingsStore;
     use std::{future, sync::Arc};
+
+    #[derive(Serialize)]
+    pub struct DummyCompletionRequest {
+        pub name: String,
+    }
 
     #[gpui::test(iterations = 10)]
     async fn test_transform_autoindent(cx: &mut TestAppContext, mut rng: StdRng) {

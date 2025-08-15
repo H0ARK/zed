@@ -1,6 +1,6 @@
 use gpui::{Action, IntoElement, ParentElement, RenderOnce, point};
 use language_model::{LanguageModelRegistry, ZED_CLOUD_PROVIDER_ID};
-use ui::{Divider, List, ListBulletItem, prelude::*};
+use ui::{Divider, List, ListItem, prelude::*};
 
 pub struct ApiKeysWithProviders {
     configured_providers: Vec<(IconName, SharedString)>,
@@ -126,13 +126,13 @@ impl RenderOnce for ApiKeysWithoutProviders {
                     )
                     .child(Divider::horizontal()),
             )
-            .child(List::new().child(ListBulletItem::new(
-                "Add your own keys to use AI without signing in.",
-            )))
+            .child(List::new().child(ListItem::new("add-keys-info")
+                .child("Add your own keys to use AI without signing in.")
+            ))
             .child(
                 Button::new("configure-providers", "Configure Providers")
                     .full_width()
-                    .style(ButtonStyle::Outlined)
+                    .style(ButtonStyle::Transparent)
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(zed_actions::agent::OpenSettings.boxed_clone(), cx);
                     }),

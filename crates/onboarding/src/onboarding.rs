@@ -393,8 +393,8 @@ impl Onboarding {
                                 if ai_setup_page {
                                     this.child(
                                         ButtonLike::new("start_building")
-                                            .style(ButtonStyle::Outlined)
-                                            .size(ButtonSize::Medium)
+                                            .style(ButtonStyle::Subtle)
+                                            .size(ButtonSize::Default)
                                             .child(
                                                 h_flex()
                                                     .ml_1()
@@ -410,7 +410,7 @@ impl Onboarding {
                                 } else {
                                     this.child(
                                         ButtonLike::new("skip_all")
-                                            .size(ButtonSize::Medium)
+                                            .size(ButtonSize::Default)
                                             .child(
                                                 h_flex()
                                                     .ml_1()
@@ -444,7 +444,7 @@ impl Onboarding {
                         )
                         .child(
                             ButtonLike::new("open_account")
-                                .size(ButtonSize::Medium)
+                                .size(ButtonSize::Default)
                                 .child(
                                     h_flex()
                                         .ml_1()
@@ -469,8 +469,8 @@ impl Onboarding {
                 } else {
                     Button::new("sign_in", "Sign In")
                         .full_width()
-                        .style(ButtonStyle::Outlined)
-                        .size(ButtonSize::Medium)
+                        .style(ButtonStyle::Subtle)
+                        .size(ButtonSize::Default)
                         .key_binding(
                             KeyBinding::for_action_in(&SignIn, &self.focus_handle, window, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),

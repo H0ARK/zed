@@ -351,7 +351,7 @@ impl KeystrokeInput {
         cx.notify();
     }
 
-    fn render_keystrokes(&self, is_recording: bool) -> impl Iterator<Item = Div> {
+    fn render_keystrokes(&self, is_recording: bool, cx: &App) -> impl Iterator<Item = Div> {
         let keystrokes = if let Some(placeholders) = self.placeholder_keystrokes.as_ref()
             && self.keystrokes.is_empty()
         {
@@ -364,13 +364,16 @@ impl KeystrokeInput {
             &self.keystrokes
         };
         keystrokes.iter().map(move |keystroke| {
-            h_flex().children(ui::render_keystroke(
-                keystroke,
-                Some(Color::Default),
-                Some(rems(0.875).into()),
-                ui::PlatformStyle::platform(),
-                false,
-            ))
+            let key_binding = gpui::KeyBinding::new(
+                &format!("{}", keystroke),
+                StartRecording, // dummy action, won't be used for display
+                None,
+            );
+            h_flex().child(
+                ui::KeyBinding::new(key_binding, cx)
+                    .size(rems(0.875))
+                    .disabled(false)
+            )
         })
     }
 
@@ -579,7 +582,7 @@ impl Render for KeystrokeInput {
                     .justify_center()
                     .flex_wrap()
                     .gap(ui::DynamicSpacing::Base04.rems(cx))
-                    .children(self.render_keystrokes(is_recording)),
+                    .children(self.render_keystrokes(is_recording, cx)),
             )
             .child(
                 h_flex()

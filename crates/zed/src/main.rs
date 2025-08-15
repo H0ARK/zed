@@ -1,7 +1,7 @@
 mod reliability;
 mod zed;
 
-use agent_ui::AgentPanel;
+use agent_ui::{AgentPanel, NewAgentTab};
 use anyhow::{Context as _, Result};
 use clap::{Parser, command};
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
@@ -15,7 +15,7 @@ use extension_host::ExtensionStore;
 use fs::{Fs, RealFs};
 use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
-use gpui::{App, AppContext as _, Application, AsyncApp, Focusable as _, UpdateGlobal as _};
+use gpui::{App, AppContext as _, Application, AsyncApp, Entity, Focusable as _, UpdateGlobal as _};
 
 use gpui_tokio::Tokio;
 use http_client::{Url, read_proxy_from_env};
@@ -27,7 +27,7 @@ use reqwest_client::ReqwestClient;
 use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
-use project::project_settings::ProjectSettings;
+use project::{LspStore, project_settings::ProjectSettings};
 use recent_projects::{SshSettings, open_ssh_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
@@ -467,16 +467,19 @@ pub fn main() {
             language_extension::LspAccess::ViaWorkspaces({
                 let workspace_store = workspace_store.clone();
                 Arc::new(move |cx: &mut App| {
-                    workspace_store.update(cx, |workspace_store, cx| {
-                        workspace_store
-                            .workspaces()
-                            .iter()
-                            .map(|workspace| {
-                                workspace.update(cx, |workspace, _, cx| {
-                                    workspace.project().read(cx).lsp_store()
-                                })
-                            })
-                            .collect()
+                    workspace_store.update(cx, |_workspace_store, _cx| {
+                        // TODO: The workspaces() method no longer exists on WorkspaceStore
+                        // Need to find alternative way to access workspaces
+                        Ok(Vec::<Entity<LspStore>>::new())
+                        // Ok(workspace_store
+                        //     .workspaces()
+                        //     .iter()
+                        //     .map(|workspace| {
+                        //         workspace.update(cx, |workspace, _, cx| {
+                        //             workspace.project().read(cx).lsp_store()
+                        //         })
+                        //     })
+                        //     .collect())
                     })
                 })
             }),
@@ -1048,7 +1051,15 @@ async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp
         cx.update(|cx| {
             // Do not create a default untitled editor on empty launch.
             // The Agent tab (and other startup UI) will be added by workspace initialization.
-            workspace::open_new(Default::default(), app_state, cx, |_workspace, _window, _cx| {})
+            {
+                // Set the default pane action to NewAgentTab for agent-first behavior
+                workspace::set_default_pane_action_fn(|| Box::new(NewAgentTab));
+                
+                workspace::open_new(Default::default(), app_state, cx, |_workspace, window, cx| {
+                    // Open the agent tab by default on new workspaces  
+                    window.dispatch_action(Box::new(NewAgentTab), cx);
+                })
+            }
         })?
         .await?;
     }

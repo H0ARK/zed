@@ -90,7 +90,7 @@ impl Render for IconButtonStory {
 
         let selected_with_tooltip_button = StoryItem::new(
             "Selected with `tooltip`",
-            IconButton::new("selected_with_tooltip_button", IconName::CaseSensitive)
+            IconButton::new("selected_with_tooltip_button", IconName::Info)
                 .toggle_state(true)
                 .tooltip(Tooltip::text("Toggle inlay hints")),
         )

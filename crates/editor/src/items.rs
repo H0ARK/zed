@@ -776,10 +776,6 @@ impl Item for Editor {
         }
     }
 
-    fn on_removed(&self, cx: &App) {
-        self.report_editor_event(ReportEditorEvent::Closed, None, cx);
-    }
-
     fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let selection = self.selections.newest_anchor();
         self.push_to_nav_history(selection.head(), None, true, false, cx);

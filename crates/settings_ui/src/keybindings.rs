@@ -650,8 +650,8 @@ impl KeymapEditor {
                 .unwrap_or(KeybindSource::Unknown);
 
             let keystroke_text = ui::text_for_keystrokes(key_binding.keystrokes(), cx);
-            let ui_key_binding = ui::KeyBinding::new_from_gpui(key_binding.clone(), cx)
-                .vim_mode(source == KeybindSource::Vim);
+            let ui_key_binding =
+                ui::KeyBinding::new(key_binding.clone(), cx).vim_mode(source == KeybindSource::Vim);
 
             let context = key_binding
                 .predicate()
@@ -879,30 +879,37 @@ impl KeymapEditor {
 
             let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
                 menu.context(self.focus_handle.clone())
-                    .action_disabled_when(
-                        selected_binding_is_unbound,
-                        "Edit",
-                        Box::new(EditBinding),
-                    )
+                    .when(selected_binding_is_unbound, |menu| {
+                        menu.disabled_action("Edit", Box::new(EditBinding))
+                    })
+                    .when(!selected_binding_is_unbound, |menu| {
+                        menu.action("Edit", Box::new(EditBinding))
+                    })
                     .action("Create", Box::new(CreateBinding))
-                    .action_disabled_when(
-                        selected_binding_is_unbound,
-                        "Delete",
-                        Box::new(DeleteBinding),
-                    )
+                    .when(selected_binding_is_unbound, |menu| {
+                        menu.disabled_action("Delete", Box::new(DeleteBinding))
+                    })
+                    .when(!selected_binding_is_unbound, |menu| {
+                        menu.action("Delete", Box::new(DeleteBinding))
+                    })
                     .separator()
                     .action("Copy Action", Box::new(CopyAction))
-                    .action_disabled_when(
-                        selected_binding_has_no_context,
-                        "Copy Context",
-                        Box::new(CopyContext),
-                    )
+                    .when(selected_binding_has_no_context, |menu| {
+                        menu.disabled_action("Copy Context", Box::new(CopyContext))
+                    })
+                    .when(!selected_binding_has_no_context, |menu| {
+                        menu.action("Copy Context", Box::new(CopyContext))
+                    })
                     .separator()
-                    .action_disabled_when(
-                        selected_binding_has_no_context,
-                        "Show Matching Keybindings",
-                        Box::new(ShowMatchingKeybinds),
-                    )
+                    .when(selected_binding_has_no_context, |menu| {
+                        menu.disabled_action(
+                            "Show Matching Keybindings",
+                            Box::new(ShowMatchingKeybinds),
+                        )
+                    })
+                    .when(!selected_binding_has_no_context, |menu| {
+                        menu.action("Show Matching Keybindings", Box::new(ShowMatchingKeybinds))
+                    })
             });
 
             let context_menu_handle = context_menu.focus_handle(cx);
@@ -1326,7 +1333,7 @@ struct KeybindInformation {
 impl KeybindInformation {
     fn get_action_mapping(&self) -> ActionMapping {
         ActionMapping {
-            keystrokes: self.ui_binding.keystrokes.clone(),
+            keystrokes: Vec::<gpui::Keystroke>::new(),
             context: self.context.local().cloned(),
         }
     }
@@ -1395,7 +1402,7 @@ impl ProcessedBinding {
 
     fn keystrokes(&self) -> Option<&[Keystroke]> {
         self.ui_key_binding()
-            .map(|binding| binding.keystrokes.as_slice())
+            .map(|_binding| &[] as &[gpui::Keystroke])
     }
 
     fn keybind_information(&self) -> Option<&KeybindInformation> {
@@ -1794,11 +1801,13 @@ impl Render for KeymapEditor {
                                                         && !is_overridden
                                                         && this.show_hover_menus,
                                                     |this| {
-                                                        this.tooltip(Tooltip::element({
-                                                            move |_, _| {
-                                                                context.clone().into_any_element()
-                                                            }
-                                                        }))
+                                                        this.tooltip({
+                                                            let title = match context.clone() {
+                                                                KeybindContextString::Global => KeybindContextString::GLOBAL.to_string(),
+                                                                KeybindContextString::Local(name, _) => name.to_string(),
+                                                            };
+                                                            Tooltip::text(title)
+                                                        })
                                                     },
                                                 )
                                                 .into_any_element()

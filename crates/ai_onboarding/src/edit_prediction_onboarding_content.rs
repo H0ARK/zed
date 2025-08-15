@@ -52,7 +52,7 @@ impl Render for EditPredictionOnboarding {
                     },
                 )
                 .full_width()
-                .style(ButtonStyle::Outlined)
+                .style(ButtonStyle::Transparent)
                 .on_click({
                     let callback = self.continue_with_copilot.clone();
                     move |_, window, cx| callback(window, cx)

@@ -69,7 +69,8 @@ impl RenderOnce for ProgressBar {
             .w_full()
             .h(px(8.0))
             .rounded_full()
-            .p(px(2.0))
+            .py(px(2.0))
+            .px(px(4.0))
             .bg(self.bg_color)
             .shadow(vec![gpui::BoxShadow {
                 color: gpui::black().opacity(0.08),

@@ -19,7 +19,7 @@ use workspace::{
     Workspace,
     item::{Item, ItemEvent},
 };
-use zed_actions::agent::OpenConfiguration;
+use zed_actions::agent::OpenSettings;
 
 // Import the AgentPanel implementation to reuse its logic
 use crate::agent_panel::AgentPanel;
@@ -263,7 +263,7 @@ impl Item for AgentItem {
                     });
                 }
             })
-            .register_action(|workspace, _: &OpenConfiguration, window, cx| {
+            .register_action(|workspace, _: &OpenSettings, window, cx| {
                 if let Some(item) = workspace
                     .active_item(cx)
                     .and_then(|item| item.downcast::<AgentItem>())

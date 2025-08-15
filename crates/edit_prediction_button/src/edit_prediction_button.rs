@@ -2,7 +2,7 @@ use anyhow::Result;
 use client::{UserStore, zed_urls};
 use cloud_llm_client::UsageLimit;
 use copilot::{Copilot, Status};
-use editor::{Editor, SelectionEffects, actions::ShowEditPrediction, scroll::Autoscroll};
+use editor::{Editor, SelectionEffects, actions::{ShowEditPrediction, ToggleEditPrediction}, scroll::Autoscroll};
 use feature_flags::{FeatureFlagAppExt, PredictEditsRateCompletionsFeatureFlag};
 use fs::Fs;
 use gpui::{
@@ -480,9 +480,9 @@ impl EditPredictionButton {
         let globally_enabled = settings.show_edit_predictions(None, cx);
         let entry = ContextMenuEntry::new("All Files")
             .toggleable(IconPosition::Start, globally_enabled)
-            .action(workspace::ToggleEditPrediction.boxed_clone())
+            .action(ToggleEditPrediction.boxed_clone())
             .handler(|window, cx| {
-                window.dispatch_action(workspace::ToggleEditPrediction.boxed_clone(), cx)
+                window.dispatch_action(ToggleEditPrediction.boxed_clone(), cx)
             });
         menu = menu.item(entry);
 

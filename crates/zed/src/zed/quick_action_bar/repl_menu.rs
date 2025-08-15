@@ -216,7 +216,7 @@ impl QuickActionBar {
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .width(rems(1.))
+                    .width(rems(1.).into())
                     .disabled(menu_state.popover_disabled),
                 Tooltip::text("REPL Menu"),
             );

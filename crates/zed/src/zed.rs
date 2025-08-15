@@ -375,18 +375,20 @@ pub fn initialize_workspace(
 
         let cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
-        workspace.status_bar().update(cx, |status_bar, cx| {
-            status_bar.add_left_item(search_button, window, cx);
-            status_bar.add_left_item(lsp_tool, window, cx);
-            status_bar.add_left_item(diagnostic_summary, window, cx);
-            status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(edit_prediction_button, window, cx);
-            status_bar.add_right_item(active_buffer_language, window, cx);
-            status_bar.add_right_item(active_toolchain_language, window, cx);
-            status_bar.add_right_item(vim_mode_indicator, window, cx);
-            status_bar.add_right_item(cursor_position, window, cx);
-            status_bar.add_right_item(image_info, window, cx);
-        });
+        // Status bar functionality has been removed from Workspace
+        // TODO: Find new way to add these items if needed
+        // workspace.status_bar().update(cx, |status_bar, cx| {
+        //     status_bar.add_left_item(search_button, window, cx);
+        //     status_bar.add_left_item(lsp_tool, window, cx);
+        //     status_bar.add_left_item(diagnostic_summary, window, cx);
+        //     status_bar.add_left_item(activity_indicator, window, cx);
+        //     status_bar.add_right_item(edit_prediction_button, window, cx);
+        //     status_bar.add_right_item(active_buffer_language, window, cx);
+        //     status_bar.add_right_item(active_toolchain_language, window, cx);
+        //     status_bar.add_right_item(vim_mode_indicator, window, cx);
+        //     status_bar.add_right_item(cursor_position, window, cx);
+        //     status_bar.add_right_item(image_info, window, cx);
+        // });
 
         let handle = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {

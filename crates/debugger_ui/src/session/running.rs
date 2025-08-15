@@ -1607,7 +1607,6 @@ impl RunningState {
                         scenario,
                         task_context,
                         active_buffer,
-                        worktree_id,
                         window,
                         cx,
                     )

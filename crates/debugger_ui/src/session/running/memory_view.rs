@@ -196,7 +196,7 @@ impl MemoryView {
             .bottom_0()
             .w(px(12.))
             .cursor_default()
-            .children(Scrollbar::vertical(self.scroll_state.clone()).map(|s| s.auto_hide(cx)))
+            .children(Scrollbar::vertical(self.scroll_state.clone()))
     }
 
     fn render_memory(&self, cx: &mut Context<Self>) -> UniformList {
@@ -384,14 +384,6 @@ impl MemoryView {
                             this.view_state.line_width = width.clone();
                         });
                     });
-                }
-                if let Some(ix) = WIDTHS
-                    .iter()
-                    .position(|width| width.width == selected_width.width)
-                {
-                    for _ in 0..=ix {
-                        this.select_next(&Default::default(), window, cx);
-                    }
                 }
                 this
             }),
@@ -652,18 +644,18 @@ impl MemoryView {
                 })
             });
 
-            let mut menu = menu.action_disabled_when(
-                range_too_large || *memory_unreadable,
-                "Go To Selected Address",
-                GoToSelectedAddress.boxed_clone(),
-            );
+            let mut menu = if range_too_large || *memory_unreadable {
+                menu.disabled_action("Go To Selected Address", GoToSelectedAddress.boxed_clone())
+            } else {
+                menu.action("Go To Selected Address", GoToSelectedAddress.boxed_clone())
+            };
 
             if supports_data_breakpoints {
-                menu = menu.action_disabled_when(
-                    *memory_unreadable,
-                    "Set Data Breakpoint",
-                    ToggleDataBreakpoint { access_type: None }.boxed_clone(),
-                );
+                menu = if *memory_unreadable {
+                    menu.disabled_action("Set Data Breakpoint", ToggleDataBreakpoint { access_type: None }.boxed_clone())
+                } else {
+                    menu.action("Set Data Breakpoint", ToggleDataBreakpoint { access_type: None }.boxed_clone())
+                };
             }
             menu.context(self.focus_handle.clone())
         });

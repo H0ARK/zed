@@ -13,7 +13,7 @@ pub use context_store::ContextStore;
 pub use pointer_context_manager::{PointerContextManager, ContextManagerConfig, UsageTracker, DiffManager, TerminalCompressor};
 pub use thread::{
     LastRestoreCheckpoint, Message, MessageCrease, MessageId, MessageSegment, Thread, ThreadError,
-    ThreadEvent, ThreadFeedback, ThreadId, ThreadSummary, TokenUsageRatio,
+    ThreadEvent, ThreadFeedback, ThreadId, ThreadSummary, TokenUsageRatio, TotalTokenUsage,
 };
 pub use thread_store::{SerializedThread, TextThreadStore, ThreadStore};
 

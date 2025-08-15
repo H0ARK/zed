@@ -1,16 +1,15 @@
 mod completion_provider;
-pub(crate) mod fetch_context_picker;
-pub(crate) mod file_context_picker;
-pub(crate) mod rules_context_picker;
-pub(crate) mod symbol_context_picker;
-pub(crate) mod thread_context_picker;
+mod fetch_context_picker;
+mod file_context_picker;
+mod rules_context_picker;
+mod symbol_context_picker;
+mod thread_context_picker;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use collections::HashSet;
 pub use completion_provider::ContextPickerCompletionProvider;
 use editor::display_map::{Crease, CreaseId, CreaseMetadata, FoldId};
 use editor::{Anchor, AnchorRangeExt as _, Editor, ExcerptId, FoldPlaceholder, ToOffset};
@@ -46,7 +45,7 @@ use agent::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextPickerEntry {
+enum ContextPickerEntry {
     Mode(ContextPickerMode),
     Action(ContextPickerAction),
 }
@@ -75,7 +74,7 @@ impl ContextPickerEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextPickerMode {
+enum ContextPickerMode {
     File,
     Symbol,
     Fetch,
@@ -84,7 +83,7 @@ pub(crate) enum ContextPickerMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextPickerAction {
+enum ContextPickerAction {
     AddSelections,
 }
 
@@ -103,7 +102,7 @@ impl ContextPickerAction {
 
     pub fn icon(&self) -> IconName {
         match self {
-            Self::AddSelections => IconName::Reader,
+            Self::AddSelections => IconName::Cog,
         }
     }
 }
@@ -148,8 +147,8 @@ impl ContextPickerMode {
         match self {
             Self::File => IconName::File,
             Self::Symbol => IconName::Code,
-            Self::Fetch => IconName::ToolWeb,
-            Self::Thread => IconName::Thread,
+            Self::Fetch => IconName::Public,
+            Self::Thread => IconName::Chat,
             Self::Rules => RULES_ICON,
         }
     }
@@ -427,7 +426,6 @@ impl ContextPicker {
                             this.add_recent_file(project_path.clone(), window, cx);
                         })
                     },
-                    None,
                 )
             }
             RecentEntry::Thread(thread) => {
@@ -445,7 +443,6 @@ impl ContextPicker {
                                 .detach_and_log_err(cx);
                         })
                     },
-                    None,
                 )
             }
         }
@@ -532,7 +529,7 @@ impl ContextPicker {
             return vec![];
         };
 
-        recent_context_picker_entries_with_store(
+        recent_context_picker_entries(
             context_store,
             self.thread_store.clone(),
             self.text_thread_store.clone(),
@@ -586,8 +583,7 @@ impl Render for ContextPicker {
             })
     }
 }
-
-pub(crate) enum RecentEntry {
+enum RecentEntry {
     File {
         project_path: ProjectPath,
         path_prefix: Arc<str>,
@@ -595,7 +591,7 @@ pub(crate) enum RecentEntry {
     Thread(ThreadContextEntry),
 }
 
-pub(crate) fn available_context_picker_entries(
+fn available_context_picker_entries(
     prompt_store: &Option<Entity<PromptStore>>,
     thread_store: &Option<WeakEntity<ThreadStore>>,
     workspace: &Entity<Workspace>,
@@ -632,7 +628,7 @@ pub(crate) fn available_context_picker_entries(
     entries
 }
 
-fn recent_context_picker_entries_with_store(
+fn recent_context_picker_entries(
     context_store: Entity<ContextStore>,
     thread_store: Option<WeakEntity<ThreadStore>>,
     text_thread_store: Option<WeakEntity<TextThreadStore>>,
@@ -640,48 +636,16 @@ fn recent_context_picker_entries_with_store(
     exclude_path: Option<ProjectPath>,
     cx: &App,
 ) -> Vec<RecentEntry> {
-    let project = workspace.read(cx).project();
-
-    let mut exclude_paths = context_store.read(cx).file_paths(cx);
-    exclude_paths.extend(exclude_path);
-
-    let exclude_paths = exclude_paths
-        .into_iter()
-        .filter_map(|project_path| project.read(cx).absolute_path(&project_path, cx))
-        .collect();
-
-    let exclude_threads = context_store.read(cx).thread_ids();
-
-    recent_context_picker_entries(
-        thread_store,
-        text_thread_store,
-        workspace,
-        &exclude_paths,
-        exclude_threads,
-        cx,
-    )
-}
-
-pub(crate) fn recent_context_picker_entries(
-    thread_store: Option<WeakEntity<ThreadStore>>,
-    text_thread_store: Option<WeakEntity<TextThreadStore>>,
-    workspace: Entity<Workspace>,
-    exclude_paths: &HashSet<PathBuf>,
-    exclude_threads: &HashSet<ThreadId>,
-    cx: &App,
-) -> Vec<RecentEntry> {
     let mut recent = Vec::with_capacity(6);
+    let mut current_files = context_store.read(cx).file_paths(cx);
+    current_files.extend(exclude_path);
     let workspace = workspace.read(cx);
     let project = workspace.project().read(cx);
 
     recent.extend(
         workspace
             .recent_navigation_history_iter(cx)
-            .filter(|(_, abs_path)| {
-                abs_path
-                    .as_ref()
-                    .map_or(true, |path| !exclude_paths.contains(path.as_path()))
-            })
+            .filter(|(path, _)| !current_files.contains(path))
             .take(4)
             .filter_map(|(project_path, _)| {
                 project
@@ -693,9 +657,11 @@ pub(crate) fn recent_context_picker_entries(
             }),
     );
 
+    let current_threads = context_store.read(cx).thread_ids();
+
     let active_thread_id = workspace
         .panel::<AgentPanel>(cx)
-        .and_then(|panel| Some(panel.read(cx).active_thread(cx)?.read(cx).id()));
+        .and_then(|panel| Some(panel.read(cx).active_thread()?.read(cx).id()));
 
     if let Some((thread_store, text_thread_store)) = thread_store
         .and_then(|store| store.upgrade())
@@ -704,7 +670,7 @@ pub(crate) fn recent_context_picker_entries(
         let mut threads = unordered_thread_entries(thread_store, text_thread_store, cx)
             .filter(|(_, thread)| match thread {
                 ThreadContextEntry::Thread { id, .. } => {
-                    Some(id) != active_thread_id && !exclude_threads.contains(id)
+                    Some(id) != active_thread_id && !current_threads.contains(id)
                 }
                 ThreadContextEntry::Context { .. } => true,
             })
@@ -742,7 +708,7 @@ fn add_selections_as_context(
     })
 }
 
-pub(crate) fn selection_ranges(
+fn selection_ranges(
     workspace: &Entity<Workspace>,
     cx: &mut App,
 ) -> Vec<(Entity<Buffer>, Range<text::Anchor>)> {
@@ -964,8 +930,8 @@ impl MentionLink {
         format!(
             "[@{} ({}-{})]({}:{}:{}-{})",
             file_name,
-            line_range.start + 1,
-            line_range.end + 1,
+            line_range.start,
+            line_range.end,
             Self::SELECTION,
             full_path,
             line_range.start,

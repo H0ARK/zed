@@ -45,7 +45,7 @@ impl Render for StatusBar {
             .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
             .py(DynamicSpacing::Base04.rems(cx))
-            .px(DynamicSpacing::Base06.rems(cx))
+            .px(DynamicSpacing::Base08.rems(cx))
             .bg(cx.theme().colors().status_bar_background)
             .map(|el| match window.window_decorations() {
                 Decorations::Server => el,
@@ -61,23 +61,22 @@ impl Render for StatusBar {
                     .border_b(px(1.0))
                     .border_color(cx.theme().colors().status_bar_background),
             })
-            .child(self.render_left_tools())
-            .child(self.render_right_tools())
+            .child(self.render_left_tools(cx))
+            .child(self.render_right_tools(cx))
     }
 }
 
 impl StatusBar {
-    fn render_left_tools(&self) -> impl IntoElement {
+    fn render_left_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .gap_1()
+            .gap(DynamicSpacing::Base04.rems(cx))
             .overflow_x_hidden()
             .children(self.left_items.iter().map(|item| item.to_any()))
     }
 
-    fn render_right_tools(&self) -> impl IntoElement {
+    fn render_right_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .gap_1()
-            .overflow_x_hidden()
+            .gap(DynamicSpacing::Base04.rems(cx))
             .children(self.right_items.iter().rev().map(|item| item.to_any()))
     }
 }

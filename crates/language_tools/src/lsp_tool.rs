@@ -118,7 +118,6 @@ impl LanguageServerHealthStatus {
 
 impl LanguageServerState {
     fn fill_menu(&self, mut menu: ContextMenu, cx: &mut Context<Self>) -> ContextMenu {
-        menu = menu.align_popover_bottom();
         let lsp_logs = cx
             .try_global::<GlobalLogStore>()
             .and_then(|lsp_logs| lsp_logs.0.upgrade());
@@ -353,12 +352,6 @@ impl LanguageServerState {
                         }
                     }
                 },
-                message.map(|server_message| {
-                    DocumentationAside::new(
-                        DocumentationSide::Right,
-                        Rc::new(move |_| Label::new(server_message.clone()).into_any_element()),
-                    )
-                }),
             ));
         }
         menu
@@ -865,11 +858,6 @@ impl LspTool {
                             state.update(cx, |state, cx| state.fill_menu(menu, cx))
                         });
                         lsp_tool.lsp_menu = Some(menu.clone());
-                        lsp_tool.popover_menu_handle.refresh_menu(
-                            window,
-                            cx,
-                            Rc::new(move |_, _| Some(menu.clone())),
-                        );
                         cx.notify();
                     })
                     .ok();

@@ -585,7 +585,7 @@
     // Default width of the project panel.
     "default_width": 200,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "right",
+    "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -761,7 +761,7 @@
     // Whether to show the notification panel button in the status bar.
     "button": true,
     // Where to dock the notification panel. Can be 'left' or 'right'.
-    "dock": "right",
+    "dock": "left",
     // Default width of the notification panel.
     "default_width": 380
   },
@@ -773,7 +773,7 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "left",
+    "dock": "right",
     // Default width when the agent panel is docked to the left or right.
     "default_width": 1000,
     // Default height when the agent panel is docked to the bottom.
@@ -944,7 +944,7 @@
     "git_status": false,
     // Position of the close button on the editor tabs.
     // One of: ["right", "left", "hidden"]
-    "close_position": "right",
+    "close_position": "left",
     // Whether to show the file icon for a tab.
     "file_icons": false,
     // Controls the appearance behavior of the tab's close button.

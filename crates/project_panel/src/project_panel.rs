@@ -947,11 +947,12 @@ impl ProjectPanel {
                             .action("Copy", Box::new(Copy))
                             .action("Duplicate", Box::new(Duplicate))
                             // TODO: Paste should always be visible, cbut disabled when clipboard is empty
-                            .action_disabled_when(
-                                self.clipboard.as_ref().is_none(),
-                                "Paste",
-                                Box::new(Paste),
-                            )
+                            .when(self.clipboard.as_ref().is_some(), |menu| {
+                                menu.action("Paste", Box::new(Paste))
+                            })
+                            .when(self.clipboard.as_ref().is_none(), |menu| {
+                                menu.disabled_action("Paste", Box::new(Paste))
+                            })
                             .separator()
                             .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))
                             .action(
@@ -4012,7 +4013,7 @@ impl ProjectPanel {
         let worktree_id = details.worktree_id;
         let dragged_selection = DraggedSelection {
             active_selection: selection,
-            marked_selections: Arc::from(self.marked_entries.clone()),
+            marked_selections: Arc::new(self.marked_entries.iter().cloned().collect::<BTreeSet<_>>()),
         };
 
         let bg_color = if is_marked {
@@ -4226,7 +4227,7 @@ impl ProjectPanel {
                             details: details.clone(),
                             click_offset,
                             selection: selection.active_selection,
-                            selections: selection.marked_selections.clone(),
+                            selections: Arc::from(selection.marked_selections.iter().cloned().collect::<Vec<_>>()),
                         })
                     },
                 )
@@ -5350,27 +5351,28 @@ impl Render for ProjectPanel {
                     })
                     .when(show_indent_guides, |list| {
                         list.with_decoration(
-                            ui::indent_guides(px(indent_size), IndentGuideColors::panel(cx))
-                                .with_compute_indents_fn(
-                                    cx.entity().clone(),
-                                    |this, range, window, cx| {
-                                        let mut items =
-                                            SmallVec::with_capacity(range.end - range.start);
-                                        this.iter_visible_entries(
-                                            range,
-                                            window,
-                                            cx,
-                                            |entry, _, entries, _, _| {
-                                                let (depth, _) =
-                                                    Self::calculate_depth_and_difference(
-                                                        entry, entries,
-                                                    );
-                                                items.push(depth);
-                                            },
-                                        );
-                                        items
-                                    },
-                                )
+                            ui::indent_guides(
+                                cx.entity().clone(),
+                                px(indent_size),
+                                IndentGuideColors::panel(cx),
+                                |this, range, window, cx| {
+                                    let mut items =
+                                        SmallVec::with_capacity(range.end - range.start);
+                                    this.iter_visible_entries(
+                                        range,
+                                        window,
+                                        cx,
+                                        |entry, _, entries, _, _| {
+                                            let (depth, _) =
+                                                Self::calculate_depth_and_difference(
+                                                    entry, entries,
+                                                );
+                                            items.push(depth);
+                                        },
+                                    );
+                                    items
+                                },
+                            )
                                 .on_click(cx.listener(
                                     |this, active_indent_guide: &IndentGuideLayout, window, cx| {
                                         if window.modifiers().secondary() {
@@ -5473,7 +5475,12 @@ impl Render for ProjectPanel {
                         );
                         list.with_decoration(if show_indent_guides {
                             sticky_items.with_decoration(
-                                ui::indent_guides(px(indent_size), IndentGuideColors::panel(cx))
+                                ui::indent_guides(
+                                    cx.entity().clone(),
+                                    px(indent_size),
+                                    IndentGuideColors::panel(cx),
+                                    |_, _, _, _| SmallVec::new(),
+                                )
                                     .with_render_fn(cx.entity().clone(), move |_, params, _, _| {
                                         const LEFT_OFFSET: Pixels = px(14.);
 

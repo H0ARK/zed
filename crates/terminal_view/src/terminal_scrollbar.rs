@@ -46,16 +46,9 @@ impl TerminalScrollHandle {
 }
 
 impl ScrollableHandle for TerminalScrollHandle {
-    fn max_offset(&self) -> Size<Pixels> {
+    fn content_size(&self) -> Size<Pixels> {
         let state = self.state.borrow();
-        size(
-            Pixels::ZERO,
-            state
-                .total_lines
-                .checked_sub(state.viewport_lines)
-                .unwrap_or(0) as f32
-                * state.line_height,
-        )
+        size(px(0.), px(state.total_lines as f32 * state.line_height.0))
     }
 
     fn offset(&self) -> Point<Pixels> {

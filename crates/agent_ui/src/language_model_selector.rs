@@ -3,7 +3,9 @@ use std::{cmp::Reverse, sync::Arc};
 use collections::{HashSet, IndexMap};
 use feature_flags::ZedProFeatureFlag;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
-use gpui::{Action, AnyElement, App, BackgroundExecutor, DismissEvent, Subscription, Task};
+use gpui::{
+    Action, AnyElement, App, BackgroundExecutor, DismissEvent, Subscription, Task, actions,
+};
 use language_model::{
     AuthenticateError, ConfiguredModel, LanguageModel, LanguageModelProviderId,
     LanguageModelRegistry,
@@ -12,6 +14,7 @@ use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate};
 use proto::Plan;
 use ui::{ListItem, ListItemSpacing, prelude::*};
+
 
 const TRY_ZED_PRO_URL: &str = "https://zed.dev/pro";
 
@@ -389,7 +392,7 @@ impl PickerDelegate for LanguageModelPickerDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         let all_models = self.all_models.clone();
-        let active_model = (self.get_active_model)(cx);
+        let current_index = self.selected_index;
         let bg_executor = cx.background_executor();
 
         let language_model_registry = LanguageModelRegistry::global(cx);
@@ -431,9 +434,12 @@ impl PickerDelegate for LanguageModelPickerDelegate {
         cx.spawn_in(window, async move |this, cx| {
             this.update_in(cx, |this, window, cx| {
                 this.delegate.filtered_entries = filtered_models.entries();
-                // Finds the currently selected model in the list
-                let new_index =
-                    Self::get_active_model_index(&this.delegate.filtered_entries, active_model);
+                // Preserve selection focus
+                let new_index = if current_index >= this.delegate.filtered_entries.len() {
+                    0
+                } else {
+                    current_index
+                };
                 this.set_selected_index(new_index, Some(picker::Direction::Down), true, window, cx);
                 cx.notify();
             })

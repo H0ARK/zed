@@ -306,7 +306,7 @@ where
                                 )
                                 .child(
                                     Icon::new(IconName::ArrowUpRight)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::XSmall)
                                         .color(Color::Muted),
                                 ),
                         )

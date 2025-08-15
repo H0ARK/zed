@@ -142,11 +142,12 @@ impl RenderOnce for AiUpsellCard {
                     rems_from_px(72.),
                 )
                 .color(Color::Custom(cx.theme().colors().text_accent.alpha(0.3)))
-                .with_animation(
-                    "loading_stamp",
-                    Animation::new(Duration::from_secs(10)).repeat(),
-                    |this, delta| this.transform(Transformation::rotate(percentage(delta))),
-                ),
+                // TODO: Vector.transform method no longer exists
+                // .with_animation(
+                //     "loading_stamp",
+                //     Animation::new(Duration::from_secs(10)).repeat(),
+                //     |this, delta| this.transform(Transformation::rotate(percentage(delta))),
+                // ),
             );
 
         let pro_trial_stamp = div()
@@ -212,9 +213,10 @@ impl RenderOnce for AiUpsellCard {
                                         Button::new("start_trial", "Start 14-day Free Pro Trial")
                                             .full_width()
                                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                            .when_some(self.tab_index, |this, tab_index| {
-                                                this.tab_index(tab_index)
-                                            })
+                                            // TODO: tab_index method no longer exists on Button
+                                            // .when_some(self.tab_index, |this, tab_index| {
+                                            //     this.tab_index(tab_index)
+                                            // })
                                             .on_click(move |_, _window, cx| {
                                                 telemetry::event!(
                                                     "Start Trial Clicked",
@@ -264,7 +266,8 @@ impl RenderOnce for AiUpsellCard {
                     Button::new("sign_in", "Sign In")
                         .full_width()
                         .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                        .when_some(self.tab_index, |this, tab_index| this.tab_index(tab_index))
+                        // TODO: tab_index method no longer exists on Button
+                        // .when_some(self.tab_index, |this, tab_index| this.tab_index(tab_index))
                         .on_click({
                             let callback = self.sign_in.clone();
                             move |_, window, cx| {

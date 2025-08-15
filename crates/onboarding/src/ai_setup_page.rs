@@ -12,7 +12,7 @@ use language_model::{LanguageModelProvider, LanguageModelProviderId, LanguageMod
 use project::DisableAiSettings;
 use settings::{Settings, update_settings_file};
 use ui::{
-    Badge, ButtonLike, Divider, KeyBinding, Modal, ModalFooter, ModalHeader, Section, SwitchField,
+    Badge, ButtonLike, Divider, KeyBinding, Modal, ModalFooter, ModalHeader, Section, SwitchWithLabel,
     ToggleState, prelude::*, tooltip_container,
 };
 use util::ResultExt;
@@ -22,7 +22,6 @@ use zed_actions::agent::OpenSettings;
 const FEATURED_PROVIDERS: [&'static str; 4] = ["anthropic", "google", "openai", "ollama"];
 
 fn render_llm_provider_section(
-    tab_index: &mut isize,
     workspace: WeakEntity<Workspace>,
     disabled: bool,
     window: &mut Window,
@@ -38,10 +37,10 @@ fn render_llm_provider_section(
                         .color(Color::Muted),
                 ),
         )
-        .child(render_llm_provider_card(tab_index, workspace, disabled, window, cx))
+        .child(render_llm_provider_card(workspace, disabled, window, cx))
 }
 
-fn render_privacy_card(tab_index: &mut isize, disabled: bool, cx: &mut App) -> impl IntoElement {
+fn render_privacy_card(disabled: bool, cx: &mut App) -> impl IntoElement {
     let (title, description) = if disabled {
         (
             "AI is disabled across Zed",
@@ -81,7 +80,7 @@ fn render_privacy_card(tab_index: &mut isize, disabled: bool, cx: &mut App) -> i
                         )
                         .child(
                             Button::new("learn_more", "Learn More")
-                                .style(ButtonStyle::Outlined)
+                                .style(ButtonStyle::Subtle)
                                 .label_size(LabelSize::Small)
                                 .icon(IconName::ArrowUpRight)
                                 .icon_size(IconSize::XSmall)
@@ -89,10 +88,6 @@ fn render_privacy_card(tab_index: &mut isize, disabled: bool, cx: &mut App) -> i
                                 .on_click(|_, _, cx| {
                                     cx.open_url(&zed_urls::ai_privacy_and_security(cx))
                                 })
-                                .tab_index({
-                                    *tab_index += 1;
-                                    *tab_index - 1
-                                }),
                         ),
                 ),
         )
@@ -104,7 +99,6 @@ fn render_privacy_card(tab_index: &mut isize, disabled: bool, cx: &mut App) -> i
 }
 
 fn render_llm_provider_card(
-    tab_index: &mut isize,
     workspace: WeakEntity<Workspace>,
     disabled: bool,
     _: &mut Window,
@@ -131,10 +125,6 @@ fn render_llm_provider_card(
 
                     ButtonLike::new(("onboarding-ai-setup-buttons", index))
                         .size(ButtonSize::Large)
-                        .tab_index({
-                            *tab_index += 1;
-                            *tab_index - 1
-                        })
                         .child(
                             h_flex()
                                 .group(&group_name)
@@ -220,10 +210,6 @@ fn render_llm_provider_card(
                 .on_click(|_event, window, cx| {
                     window.dispatch_action(OpenSettings.boxed_clone(), cx)
                 })
-                .tab_index({
-                    *tab_index += 1;
-                    *tab_index - 1
-                }),
         )
 }
 
@@ -234,16 +220,14 @@ pub(crate) fn render_ai_setup_page(
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
-    let mut tab_index = 0;
     let is_ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
 
     v_flex()
         .gap_2()
         .child(
-            SwitchField::new(
+            SwitchWithLabel::new(
                 "enable_ai",
-                "Enable AI features",
-                None,
+                Label::new("Enable AI features"),
                 if is_ai_disabled {
                     ToggleState::Unselected
                 } else {
@@ -273,12 +257,8 @@ pub(crate) fn render_ai_setup_page(
                     );
                 },
             )
-            .tab_index({
-                tab_index += 1;
-                tab_index - 1
-            }),
         )
-        .child(render_privacy_card(&mut tab_index, is_ai_disabled, cx))
+        .child(render_privacy_card(is_ai_disabled, cx))
         .child(
             v_flex()
                 .mt_2()
@@ -287,15 +267,10 @@ pub(crate) fn render_ai_setup_page(
                     let mut ai_upsell_card =
                         AiUpsellCard::new(client, &user_store, user_store.read(cx).plan(), cx);
 
-                    ai_upsell_card.tab_index = Some({
-                        tab_index += 1;
-                        tab_index - 1
-                    });
 
                     ai_upsell_card
                 })
                 .child(render_llm_provider_section(
-                    &mut tab_index,
                     workspace,
                     is_ai_disabled,
                     window,
@@ -367,11 +342,6 @@ impl Render for AiConfigurationModal {
                 Modal::new("onboarding-ai-setup-modal", None)
                     .header(
                         ModalHeader::new()
-                            .icon(
-                                Icon::new(self.selected_provider.icon())
-                                    .color(Color::Muted)
-                                    .size(IconSize::Small),
-                            )
                             .headline(self.selected_provider.name().0),
                     )
                     .section(Section::new().child(self.configuration_view.clone()))

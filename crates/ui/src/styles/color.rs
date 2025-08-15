@@ -126,7 +126,7 @@ impl From<Hsla> for Color {
 
 impl Component for Color {
     fn scope() -> ComponentScope {
-        ComponentScope::Utilities
+        ComponentScope::None
     }
 
     fn description() -> Option<&'static str> {

@@ -19,12 +19,12 @@ pub enum Severity {
 /// use ui::{Banner};
 ///
 ///    Banner::new()
-///     .severity(Severity::Success)
-///     .children(Label::new("This is a success message"))
+///     .severity(Severity::Info)
+///     .children(Label::new("This is an informational message"))
 ///     .action_slot(
 ///         Button::new("learn-more", "Learn More")
 ///             .icon(IconName::ArrowUpRight)
-///             .icon_size(IconSize::Small)
+///             .icon_size(IconSize::XSmall)
 ///             .icon_position(IconPosition::End),
 ///     )
 /// ```
@@ -32,6 +32,7 @@ pub enum Severity {
 pub struct Banner {
     severity: Severity,
     children: Vec<AnyElement>,
+    icon: Option<(IconName, Option<Color>)>,
     action_slot: Option<AnyElement>,
 }
 
@@ -41,6 +42,7 @@ impl Banner {
         Self {
             severity: Severity::Info,
             children: Vec::new(),
+            icon: None,
             action_slot: None,
         }
     }
@@ -48,6 +50,12 @@ impl Banner {
     /// Sets the severity of the banner.
     pub fn severity(mut self, severity: Severity) -> Self {
         self.severity = severity;
+        self
+    }
+
+    /// Sets an icon to display in the banner with an optional color.
+    pub fn icon(mut self, icon: IconName, color: Option<impl Into<Color>>) -> Self {
+        self.icon = Some((icon, color.map(|c| c.into())));
         self
     }
 
@@ -65,13 +73,12 @@ impl ParentElement for Banner {
 }
 
 impl RenderOnce for Banner {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let banner = h_flex()
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let base = h_flex()
             .py_0p5()
-            .gap_1p5()
+            .rounded_sm()
             .flex_wrap()
             .justify_between()
-            .rounded_sm()
             .border_1();
 
         let (icon, icon_color, bg_color, border_color) = match self.severity {
@@ -101,37 +108,35 @@ impl RenderOnce for Banner {
             ),
         };
 
-        let mut banner = banner.bg(bg_color).border_color(border_color);
+        let mut container = base.bg(bg_color).border_color(border_color);
 
-        let icon_and_child = h_flex()
-            .items_start()
-            .min_w_0()
-            .gap_1p5()
-            .child(
-                h_flex()
-                    .h(window.line_height())
-                    .flex_shrink_0()
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(icon_color)),
-            )
-            .child(div().min_w_0().children(self.children));
+        let mut content_area = h_flex().id("content_area").gap_1p5().overflow_x_scroll();
 
-        if let Some(action_slot) = self.action_slot {
-            banner = banner
-                .pl_2()
-                .pr_1()
-                .child(icon_and_child)
-                .child(action_slot);
-        } else {
-            banner = banner.px_2().child(icon_and_child);
+        if self.icon.is_none() {
+            content_area =
+                content_area.child(Icon::new(icon).size(IconSize::XSmall).color(icon_color));
         }
 
-        banner
+        content_area = content_area.children(self.children);
+
+        if let Some(action_slot) = self.action_slot {
+            container = container
+                .pl_2()
+                .pr_0p5()
+                .gap_2()
+                .child(content_area)
+                .child(action_slot);
+        } else {
+            container = container.px_2().child(div().w_full().child(content_area));
+        }
+
+        container
     }
 }
 
 impl Component for Banner {
     fn scope() -> ComponentScope {
-        ComponentScope::DataDisplay
+        ComponentScope::Notification
     }
 
     fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
@@ -150,7 +155,7 @@ impl Component for Banner {
                     .action_slot(
                         Button::new("learn-more", "Learn More")
                             .icon(IconName::ArrowUpRight)
-                            .icon_size(IconSize::Small)
+                            .icon_size(IconSize::XSmall)
                             .icon_position(IconPosition::End),
                     )
                     .into_any_element(),
