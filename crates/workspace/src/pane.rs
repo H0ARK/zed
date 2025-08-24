@@ -2362,6 +2362,9 @@ impl Pane {
         let is_last_item = ix == self.items.len() - 1;
         let is_pinned = self.is_tab_pinned(ix);
         let position_relative_to_active_item = ix.cmp(&self.active_item_index);
+        
+        // Capture workspace handle for re-render notifications (like OSRS interface updates)
+        let workspace_handle = self.workspace.clone();
 
         let tab = Tab::new(ix)
             .position(if is_first_item {
@@ -2405,7 +2408,19 @@ impl Pane {
                     is_active,
                     ix,
                 },
-                |tab, _, _, cx| cx.new(|_| tab.clone()),
+                move |tab, _, _, cx| {
+                    // Start tab drag - disable window drag hitbox registration (like OSRS click priority)
+                    crate::GlobalTabDragState::set_active(true, cx);
+                    
+                    // Trigger title bar re-render to update hitbox registration
+                    if let Some(workspace) = workspace_handle.upgrade() {
+                        workspace.update(cx, |_, _| {
+                            // Empty update just to trigger notifications
+                        });
+                    }
+                    
+                    cx.new(|_| tab.clone())
+                },
             )
             .drag_over::<DraggedTab>(|tab, _, _, cx| {
                 tab.bg(cx.theme().colors().drop_target_background)
@@ -2418,6 +2433,16 @@ impl Pane {
             })
             .on_drop(
                 cx.listener(move |this, dragged_tab: &DraggedTab, window, cx| {
+                    // End tab drag - re-enable window drag hitbox registration
+                    crate::GlobalTabDragState::set_active(false, cx);
+                    
+                    // Trigger title bar re-render to update hitbox registration
+                    if let Some(workspace) = this.workspace.upgrade() {
+                        workspace.update(cx, |_, _| {
+                            // Empty update just to trigger notifications
+                        });
+                    }
+                    
                     this.drag_split_direction = None;
                     this.handle_tab_drop(dragged_tab, ix, window, cx)
                 }),
@@ -2878,6 +2903,16 @@ impl Pane {
                             })
                             .on_drop(cx.listener(
                                 move |this, dragged_tab: &DraggedTab, window, cx| {
+                                    // End tab drag - re-enable window drag hitbox registration
+                                    crate::GlobalTabDragState::set_active(false, cx);
+                                    
+                                    // Trigger title bar re-render to update hitbox registration
+                                    if let Some(workspace) = this.workspace.upgrade() {
+                                        workspace.update(cx, |_, _| {
+                                            // Empty update just to trigger notifications
+                                        });
+                                    }
+                                    
                                     this.drag_split_direction = None;
                                     this.handle_tab_drop(dragged_tab, this.items.len(), window, cx)
                                 },
@@ -2931,6 +2966,17 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Check if we're dragging a tab - if so, completely disable all drag move handling
+        // This prevents any window movement, pane splitting, or other drag behaviors
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<DraggedTab>() {
+            // Clear any existing split direction when dragging any tab
+            if self.drag_split_direction.is_some() {
+                self.drag_split_direction = None;
+            }
+            // Return immediately - no pane splitting or window movement for tab drags
+            return;
+        }
+
         let can_split_predicate = self.can_split_predicate.take();
         let can_split = match &can_split_predicate {
             Some(can_split_predicate) => {
@@ -2988,6 +3034,7 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        
         if let Some(custom_drop_handle) = self.custom_drop_handle.clone() {
             if let ControlFlow::Break(()) = custom_drop_handle(self, dragged_tab, window, cx) {
                 return;
@@ -3326,7 +3373,7 @@ fn default_render_tab_bar_buttons(
                         // Offer common items that can be added to the main (center) page
                         menu.action("New File", NewFile.boxed_clone())
                             .action("New Terminal", NewTerminal.boxed_clone())
-                            .action("New Agent Panel", crate::get_default_pane_action())
+                            .action("New Agent Panel", OpenAgentTab.boxed_clone())
                     }))
                 }),
         )
@@ -3494,7 +3541,7 @@ impl Render for Pane {
                     }
                 }),
             )
-            .on_action(cx.listener(|_, _: &menu::Cancel, window, cx| {
+            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                 if cx.stop_active_drag(window) {
                     return;
                 } else {
@@ -3566,6 +3613,16 @@ impl Render for Pane {
                                 this.can_drop(move |a, window, cx| p(a, window, cx))
                             })
                             .on_drop(cx.listener(move |this, dragged_tab, window, cx| {
+                                // End tab drag - re-enable window drag hitbox registration
+                                crate::GlobalTabDragState::set_active(false, cx);
+                                
+                                // Trigger title bar re-render to update hitbox registration
+                                if let Some(workspace) = this.workspace.upgrade() {
+                                    workspace.update(cx, |_, _| {
+                                        // Empty update just to trigger notifications
+                                    });
+                                }
+                                
                                 this.handle_tab_drop(
                                     dragged_tab,
                                     this.active_item_index(),

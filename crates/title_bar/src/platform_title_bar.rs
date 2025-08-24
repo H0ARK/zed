@@ -13,6 +13,7 @@ pub struct PlatformTitleBar {
     platform_style: PlatformStyle,
     children: SmallVec<[AnyElement; 2]>,
     should_move: bool,
+    drag_disabled: bool,
 }
 
 impl PlatformTitleBar {
@@ -23,6 +24,7 @@ impl PlatformTitleBar {
             platform_style,
             children: SmallVec::new(),
             should_move: false,
+            drag_disabled: false,
         }
     }
 
@@ -42,6 +44,13 @@ impl PlatformTitleBar {
         T: IntoIterator<Item = AnyElement>,
     {
         self.children = children.into_iter().collect();
+    }
+
+    /// Disable or enable the titlebar's window-drag control area.
+    /// When disabled, the header will not expose a platform window drag
+    /// hitbox (prevents window moves while other drags are active).
+    pub fn set_drag_disabled(&mut self, disabled: bool) {
+        self.drag_disabled = disabled;
     }
 }
 
@@ -63,7 +72,6 @@ impl Render for PlatformTitleBar {
         let children = mem::take(&mut self.children);
 
         h_flex()
-            .window_control_area(WindowControlArea::Drag)
             .w_full()
             .h(height)
             .map(|this| {
@@ -129,12 +137,17 @@ impl Render for PlatformTitleBar {
                                             window.show_window_menu(ev.position)
                                         })
                                 })
-                                .on_mouse_move(cx.listener(move |this, _ev, window, _| {
-                                    if this.should_move {
-                                        this.should_move = false;
-                                        window.start_window_move();
-                                    }
-                                }))
+                                // TEMP: Disable mouse move handler to test universal drag
+                                // .on_mouse_move(cx.listener(move |this, _ev, window, cx| {
+                                //     // If a general drag operation is active (e.g. dragging a tab),
+                                //     // avoid starting a window move from the title bar.
+                                //     if this.should_move {
+                                //         this.should_move = false;
+                                //         if !cx.has_active_drag() {
+                                //             window.start_window_move();
+                                //         }
+                                //     }
+                                // }))
                                 .on_mouse_down_out(cx.listener(move |this, _ev, _window, _cx| {
                                     this.should_move = false;
                                 }))
@@ -144,12 +157,16 @@ impl Render for PlatformTitleBar {
                                         this.should_move = false;
                                     }),
                                 )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _ev, _window, _cx| {
-                                        this.should_move = true;
-                                    }),
-                                )
+                                // TEMP: Disable mouse down handler to test universal drag
+                                // .on_mouse_down(
+                                //     MouseButton::Left,
+                                //     cx.listener(move |this, _ev, _window, cx| {
+                                //         // Only arm a potential window move if there is no other active drag.
+                                //         if !cx.has_active_drag() {
+                                //             this.should_move = true;
+                                //         }
+                                //     }),
+                                // )
                         } else {
                             title_bar
                         }

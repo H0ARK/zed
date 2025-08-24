@@ -52,7 +52,7 @@ impl ScrollableHandle for ListState {
         Size::new(px(0.), px(0.))
     }
 
-    fn set_offset(&self, point: Point<Pixels>) {
+    fn set_offset(&self, _point: Point<Pixels>) {
         // TODO: Fix this method call
         // self.set_offset_from_scrollbar(point);
     }

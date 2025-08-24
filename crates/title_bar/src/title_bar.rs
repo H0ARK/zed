@@ -10,6 +10,7 @@ mod stories;
 
 use crate::{application_menu::ApplicationMenu, platform_title_bar::PlatformTitleBar};
 
+
 #[cfg(not(target_os = "macos"))]
 use crate::application_menu::{
     ActivateDirection, ActivateMenuLeft, ActivateMenuRight, OpenApplicationMenu,
@@ -25,7 +26,6 @@ use gpui::{
 };
 use onboarding_banner::OnboardingBanner;
 use project::Project;
-use rpc::proto;
 use settings::Settings as _;
 use std::sync::Arc;
 use theme::ActiveTheme;
@@ -35,7 +35,7 @@ use ui::{
     IconWithIndicator, Indicator, PopoverMenu, Tooltip, h_flex, prelude::*,
 };
 use util::ResultExt;
-use workspace::{Workspace, notifications::NotifyResultExt};
+use workspace::{GlobalTabDragState, Workspace};
 use zed_actions::{OpenRecent, OpenRemote};
 
 pub use onboarding_banner::restore_banner;
@@ -126,9 +126,12 @@ impl Render for TitleBar {
         // Build a left block containing project/menu, collaborators, and optional banner
         let left_block = h_flex()
             .gap_1()
+            .when(!GlobalTabDragState::is_active(cx), |this| {
+                this.window_control_area(gpui::WindowControlArea::Drag)
+            })
             .map(|title_bar| {
-                let mut render_project_items = title_bar_settings.show_branch_name
-                    || title_bar_settings.show_project_items;
+                let mut render_project_items =
+                    title_bar_settings.show_branch_name || title_bar_settings.show_project_items;
                 title_bar
                     .when_some(self.application_menu.clone(), |title_bar, menu| {
                         render_project_items &= !menu.read(cx).all_menus_shown();
@@ -137,17 +140,15 @@ impl Render for TitleBar {
                     .when(render_project_items, |title_bar| {
                         title_bar
                             .when(title_bar_settings.show_project_items, |title_bar| {
-                                title_bar
-                                    .children(self.render_project_host(cx))
-                                    // Remove the "Open recent project" button for terminal-centric workflow
-                                    // .child(self.render_project_name(cx))
+                                title_bar.children(self.render_project_host(cx))
+                                // Remove the "Open recent project" button for terminal-centric workflow
+                                // .child(self.render_project_name(cx))
                             })
                             .when(title_bar_settings.show_branch_name, |title_bar| {
                                 title_bar.children(self.render_project_branch(cx))
                             })
                     })
             })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .into_any_element();
 
         let mut left_children: Vec<AnyElement> = Vec::new();
@@ -158,12 +159,17 @@ impl Render for TitleBar {
         }
         let left_container = h_flex().children(left_children).into_any_element();
 
-        // Build center block (tabs) if enabled, otherwise a flexible spacer
+        // Build center block with test drag square and tabs
+        let tab_drag_active = GlobalTabDragState::is_active(cx);
         let center_container = if workspace::TabBarSettings::get_global(cx).show_in_title_bar {
             if let Some(workspace) = self.workspace.upgrade() {
-                let pane = workspace.read_with(cx, |ws, _| ws.focused_pane(window, cx));
-                // Only render tabs when there are items; otherwise leave center as flexible spacer
+                // Use the last active center pane (editor area) rather than the currently focused
+                // pane so that focusing a dock panel (e.g. terminal, agent panel) does not replace
+                // the title bar's tab list with the dock's tabs. This preserves showing editor tabs
+                // while still allowing the agent panel to function without regression.
+                let pane = workspace.read_with(cx, |ws, _| ws.last_active_center_pane_entity());
                 let has_items = pane.read(cx).items_len() > 0;
+
                 if has_items {
                     let tab = pane.update(cx, |pane, cx| {
                         pane.render_tab_bar_element_for_titlebar(window, cx)
@@ -171,43 +177,64 @@ impl Render for TitleBar {
                     h_flex()
                         .flex_1()
                         .min_w_0()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .gap_2()
                         .child(tab)
                         .into_any_element()
                 } else {
-                    h_flex().flex_1().min_w_0().into_any_element()
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .when(!tab_drag_active, |this| {
+                            this.window_control_area(gpui::WindowControlArea::Drag)
+                        })
+                        .into_any_element()
                 }
             } else {
-                h_flex().flex_1().min_w_0().into_any_element()
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .when(!tab_drag_active, |this| {
+                        this.window_control_area(gpui::WindowControlArea::Drag)
+                    })
+                    .into_any_element()
             }
         } else {
-            h_flex().flex_1().min_w_0().into_any_element()
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .when(!tab_drag_active, |this| {
+                    this.window_control_area(gpui::WindowControlArea::Drag)
+                })
+                .into_any_element()
         };
 
         // Build right block
-        let right_container =
-            h_flex()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .children(self.render_call_controls(window, cx))
-                .map(|el| {
-                    let status = self.client.status();
-                    let status = &*status.borrow();
-                    if matches!(status, client::Status::Connected { .. }) {
-                        el.child(self.render_user_menu_button(cx))
-                    } else {
-                        el.children(self.render_connection_status(status, cx))
-                            .when(TitleBarSettings::get_global(cx).show_sign_in, |el| {
-                                el.child(self.render_sign_in_button(cx))
-                            })
-                            .child(self.render_user_menu_button(cx))
-                    }
-                })
-                .into_any_element();
+        let right_container = h_flex()
+            .when(!tab_drag_active, |this| {
+                this.window_control_area(gpui::WindowControlArea::Drag)
+            })
+            .children(self.render_call_controls(window, cx))
+            .map(|el| {
+                let status = self.client.status();
+                let status = &*status.borrow();
+                if matches!(status, client::Status::Connected { .. }) {
+                    el.child(self.render_user_menu_button(cx))
+                } else {
+                    el.children(self.render_connection_status(status, cx))
+                        .when(TitleBarSettings::get_global(cx).show_sign_in, |el| {
+                            el.child(self.render_sign_in_button(cx))
+                        })
+                        .child(self.render_user_menu_button(cx))
+                }
+            })
+            .into_any_element();
 
         let children: Vec<AnyElement> = vec![left_container, center_container, right_container];
 
         self.platform_titlebar.update(cx, |this, _| {
             this.set_children(children);
+            // No longer need global drag disabling - using targeted hitboxes instead
+            this.set_drag_disabled(false);
         });
 
         self.platform_titlebar.clone().into_any_element()
@@ -592,9 +619,7 @@ impl TitleBar {
                 let client = client.clone();
                 window
                     .spawn(cx, async move |cx| {
-                        let _ = client
-                            .authenticate_with_browser(&cx)
-                            .await;
+                        let _ = client.authenticate_with_browser(&cx).await;
                     })
                     .detach();
             })

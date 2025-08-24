@@ -4,7 +4,9 @@ mod agent_diff;
 mod agent_item;
 mod agent_model_selector;
 mod agent_panel;
+mod agent_settings_modal;
 mod buffer_codegen;
+mod canvas_pane;
 mod context_picker;
 mod context_server_configuration;
 mod context_strip;
@@ -26,74 +28,73 @@ mod ui;
 
 use std::sync::Arc;
 
-use agent::{Thread, ThreadId};
-use agent_settings::{AgentProfileId, AgentSettings, LanguageModelSelection};
+use agent::{ Thread, ThreadId };
+use agent_settings::{ AgentProfileId, AgentSettings, LanguageModelSelection };
 use assistant_slash_command::SlashCommandRegistry;
 use client::Client;
 use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
-use gpui::{Action, App, Entity, actions};
+use gpui::{ Action, App, Entity, actions };
 use language::LanguageRegistry;
-use language_model::{
-    ConfiguredModel, LanguageModel, LanguageModelId, LanguageModelProviderId, LanguageModelRegistry,
-};
+use language_model::{ ConfiguredModel, LanguageModel, LanguageModelId, LanguageModelProviderId, LanguageModelRegistry };
 use prompt_store::PromptBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use settings::{Settings as _, SettingsStore};
+use settings::{ Settings as _, SettingsStore };
+use workspace;
 
 pub use crate::active_thread::ActiveThread;
-use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModal};
+use crate::agent_configuration::{ ConfigureContextServerModal, ManageProfilesModal };
 pub use crate::agent_item::AgentItem;
-pub use crate::agent_panel::{AgentPanel, ConcreteAssistantPanelDelegate};
+pub use crate::agent_panel::{ AgentPanel, ConcreteAssistantPanelDelegate };
+pub use crate::agent_settings_modal::AgentSettingsModal;
+pub use crate::canvas_pane::CanvasPane;
 pub use crate::inline_assistant::InlineAssistant;
 use crate::slash_command_settings::SlashCommandSettings;
-pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
-pub use text_thread_editor::{AgentPanelDelegate, TextThreadEditor};
-pub use ui::preview::{all_agent_previews, get_agent_preview};
+pub use agent_diff::{ AgentDiffPane, AgentDiffToolbar };
+pub use text_thread_editor::{ AgentPanelDelegate, TextThreadEditor };
+pub use ui::preview::{ all_agent_previews, get_agent_preview };
 
-actions!(
-    agent,
-    [
-            NewAgentTab,
-            NewTextThread,
-            ToggleContextPicker,
-            ToggleNavigationMenu,
-            ToggleOptionsMenu,
-            DeleteRecentlyOpenThread,
-            ToggleProfileSelector,
-            RemoveAllContext,
-            ExpandMessageEditor,
-            OpenHistory,
-            AddContextServer,
-            RemoveSelectedThread,
-            ChatWithFollow,
-            CycleNextInlineAssist,
-            CyclePreviousInlineAssist,
-            FocusUp,
-            FocusDown,
-            FocusLeft,
-            FocusRight,
-            /*...*/
-        RemoveFocusedContext,
-        AcceptSuggestedContext,
-        OpenActiveThreadAsMarkdown,
-        OpenAgentDiff,
-        OpenAgentTab,
-        Keep,
-        Reject,
-        RejectAll,
-        KeepAll,
-        Follow,
-        ResetTrialUpsell,
-        ResetTrialEndUpsell,
-        ContinueThread,
-        ContinueWithBurnMode,
-        ToggleBurnMode,
-        ToggleNewThreadMenu,
-        NewExternalAgentThread,
-    ]
-);
+actions!(agent, [
+    NewAgentTab,
+    NewTextThread,
+    ToggleContextPicker,
+    ToggleNavigationMenu,
+    ToggleOptionsMenu,
+    DeleteRecentlyOpenThread,
+    ToggleProfileSelector,
+    RemoveAllContext,
+    ExpandMessageEditor,
+    OpenHistory,
+    OpenSettingsModal,
+    AddContextServer,
+    RemoveSelectedThread,
+    ChatWithFollow,
+    CycleNextInlineAssist,
+    CyclePreviousInlineAssist,
+    FocusUp,
+    FocusDown,
+    FocusLeft,
+    FocusRight,
+    /*...*/
+    RemoveFocusedContext,
+    AcceptSuggestedContext,
+    OpenActiveThreadAsMarkdown,
+    OpenAgentDiff,
+    OpenAgentTab,
+    Keep,
+    Reject,
+    RejectAll,
+    KeepAll,
+    Follow,
+    ResetTrialUpsell,
+    ResetTrialEndUpsell,
+    ContinueThread,
+    ContinueWithBurnMode,
+    ToggleBurnMode,
+    ToggleNewThreadMenu,
+    NewExternalAgentThread,
+]);
 
 #[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
@@ -127,15 +128,12 @@ impl ModelUsageContext {
     pub fn configured_model(&self, cx: &App) -> Option<ConfiguredModel> {
         match self {
             Self::Thread(thread) => thread.read(cx).configured_model(),
-            Self::InlineAssistant => {
-                LanguageModelRegistry::read_global(cx).inline_assistant_model()
-            }
+            Self::InlineAssistant => { LanguageModelRegistry::read_global(cx).inline_assistant_model() }
         }
     }
 
     pub fn language_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        self.configured_model(cx)
-            .map(|configured_model| configured_model.model)
+        self.configured_model(cx).map(|configured_model| configured_model.model)
     }
 }
 
@@ -146,7 +144,7 @@ pub fn init(
     prompt_builder: Arc<PromptBuilder>,
     language_registry: Arc<LanguageRegistry>,
     is_eval: bool,
-    cx: &mut App,
+    cx: &mut App
 ) {
     AgentSettings::register(cx);
     SlashCommandSettings::register(cx);
@@ -165,64 +163,66 @@ pub fn init(
     TextThreadEditor::init(cx);
 
     register_slash_commands(cx);
-    inline_assistant::init(
-        fs.clone(),
-        prompt_builder.clone(),
-        client.telemetry().clone(),
-        cx,
-    );
-    terminal_inline_assistant::init(
-        fs.clone(),
-        prompt_builder.clone(),
-        client.telemetry().clone(),
-        cx,
-    );
+    inline_assistant::init(fs.clone(), prompt_builder.clone(), client.telemetry().clone(), cx);
+    terminal_inline_assistant::init(fs.clone(), prompt_builder.clone(), client.telemetry().clone(), cx);
     indexed_docs::init(cx);
     cx.observe_new(move |workspace, window, cx| {
         ConfigureContextServerModal::register(workspace, language_registry.clone(), window, cx);
         // Register the NewAgentTab action globally for all workspaces
-        workspace.register_action(|workspace, _: &NewAgentTab, window, cx| {
+            workspace.register_action(|workspace, _: &NewAgentTab, window, cx| {
             let fs = workspace.app_state().fs.clone();
             let prompt_builder = PromptBuilder::load(fs, false, cx);
             let task = AgentItem::load(workspace.weak_handle(), prompt_builder, window.to_async(cx));
             cx.spawn_in(window, async move |workspace, cx| {
                 if let Ok(agent_item) = task.await {
                     workspace.update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(
-                            Box::new(agent_item),
-                            None,
-                            true,
-                            window,
-                            cx,
-                        );
+                        #[cfg(feature = "debug-agent-pane")]
+                        {
+                            log::debug!("[AgentTab] NewAgentTab adding to active pane id={:?} last_center={:?}", workspace.active_pane().entity_id(), workspace.last_active_center_pane_entity().entity_id());
+                        }
+                            workspace.add_agent_item_to_center(Box::new(agent_item), window, cx);
                     })?;
                 }
                 anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
+            }).detach_and_log_err(cx);
         });
-    })
-    .detach();
+        
+        // Register the OpenAgentTab action - same as NewAgentTab for now
+        workspace.register_action(|workspace, _: &workspace::OpenAgentTab, window, cx| {
+            let fs = workspace.app_state().fs.clone();
+            let prompt_builder = PromptBuilder::load(fs, false, cx);
+            let task = AgentItem::load(workspace.weak_handle(), prompt_builder, window.to_async(cx));
+            cx.spawn_in(window, async move |workspace, cx| {
+                if let Ok(agent_item) = task.await {
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        #[cfg(feature = "debug-agent-pane")]
+                        {
+                            log::debug!("[AgentTab] OpenAgentTab adding to active pane id={:?} last_center={:?}", workspace.active_pane().entity_id(), workspace.last_active_center_pane_entity().entity_id());
+                        }
+                        workspace.add_agent_item_to_center(Box::new(agent_item), window, cx);
+                    })?;
+                }
+                anyhow::Ok(())
+            }).detach_and_log_err(cx);
+        });
+    }).detach();
     cx.observe_new(ManageProfilesModal::register).detach();
 }
 
 fn init_language_model_settings(cx: &mut App) {
     update_active_language_model_from_settings(cx);
 
-    cx.observe_global::<SettingsStore>(update_active_language_model_from_settings)
-        .detach();
-    cx.subscribe(
-        &LanguageModelRegistry::global(cx),
-        |_, event: &language_model::Event, cx| match event {
-            language_model::Event::ProviderStateChanged
+    cx.observe_global::<SettingsStore>(update_active_language_model_from_settings).detach();
+    cx.subscribe(&LanguageModelRegistry::global(cx), |_, event: &language_model::Event, cx| {
+        match event {
+            | language_model::Event::ProviderStateChanged
             | language_model::Event::AddedProvider(_)
             | language_model::Event::RemovedProvider(_) => {
                 update_active_language_model_from_settings(cx);
             }
             _ => {}
-        },
-    )
-    .detach();
+        }
+    }).detach();
 }
 
 fn update_active_language_model_from_settings(cx: &mut App) {
@@ -235,27 +235,11 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         }
     }
 
-    let default = settings
-        .default_model
-        .as_ref()
-        .map(to_selected_model);
-    let inline_assistant = settings
-        .inline_assistant_model
-        .as_ref()
-        .map(to_selected_model);
-    let commit_message = settings
-        .commit_message_model
-        .as_ref()
-        .map(to_selected_model);
-    let thread_summary = settings
-        .thread_summary_model
-        .as_ref()
-        .map(to_selected_model);
-    let inline_alternatives = settings
-        .inline_alternatives
-        .iter()
-        .map(to_selected_model)
-        .collect::<Vec<_>>();
+    let default = settings.default_model.as_ref().map(to_selected_model);
+    let inline_assistant = settings.inline_assistant_model.as_ref().map(to_selected_model);
+    let commit_message = settings.commit_message_model.as_ref().map(to_selected_model);
+    let thread_summary = settings.thread_summary_model.as_ref().map(to_selected_model);
+    let inline_alternatives = settings.inline_alternatives.iter().map(to_selected_model).collect::<Vec<_>>();
 
     LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
         registry.select_default_model(default.as_ref(), cx);
@@ -273,32 +257,25 @@ fn register_slash_commands(cx: &mut App) {
     slash_command_registry.register_command(assistant_slash_commands::DeltaSlashCommand, true);
     slash_command_registry.register_command(assistant_slash_commands::OutlineSlashCommand, true);
     slash_command_registry.register_command(assistant_slash_commands::TabSlashCommand, true);
-    slash_command_registry
-        .register_command(assistant_slash_commands::CargoWorkspaceSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::CargoWorkspaceSlashCommand, true);
     slash_command_registry.register_command(assistant_slash_commands::PromptSlashCommand, true);
     slash_command_registry.register_command(assistant_slash_commands::SelectionCommand, true);
     slash_command_registry.register_command(assistant_slash_commands::DefaultSlashCommand, false);
     slash_command_registry.register_command(assistant_slash_commands::NowSlashCommand, false);
-    slash_command_registry
-        .register_command(assistant_slash_commands::DiagnosticsSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::DiagnosticsSlashCommand, true);
     slash_command_registry.register_command(assistant_slash_commands::FetchSlashCommand, true);
 
     cx.observe_flag::<assistant_slash_commands::StreamingExampleSlashCommandFeatureFlag, _>({
         let slash_command_registry = slash_command_registry.clone();
         move |is_enabled, _cx| {
             if is_enabled {
-                slash_command_registry.register_command(
-                    assistant_slash_commands::StreamingExampleSlashCommand,
-                    false,
-                );
+                slash_command_registry.register_command(assistant_slash_commands::StreamingExampleSlashCommand, false);
             }
         }
-    })
-    .detach();
+    }).detach();
 
     update_slash_commands_from_settings(cx);
-    cx.observe_global::<SettingsStore>(update_slash_commands_from_settings)
-        .detach();
+    cx.observe_global::<SettingsStore>(update_slash_commands_from_settings).detach();
 }
 
 fn update_slash_commands_from_settings(cx: &mut App) {
@@ -312,10 +289,8 @@ fn update_slash_commands_from_settings(cx: &mut App) {
     }
 
     if settings.cargo_workspace.enabled {
-        slash_command_registry
-            .register_command(assistant_slash_commands::CargoWorkspaceSlashCommand, true);
+        slash_command_registry.register_command(assistant_slash_commands::CargoWorkspaceSlashCommand, true);
     } else {
-        slash_command_registry
-            .unregister_command(assistant_slash_commands::CargoWorkspaceSlashCommand);
+        slash_command_registry.unregister_command(assistant_slash_commands::CargoWorkspaceSlashCommand);
     }
 }

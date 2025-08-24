@@ -63,8 +63,8 @@ use ui::{
 };
 use util::{ResultExt, TakeUntilExt, TryFutureExt, maybe, paths::compare_paths};
 use workspace::{
-    DraggedSelection, OpenInTerminal, OpenOptions, OpenVisible, PreviewTabsSettings, SelectedEntry,
-    Workspace,
+    DraggedSelection, NavigationEvent, NavigationState, OpenInTerminal, OpenOptions, OpenVisible,
+    PreviewTabsSettings, SelectedEntry, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotifyTaskExt},
 };
@@ -123,6 +123,8 @@ pub struct ProjectPanel {
     previous_drag_position: Option<Point<Pixels>>,
     sticky_items_count: usize,
     last_reported_update: Instant,
+    navigation_state: Entity<NavigationState>,
+    _navigation_subscription: Subscription,
 }
 
 struct DragTargetEntry {
@@ -268,6 +270,8 @@ actions!(
         Open,
         /// Opens the selected file in a permanent tab.
         OpenPermanent,
+        /// Opens the selected file in a new tab (traditional behavior).
+        OpenInNewTab,
         /// Toggles focus on the project panel.
         ToggleFocus,
         /// Toggles visibility of git-ignored files.
@@ -367,6 +371,11 @@ pub fn init(cx: &mut App) {
 #[derive(Debug)]
 pub enum Event {
     OpenedEntry {
+        entry_id: ProjectEntryId,
+        focus_opened_item: bool,
+        allow_preview: bool,
+    },
+    OpenedEntryInNewTab {
         entry_id: ProjectEntryId,
         focus_opened_item: bool,
         allow_preview: bool,
@@ -639,8 +648,61 @@ impl ProjectPanel {
                 previous_drag_position: None,
                 sticky_items_count: 0,
                 last_reported_update: Instant::now(),
+                navigation_state: NavigationState::get_or_init(project.clone(), cx),
+                _navigation_subscription: Subscription::new(|| {}), // Will be properly set below
             };
+
+            // Set up navigation state subscription
+            this._navigation_subscription =
+                cx.subscribe(&this.navigation_state, |this, _nav_state, event, cx| {
+                    match event {
+                        NavigationEvent::DirectoryChanged { .. } => {
+                            // Project panel doesn't need to respond to directory changes from other components
+                        }
+                        NavigationEvent::SelectionChanged { new_selection, .. } => {
+                            // Sync selection from navigation state to project panel
+                            if !new_selection.is_empty() {
+                                this.selection = new_selection.first().copied();
+                                this.marked_entries = new_selection.clone();
+                                cx.notify();
+                            }
+                        }
+                        NavigationEvent::DirectoryExpanded {
+                            worktree_id,
+                            entry_id,
+                        } => {
+                            // Sync expanded directories from navigation state
+                            let entries = this
+                                .expanded_dir_ids
+                                .entry(*worktree_id)
+                                .or_insert_with(Vec::new);
+                            if !entries.contains(entry_id) {
+                                entries.push(*entry_id);
+                                this.update_visible_entries(None, cx);
+                                cx.notify();
+                            }
+                        }
+                        NavigationEvent::DirectoryCollapsed {
+                            worktree_id,
+                            entry_id,
+                        } => {
+                            // Sync collapsed directories from navigation state
+                            if let Some(entries) = this.expanded_dir_ids.get_mut(worktree_id) {
+                                if let Some(index) = entries.iter().position(|&id| id == *entry_id)
+                                {
+                                    entries.remove(index);
+                                    this.update_visible_entries(None, cx);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    }
+                });
+
             this.update_visible_entries(None, cx);
+
+            // Sync state after initialization is complete
+            this.sync_all_state_to_navigation_state_on_load(cx);
 
             this
         });
@@ -660,6 +722,91 @@ impl ProjectPanel {
                             let entry_id = entry.id;
                             let is_via_ssh = project.read(cx).is_via_ssh();
 
+                            // Open files in a right-hand split when the Agent panel is open
+                            {
+                                // Check if agent panel is open and use split view if so
+                                let should_use_split = workspace.panel::<agent_ui::AgentPanel>(cx)
+                                    .map(|panel| {
+                                        let dock_position = panel.read(cx).position(window, cx);
+                                        workspace.is_dock_at_position_open(dock_position, cx)
+                                    })
+                                    .unwrap_or(false);
+
+                                if should_use_split {
+                                    // Force split to the right and open the file in the new/right pane
+                                    workspace
+                                        .split_path_preview(
+                                            ProjectPath {
+                                                worktree_id,
+                                                path: file_path.clone(),
+                                            },
+                                            allow_preview,
+                                            Some(workspace::pane_group::SplitDirection::Right),
+                                            window,
+                                            cx,
+                                        )
+                                } else {
+                                    workspace
+                                        .open_path_preview(
+                                            ProjectPath {
+                                                worktree_id,
+                                                path: file_path.clone(),
+                                            },
+                                            None,
+                                            focus_opened_item,
+                                            allow_preview,
+                                            true,
+                                            window, cx,
+                                        )
+                                }
+                                    .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
+                                        match e.error_code() {
+                                            ErrorCode::Disconnected => if is_via_ssh {
+                                                Some("Disconnected from SSH host".to_string())
+                                            } else {
+                                                Some("Disconnected from remote project".to_string())
+                                            },
+                                            ErrorCode::UnsharedItem => Some(format!(
+                                                "{} is not shared by the host. This could be because it has been marked as `private`",
+                                                file_path.display()
+                                            )),
+                                            // See note in worktree.rs where this error originates. Returning Some in this case prevents
+                                            // the error popup from saying "Try Again", which is a red herring in this case
+                                            ErrorCode::Internal if e.to_string().contains("File is too large to load") => Some(e.to_string()),
+                                            _ => None,
+                                        }
+                                    });
+                            }
+
+                            if let Some(project_panel) = project_panel.upgrade() {
+                                // Always select and mark the entry, regardless of whether it is opened or not.
+                                project_panel.update(cx, |project_panel, _| {
+                                    let entry = SelectedEntry { worktree_id, entry_id };
+                                    project_panel.marked_entries.clear();
+                                    project_panel.marked_entries.push(entry);
+                                    project_panel.selection = Some(entry);
+                                });
+                                if !focus_opened_item {
+                                    let focus_handle = project_panel.read(cx).focus_handle.clone();
+                                    window.focus(&focus_handle);
+                                }
+                            }
+                        }
+                    }
+                }
+                &Event::OpenedEntryInNewTab {
+                    entry_id,
+                    focus_opened_item,
+                    allow_preview,
+                } => {
+                    if let Some(worktree) = project.read(cx).worktree_for_entry(entry_id, cx) {
+                        if let Some(entry) = worktree.read(cx).entry_for_id(entry_id) {
+                            let file_path = entry.path.clone();
+                            let worktree_id = worktree.read(cx).id();
+                            let entry_id = entry.id;
+                            let is_via_ssh = project.read(cx).is_via_ssh();
+
+                            // Always use traditional open_path_preview for "Open in New Tab"
                             workspace
                                 .open_path_preview(
                                     ProjectPath {
@@ -683,15 +830,12 @@ impl ProjectPanel {
                                             "{} is not shared by the host. This could be because it has been marked as `private`",
                                             file_path.display()
                                         )),
-                                        // See note in worktree.rs where this error originates. Returning Some in this case prevents
-                                        // the error popup from saying "Try Again", which is a red herring in this case
                                         ErrorCode::Internal if e.to_string().contains("File is too large to load") => Some(e.to_string()),
                                         _ => None,
                                     }
                                 });
 
                             if let Some(project_panel) = project_panel.upgrade() {
-                                // Always select and mark the entry, regardless of whether it is opened or not.
                                 project_panel.update(cx, |project_panel, _| {
                                     let entry = SelectedEntry { worktree_id, entry_id };
                                     project_panel.marked_entries.clear();
@@ -858,6 +1002,75 @@ impl ProjectPanel {
         );
     }
 
+    fn sync_selection_to_navigation_state(&self, cx: &mut Context<Self>) {
+        let mut selection = Vec::new();
+        if let Some(sel) = self.selection {
+            selection.push(sel);
+        }
+        selection.extend(self.marked_entries.iter().cloned());
+
+        self.navigation_state.update(cx, |nav_state, cx| {
+            nav_state.set_selected_entries(selection, cx);
+        });
+    }
+
+    fn sync_all_state_to_navigation_state_on_load(&self, cx: &mut Context<Self>) {
+        // Only sync state TO navigation state, not FROM it, to preserve existing project panel state
+        self.navigation_state.update(cx, |nav_state, cx| {
+            // Preserve existing navigation state if it has useful data
+            let project_active_dir = self.project.read(cx).active_project_directory(cx);
+            let should_update_directory = nav_state.current_directory().is_none()
+                || match (nav_state.current_directory(), project_active_dir.as_ref()) {
+                    (Some(nav_dir), Some(proj_dir)) => nav_dir.as_path() != proj_dir.as_ref(),
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+
+            if should_update_directory {
+                if let Some(active_dir) = self.project.read(cx).active_project_directory(cx) {
+                    let _ = nav_state
+                        .update_current_directory_quietly(Some(active_dir.to_path_buf()), cx);
+                }
+            }
+
+            // Sync selection but don't override if navigation state already has selections
+            if nav_state.selected_entries().is_empty() {
+                let mut selection = Vec::new();
+                if let Some(sel) = self.selection {
+                    selection.push(sel);
+                }
+                selection.extend(self.marked_entries.iter().cloned());
+                if !selection.is_empty() {
+                    nav_state.set_selected_entries(selection, cx);
+                }
+            }
+
+            // Only sync expanded directories if navigation state doesn't have any
+            if nav_state.expanded_directories().is_empty() && !self.expanded_dir_ids.is_empty() {
+                nav_state.sync_from_project_panel(
+                    nav_state.current_directory().cloned(),
+                    nav_state.selected_entries().to_vec(),
+                    self.expanded_dir_ids.clone(),
+                    cx,
+                );
+            }
+        });
+    }
+
+    fn sync_expanded_dirs_to_navigation_state(&self, cx: &mut Context<Self>) {
+        self.navigation_state.update(cx, |nav_state, cx| {
+            nav_state.sync_from_project_panel(
+                None, // We don't track directory in project panel directly
+                self.selection
+                    .into_iter()
+                    .chain(self.marked_entries.iter().cloned())
+                    .collect(),
+                self.expanded_dir_ids.clone(),
+                cx,
+            );
+        });
+    }
+
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus_handle.contains_focused(window, cx) {
             cx.emit(Event::Focus);
@@ -915,7 +1128,11 @@ impl ProjectPanel {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
                     } else {
-                        menu.action("New File", Box::new(NewFile))
+                        menu.when(!is_dir, |menu| {
+                            menu.action("Open in New Tab", Box::new(OpenInNewTab))
+                                .separator()
+                        })
+                        .action("New File", Box::new(NewFile))
                             .action("New Folder", Box::new(NewDirectory))
                             .separator()
                             .when(is_local && cfg!(target_os = "macos"), |menu| {
@@ -993,6 +1210,7 @@ impl ProjectPanel {
             self.context_menu = Some((context_menu, position, subscription));
         }
 
+        self.sync_selection_to_navigation_state(cx);
         cx.notify();
     }
 
@@ -1315,6 +1533,10 @@ impl ProjectPanel {
         self.open_internal(false, true, window, cx);
     }
 
+    fn open_in_new_tab(&mut self, _: &OpenInNewTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_internal_traditional(false, true, window, cx);
+    }
+
     fn open_internal(
         &mut self,
         allow_preview: bool,
@@ -1325,6 +1547,23 @@ impl ProjectPanel {
         if let Some((_, entry)) = self.selected_entry(cx) {
             if entry.is_file() {
                 self.open_entry(entry.id, focus_opened_item, allow_preview, cx);
+                cx.notify();
+            } else {
+                self.toggle_expanded(entry.id, window, cx);
+            }
+        }
+    }
+
+    fn open_internal_traditional(
+        &mut self,
+        allow_preview: bool,
+        focus_opened_item: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, entry)) = self.selected_entry(cx) {
+            if entry.is_file() {
+                self.open_entry_in_new_tab(entry.id, focus_opened_item, allow_preview, cx);
                 cx.notify();
             } else {
                 self.toggle_expanded(entry.id, window, cx);
@@ -1559,6 +1798,20 @@ impl ProjectPanel {
         cx: &mut Context<Self>,
     ) {
         cx.emit(Event::OpenedEntry {
+            entry_id,
+            focus_opened_item,
+            allow_preview,
+        });
+    }
+
+    fn open_entry_in_new_tab(
+        &mut self,
+        entry_id: ProjectEntryId,
+        focus_opened_item: bool,
+        allow_preview: bool,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(Event::OpenedEntryInNewTab {
             entry_id,
             focus_opened_item,
             allow_preview,
@@ -4013,7 +4266,9 @@ impl ProjectPanel {
         let worktree_id = details.worktree_id;
         let dragged_selection = DraggedSelection {
             active_selection: selection,
-            marked_selections: Arc::new(self.marked_entries.iter().cloned().collect::<BTreeSet<_>>()),
+            marked_selections: Arc::new(
+                self.marked_entries.iter().cloned().collect::<BTreeSet<_>>(),
+            ),
         };
 
         let bg_color = if is_marked {
@@ -5273,6 +5528,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::collapse_all_entries))
                 .on_action(cx.listener(Self::open))
                 .on_action(cx.listener(Self::open_permanent))
+                .on_action(cx.listener(Self::open_in_new_tab))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
@@ -5363,40 +5619,40 @@ impl Render for ProjectPanel {
                                         window,
                                         cx,
                                         |entry, _, entries, _, _| {
-                                            let (depth, _) =
-                                                Self::calculate_depth_and_difference(
-                                                    entry, entries,
-                                                );
+                                            let (depth, _) = Self::calculate_depth_and_difference(
+                                                entry, entries,
+                                            );
                                             items.push(depth);
                                         },
                                     );
                                     items
                                 },
                             )
-                                .on_click(cx.listener(
-                                    |this, active_indent_guide: &IndentGuideLayout, window, cx| {
-                                        if window.modifiers().secondary() {
-                                            let ix = active_indent_guide.offset.y;
-                                            let Some((target_entry, worktree)) = maybe!({
-                                                let (worktree_id, entry) =
-                                                    this.entry_at_index(ix)?;
-                                                let worktree = this
-                                                    .project
-                                                    .read(cx)
-                                                    .worktree_for_id(worktree_id, cx)?;
-                                                let target_entry = worktree
-                                                    .read(cx)
-                                                    .entry_for_path(&entry.path.parent()?)?;
-                                                Some((target_entry, worktree))
-                                            }) else {
-                                                return;
-                                            };
+                            .on_click(cx.listener(
+                                |this, active_indent_guide: &IndentGuideLayout, window, cx| {
+                                    if window.modifiers().secondary() {
+                                        let ix = active_indent_guide.offset.y;
+                                        let Some((target_entry, worktree)) = maybe!({
+                                            let (worktree_id, entry) = this.entry_at_index(ix)?;
+                                            let worktree = this
+                                                .project
+                                                .read(cx)
+                                                .worktree_for_id(worktree_id, cx)?;
+                                            let target_entry = worktree
+                                                .read(cx)
+                                                .entry_for_path(&entry.path.parent()?)?;
+                                            Some((target_entry, worktree))
+                                        }) else {
+                                            return;
+                                        };
 
-                                            this.collapse_entry(target_entry.clone(), worktree, cx);
-                                        }
-                                    },
-                                ))
-                                .with_render_fn(cx.entity().clone(), move |this, params, _, cx| {
+                                        this.collapse_entry(target_entry.clone(), worktree, cx);
+                                    }
+                                },
+                            ))
+                            .with_render_fn(
+                                cx.entity().clone(),
+                                move |this, params, _, cx| {
                                     const LEFT_OFFSET: Pixels = px(14.);
                                     const PADDING_Y: Pixels = px(4.);
                                     const HITBOX_OVERDRAW: Pixels = px(3.);
@@ -5444,7 +5700,8 @@ impl Render for ProjectPanel {
                                             }
                                         })
                                         .collect()
-                                }),
+                                },
+                            ),
                         )
                     })
                     .when(show_sticky_entries, |list| {
@@ -5481,7 +5738,9 @@ impl Render for ProjectPanel {
                                     IndentGuideColors::panel(cx),
                                     |_, _, _, _| SmallVec::new(),
                                 )
-                                    .with_render_fn(cx.entity().clone(), move |_, params, _, _| {
+                                .with_render_fn(
+                                    cx.entity().clone(),
+                                    move |_, params, _, _| {
                                         const LEFT_OFFSET: Pixels = px(14.);
 
                                         let indent_size = params.indent_size;
@@ -5506,7 +5765,8 @@ impl Render for ProjectPanel {
                                                 }
                                             })
                                             .collect()
-                                    }),
+                                    },
+                                ),
                             )
                         } else {
                             sticky_items

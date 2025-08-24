@@ -1,3 +1,4 @@
+mod add_llm_provider_modal;
 mod configure_context_server_modal;
 mod manage_profiles_modal;
 mod tool_picker;
@@ -31,6 +32,7 @@ use util::ResultExt as _;
 use workspace::Workspace;
 use zed_actions::ExtensionCategoryFilter;
 
+pub(crate) use add_llm_provider_modal::{AddLlmProviderModal, LlmCompatibleProvider};
 pub(crate) use configure_context_server_modal::ConfigureContextServerModal;
 pub(crate) use manage_profiles_modal::ManageProfilesModal;
 
@@ -908,7 +910,7 @@ impl Render for AgentConfiguration {
     }
 }
 
-fn extension_only_provides_context_server(manifest: &ExtensionManifest) -> bool {
+pub fn extension_only_provides_context_server(manifest: &ExtensionManifest) -> bool {
     manifest.context_servers.len() == 1
         && manifest.themes.is_empty()
         && manifest.icon_themes.is_empty()
@@ -936,7 +938,7 @@ pub(crate) fn resolve_extension_for_context_server(
 // This notification appears when trying to delete
 // an MCP server extension that not only provides
 // the server, but other things, too, like language servers and more.
-fn show_unable_to_uninstall_extension_with_context_server(
+pub fn show_unable_to_uninstall_extension_with_context_server(
     workspace: &mut Workspace,
     id: ContextServerId,
     cx: &mut App,

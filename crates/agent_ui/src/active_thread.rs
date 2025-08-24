@@ -1,4 +1,4 @@
-use crate::context_picker::{ContextPicker, MentionLink};
+use crate::context_picker::{ContextPicker, MentionLink, ContextPickerCompletionProvider};
 use crate::context_strip::{ContextStrip, ContextStripEvent, SuggestContextKind};
 use crate::message_editor::{extract_message_creases, insert_message_creases};
 use crate::ui::{
@@ -16,6 +16,7 @@ use agent_settings::{AgentSettings, NotifyWhenAgentWaiting};
 use anyhow::Context as _;
 use assistant_tool::ToolUseStatus;
 use audio::{Audio, Sound};
+use cloud_llm_client::CompletionIntent;
 use collections::{HashMap, HashSet};
 use editor::actions::{MoveUp, Paste};
 use editor::scroll::Autoscroll;
@@ -54,7 +55,6 @@ use util::ResultExt as _;
 use util::markdown::MarkdownCodeBlock;
 use workspace::{CollaboratorId, Workspace};
 use zed_actions::assistant::OpenRulesLibrary;
-use cloud_llm_client::CompletionIntent;
 
 const CODEBLOCK_CONTAINER_GROUP: &str = "codeblock_container";
 const EDIT_PREVIOUS_MESSAGE_MIN_LINES: usize = 1;
@@ -598,7 +598,8 @@ fn open_path(
     }) else {
         return;
     };
-    let open_task = workspace.open_path(project_path, None, true, window, cx);
+    // Force split to the right and open the file there
+    let open_task = workspace.split_path_preview(project_path, false, Some(workspace::pane_group::SplitDirection::Right), window, cx);
     window
         .spawn(cx, async move |cx| {
             let item = open_task.await?;
@@ -661,14 +662,15 @@ fn open_markdown_link(
                     cx.emit(project::Event::RevealInProjectPanel(entry.id));
                 })
             } else {
+                // Force split to the right and open the file there
                 workspace
-                    .open_path(path, None, true, window, cx)
+                    .split_path_preview(path, false, Some(workspace::pane_group::SplitDirection::Right), window, cx)
                     .detach_and_log_err(cx);
             }
         }),
         Some(MentionLink::Symbol(path, symbol_name)) => {
             let open_task = workspace.update(cx, |workspace, cx| {
-                workspace.open_path(path, None, true, window, cx)
+                workspace.split_path_preview(path, false, Some(workspace::pane_group::SplitDirection::Right), window, cx)
             });
             window
                 .spawn(cx, async move |cx| {
@@ -689,9 +691,12 @@ fn open_markdown_link(
                             })
                             .context("Could not find matching symbol")?;
 
-                        editor.change_selections(SelectionEffects::scroll(Autoscroll::center()), window, cx, |s| {
-                            s.select_anchor_ranges([symbol_range.start..symbol_range.start])
-                        });
+                        editor.change_selections(
+                            SelectionEffects::scroll(Autoscroll::center()),
+                            window,
+                            cx,
+                            |s| s.select_anchor_ranges([symbol_range.start..symbol_range.start]),
+                        );
                         anyhow::Ok(())
                     })
                 })
@@ -699,7 +704,7 @@ fn open_markdown_link(
         }
         Some(MentionLink::Selection(path, line_range)) => {
             let open_task = workspace.update(cx, |workspace, cx| {
-                workspace.open_path(path, None, true, window, cx)
+                workspace.split_path_preview(path, false, Some(workspace::pane_group::SplitDirection::Right), window, cx)
             });
             window
                 .spawn(cx, async move |cx| {
@@ -708,10 +713,15 @@ fn open_markdown_link(
                         .downcast::<Editor>()
                         .context("Item is not an editor")?;
                     active_editor.update_in(cx, |editor, window, cx| {
-                        editor.change_selections(SelectionEffects::scroll(Autoscroll::center()), window, cx, |s| {
-                            s.select_ranges([Point::new(line_range.start as u32, 0)
-                                ..Point::new(line_range.start as u32, 0)])
-                        });
+                        editor.change_selections(
+                            SelectionEffects::scroll(Autoscroll::center()),
+                            window,
+                            cx,
+                            |s| {
+                                s.select_ranges([Point::new(line_range.start as u32, 0)
+                                    ..Point::new(line_range.start as u32, 0)])
+                            },
+                        );
                         anyhow::Ok(())
                     })
                 })
@@ -2729,7 +2739,9 @@ impl ActiveThread {
         let is_direct_terminal_command = tool_use.id.to_string().starts_with("term-");
 
         if is_direct_terminal_command {
-            return self.render_direct_terminal_command(tool_use, window, workspace, cx).into_any_element();
+            return self
+                .render_direct_terminal_command(tool_use, window, workspace, cx)
+                .into_any_element();
         }
 
         let is_open = self
@@ -3231,57 +3243,67 @@ impl ActiveThread {
                         Animation::new(Duration::from_secs(2)).repeat(),
                         |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
                     )
-                    .into_any_element()
+                    .into_any_element(),
             ),
             ToolUseStatus::Error(_) => Some(
                 Icon::new(IconName::Close)
                     .color(Color::Error)
                     .size(IconSize::Small)
-                    .into_any_element()
+                    .into_any_element(),
             ),
             ToolUseStatus::Finished(_) | ToolUseStatus::NeedsConfirmation => None,
         };
 
         // Terminal output content - show real-time terminal output when running, or final result when finished
         let terminal_output = match &tool_use.status {
-            ToolUseStatus::Finished(_) => {
-                rendered_tool_use.as_ref().map(|rendered| {
-                    div()
-                        .w_full()
-                        .text_ui_sm(cx)
-                        .child(
-                            MarkdownElement::new(
-                                rendered.output.clone(),
-                                tool_use_markdown_style(window, cx),
-                            )
-                            .code_block_renderer(markdown::CodeBlockRenderer::Default {
-                                copy_button: false,
-                                copy_button_on_hover: false,
-                                border: false,
-                            })
-                            .on_url_click({
-                                let workspace = self.workspace.clone();
-                                move |text, window, cx| {
-                                    open_markdown_link(text, workspace.clone(), window, cx);
-                                }
-                            })
+            ToolUseStatus::Finished(_) => rendered_tool_use.as_ref().map(|rendered| {
+                div()
+                    .w_full()
+                    .text_ui_sm(cx)
+                    .child(
+                        MarkdownElement::new(
+                            rendered.output.clone(),
+                            tool_use_markdown_style(window, cx),
                         )
-                        .into_any_element()
-                })
-            }
+                        .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                            copy_button: false,
+                            copy_button_on_hover: false,
+                            border: false,
+                        })
+                        .on_url_click({
+                            let workspace = self.workspace.clone();
+                            move |text, window, cx| {
+                                open_markdown_link(text, workspace.clone(), window, cx);
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            }),
             ToolUseStatus::Running | ToolUseStatus::InputStillStreaming => {
                 // Show real-time terminal output if a terminal card is available
-                log::info!("Direct terminal command running, tool_use.id: {}", tool_use.id);
+                log::info!(
+                    "Direct terminal command running, tool_use.id: {}",
+                    tool_use.id
+                );
 
                 if let Some(card) = self.thread.read(cx).card_for_tool(&tool_use.id) {
-                    log::info!("Found terminal card for tool_use.id: {}, rendering card", tool_use.id);
+                    log::info!(
+                        "Found terminal card for tool_use.id: {}, rendering card",
+                        tool_use.id
+                    );
                     Some(card.render(&tool_use.status, window, workspace.clone(), cx))
                 } else {
-                    log::warn!("No terminal card found for tool_use.id: {}, showing fallback", tool_use.id);
+                    log::warn!(
+                        "No terminal card found for tool_use.id: {}, showing fallback",
+                        tool_use.id
+                    );
 
                     // Debug: Check if any cards are available
                     let thread = self.thread.read(cx);
-                    log::info!("Thread has pending tool uses: {}", thread.has_pending_tool_uses());
+                    log::info!(
+                        "Thread has pending tool uses: {}",
+                        thread.has_pending_tool_uses()
+                    );
 
                     // Fallback to running indicator if no card is available
                     Some(
@@ -3295,7 +3317,9 @@ impl ActiveThread {
                                         "arrow-circle",
                                         Animation::new(Duration::from_secs(2)).repeat(),
                                         |icon, delta| {
-                                            icon.transform(Transformation::rotate(percentage(delta)))
+                                            icon.transform(Transformation::rotate(percentage(
+                                                delta,
+                                            )))
                                         },
                                     ),
                             )
@@ -3305,29 +3329,27 @@ impl ActiveThread {
                                     .color(Color::Muted)
                                     .buffer_font(cx),
                             )
-                            .into_any_element()
+                            .into_any_element(),
                     )
                 }
-            },
-            ToolUseStatus::Error(_) => {
-                rendered_tool_use.as_ref().map(|rendered| {
-                    div()
-                        .text_ui_sm(cx)
-                        .child(
-                            MarkdownElement::new(
-                                rendered.output.clone(),
-                                tool_use_markdown_style(window, cx),
-                            )
-                            .on_url_click({
-                                let workspace = self.workspace.clone();
-                                move |text, window, cx| {
-                                    open_markdown_link(text, workspace.clone(), window, cx);
-                                }
-                            })
-                        )
-                        .into_any_element()
-                })
             }
+            ToolUseStatus::Error(_) => rendered_tool_use.as_ref().map(|rendered| {
+                div()
+                    .text_ui_sm(cx)
+                    .child(
+                        MarkdownElement::new(
+                            rendered.output.clone(),
+                            tool_use_markdown_style(window, cx),
+                        )
+                        .on_url_click({
+                            let workspace = self.workspace.clone();
+                            move |text, window, cx| {
+                                open_markdown_link(text, workspace.clone(), window, cx);
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            }),
             ToolUseStatus::Pending | ToolUseStatus::NeedsConfirmation => None,
         };
 
@@ -3354,26 +3376,27 @@ impl ActiveThread {
                                             .size(IconSize::XSmall)
                                             .color(Color::Muted),
                                     )
-                                    .child(
-                                        h_flex().pr_8().text_size(rems(0.8125)).children(
-                                            rendered_tool_use.map(|rendered| {
-                                                MarkdownElement::new(
-                                                    rendered.label,
-                                                    tool_use_markdown_style(window, cx),
-                                                )
-                                                .on_url_click({
-                                                    let workspace = self.workspace.clone();
-                                                    move |text, window, cx| {
-                                                        open_markdown_link(text, workspace.clone(), window, cx);
-                                                    }
-                                                })
+                                    .child(h_flex().pr_8().text_size(rems(0.8125)).children(
+                                        rendered_tool_use.map(|rendered| {
+                                            MarkdownElement::new(
+                                                rendered.label,
+                                                tool_use_markdown_style(window, cx),
+                                            )
+                                            .on_url_click({
+                                                let workspace = self.workspace.clone();
+                                                move |text, window, cx| {
+                                                    open_markdown_link(
+                                                        text,
+                                                        workspace.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
                                             })
-                                        ),
-                                    ),
+                                        }),
+                                    )),
                             )
-                            .children(status_icon.map(|icon| {
-                                h_flex().gap_1().child(icon)
-                            })),
+                            .children(status_icon.map(|icon| h_flex().gap_1().child(icon))),
                     )
                     .children(terminal_output.map(|output| {
                         v_flex()
@@ -3705,9 +3728,13 @@ impl Render for ActiveThread {
                     this.hide_scrollbar_later(cx);
                 }),
             )
-            .child(list(self.list_state.clone(), cx.processor(|this, ix: usize, window, cx| {
-                this.render_message(ix, window, cx)
-            })).flex_grow())
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(|this, ix: usize, window, cx| this.render_message(ix, window, cx)),
+                )
+                .flex_grow(),
+            )
             .when_some(self.render_vertical_scrollbar(cx), |this, scrollbar| {
                 this.child(scrollbar)
             })
@@ -3950,7 +3977,13 @@ mod tests {
         thread.update(cx, |thread, cx| {
             let request =
                 thread.to_completion_request(model.clone(), CompletionIntent::UserPrompt, cx);
-            thread.stream_completion(request, model, cx.active_window(), cx)
+            thread.stream_completion(
+                request,
+                model,
+                CompletionIntent::UserPrompt,
+                cx.active_window(),
+                cx,
+            )
         });
         // Follow the agent
         cx.update(|window, cx| {

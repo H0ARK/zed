@@ -147,7 +147,7 @@ mod uniform_list {
             &self,
             visible_range: Range<usize>,
             bounds: Bounds<Pixels>,
-            scroll_offset: Point<Pixels>,
+            _scroll_offset: Point<Pixels>,
             item_height: Pixels,
             item_count: usize,
             window: &mut Window,

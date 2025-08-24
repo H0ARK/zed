@@ -2,6 +2,7 @@ pub mod dock;
 pub mod history_manager;
 pub mod item;
 mod modal_layer;
+pub mod navigation_state;
 pub mod notifications;
 pub mod pane;
 pub mod pane_group;
@@ -65,6 +66,7 @@ use itertools::Itertools;
 use language::{Buffer, LanguageRegistry, Rope};
 pub use modal_layer::*;
 use node_runtime::NodeRuntime;
+pub use navigation_state::{NavigationEvent, NavigationState};
 use notifications::{
     DetachAndPromptErr, Notifications, dismiss_app_notification,
     simple_message_notification::MessageNotification,
@@ -230,6 +232,32 @@ actions!(
         IncreaseOpenDocksSize,
     ]
 );
+
+// Global state for tracking tab drag to conditionally register window drag hitboxes
+#[derive(Default)]
+pub struct GlobalTabDragState {
+    active: bool,
+}
+
+impl gpui::Global for GlobalTabDragState {}
+
+impl GlobalTabDragState {
+    pub fn set_active(active: bool, cx: &mut App) {
+        if cx.has_global::<Self>() {
+            cx.update_global::<Self, _>(|state, _| {
+                state.active = active;
+            });
+        } else {
+            cx.set_global(Self { active });
+        }
+    }
+    
+    pub fn is_active(cx: &App) -> bool {
+        cx.try_global::<Self>()
+            .map(|state| state.active)
+            .unwrap_or(false)
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub struct OpenPaths {
@@ -1019,6 +1047,13 @@ struct FollowerView {
 }
 
 impl Workspace {
+    /// Returns the last active center (editor) pane if it still exists; otherwise falls back to the current active pane.
+    pub fn last_active_center_pane_entity(&self) -> Entity<Pane> {
+        self.last_active_center_pane
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .unwrap_or_else(|| self.active_pane.clone())
+    }
     const DEFAULT_PADDING: f32 = 0.2;
     const MAX_PADDING: f32 = 0.4;
 
@@ -1991,6 +2026,7 @@ impl Workspace {
     pub fn titlebar_item(&self) -> Option<AnyView> {
         self.titlebar_item.clone()
     }
+
 
     /// Call the given callback with a workspace whose project is local.
     ///
@@ -2982,7 +3018,7 @@ impl Workspace {
         &mut self,
         item: Box<dyn ItemHandle>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> bool {
         if let Some(center_pane) = self.last_active_center_pane.clone() {
             if let Some(center_pane) = center_pane.upgrade() {
@@ -3006,8 +3042,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // If the active pane is effectively empty (e.g. focus was in a dock-driven temporary
+        // context like a terminal / agent panel interaction) prefer the last active center pane
+        // so user actions (like NewAgentTab / OpenAgentTab) land in the editor area tabs.
+        let target_pane = if self
+            .last_active_center_pane
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|center| center.entity_id() == self.active_pane.entity_id())
+            .unwrap_or(false)
+        {
+            // Active pane is already the center pane
+            self.active_pane.clone()
+        } else if !self.panes.iter().any(|p| p.entity_id() == self.active_pane.entity_id()) {
+            // Active pane is not a center pane (it's from a dock); prefer center pane
+            self.last_active_center_pane_entity()
+        } else if self.active_pane.read(cx).items().next().is_none() {
+            // Active pane is a center pane but empty; still fine to route to center
+            self.last_active_center_pane_entity()
+        } else {
+            self.active_pane.clone()
+        };
+
         self.add_item(
-            self.active_pane.clone(),
+            target_pane,
             item,
             destination_index,
             false,
@@ -3015,6 +3073,24 @@ impl Workspace {
             window,
             cx,
         )
+    }
+
+    /// Prefer placing agent items into the center pane. Falls back gracefully.
+    pub fn add_agent_item_to_center(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Attempt center insertion first
+    if !self.add_item_to_center(item, window, cx) {
+            // Self-heal: if we have no recorded center pane but active pane is a true center pane, adopt it.
+            if self.last_active_center_pane.is_none()
+                && self.panes.iter().any(|p| p.entity_id() == self.active_pane.entity_id())
+            {
+                self.last_active_center_pane = Some(self.active_pane.downgrade());
+            }
+        }
     }
 
     pub fn add_item(
@@ -7341,7 +7417,6 @@ pub fn client_side_decorations(
 
     div()
         .id("window-backdrop")
-        .bg(transparent_black())
         .map(|div| match decorations {
             Decorations::Server => div,
             Decorations::Client { tiling, .. } => div

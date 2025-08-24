@@ -1,24 +1,34 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{ Deserialize, Serialize };
 
-use crate::{NewTextThread, NewThread, OpenHistory};
+use crate::{ NewTextThread, NewThread, OpenHistory };
 use agent::{
     ThreadEvent, // Added ThreadEvent import
-    thread_store::{TextThreadStore, ThreadStore},
+    thread_store::{ TextThreadStore, ThreadStore },
 };
-use anyhow::{Context as AnyhowContext, Result};
+use anyhow::{ Context as AnyhowContext, Result };
 use assistant_slash_command::SlashCommandWorkingSet;
 use gpui::{
-    App, AppContext, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    App,
+    AppContext,
+    AsyncWindowContext,
+    Context,
+    Entity,
+    EventEmitter,
+    FocusHandle,
+    Focusable,
+    IntoElement,
+    Render,
+    SharedString,
+    Subscription,
+    Task,
+    WeakEntity,
+    Window,
 };
-use prompt_store::{PromptBuilder, PromptStore};
+use prompt_store::{ PromptBuilder, PromptStore };
 use ui::Icon;
-use workspace::{
-    Workspace,
-    item::{Item, ItemEvent},
-};
+use workspace::{ Workspace, item::{ Item, ItemEvent } };
 use zed_actions::agent::OpenSettings;
 
 // Import the AgentPanel implementation to reuse its logic
@@ -43,20 +53,13 @@ impl AgentItem {
         context_store: Entity<TextThreadStore>,
         prompt_store: Option<Entity<PromptStore>>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut Context<Self>
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
         // Create the underlying AgentPanel
         let panel = cx.new(|cx| {
-            AgentPanel::new_internal(
-                workspace,
-                thread_store,
-                context_store,
-                prompt_store,
-                window,
-                cx,
-            )
+            AgentPanel::new_internal(workspace, thread_store, context_store, prompt_store, window, cx)
         });
 
         let mut subscriptions = Vec::new();
@@ -102,12 +105,10 @@ impl AgentItem {
     pub fn load(
         workspace: WeakEntity<Workspace>,
         prompt_builder: Arc<PromptBuilder>,
-        cx: AsyncWindowContext,
+        cx: AsyncWindowContext
     ) -> Task<Result<Entity<Self>>> {
         cx.spawn(async move |cx| {
-            let workspace = workspace
-                .upgrade()
-                .with_context(|| "workspace was dropped")?;
+            let workspace = workspace.upgrade().with_context(|| "workspace was dropped")?;
 
             // Get the prompt store - we'll pass None for now since we need an App context
             let prompt_store = None;
@@ -120,13 +121,13 @@ impl AgentItem {
                     tools,
                     prompt_store.clone(),
                     prompt_builder.clone(),
-                    cx,
+                    cx
                 );
                 let context_store_task = assistant_context::ContextStore::new(
                     workspace.project().clone(),
                     prompt_builder.clone(),
                     Arc::new(SlashCommandWorkingSet::default()),
-                    cx,
+                    cx
                 );
                 (thread_store_task, context_store_task)
             })?;
@@ -136,16 +137,7 @@ impl AgentItem {
 
             let agent_item = cx.update(|window, cx| {
                 workspace.update(cx, |workspace, cx| {
-                    cx.new(|cx| {
-                        Self::new(
-                            workspace,
-                            thread_store,
-                            context_store,
-                            prompt_store,
-                            window,
-                            cx,
-                        )
-                    })
+                    cx.new(|cx| { Self::new(workspace, thread_store, context_store, prompt_store, window, cx) })
                 })
             })?;
 
@@ -202,20 +194,14 @@ impl Item for AgentItem {
         &self,
         _workspace_id: Option<workspace::WorkspaceId>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        _cx: &mut Context<Self>
     ) -> Option<Entity<Self>>
-    where
-        Self: Sized,
+        where Self: Sized
     {
         None // Agent panel should not be cloned on split
     }
 
-    fn added_to_workspace(
-        &mut self,
-        workspace: &mut Workspace,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn added_to_workspace(&mut self, workspace: &mut Workspace, _window: &mut Window, _cx: &mut Context<Self>) {
         // Register actions that were previously in the panel init
         workspace
             .register_action(|workspace, _: &crate::NewAgentTab, window, cx| {
@@ -226,62 +212,39 @@ impl Item for AgentItem {
                 cx.spawn_in(window, async move |workspace, cx| {
                     if let Ok(agent_item) = task.await {
                         workspace.update_in(cx, |workspace, window, cx| {
-                            workspace.add_item_to_active_pane(
-                                Box::new(agent_item),
-                                None,
-                                true,
-                                window,
-                                cx,
-                            );
+                            workspace.add_item_to_active_pane(Box::new(agent_item), None, true, window, cx);
                         })?;
                     }
                     anyhow::Ok(())
-                })
-                .detach_and_log_err(cx);
+                }).detach_and_log_err(cx);
             })
             .register_action(|workspace, action: &NewThread, window, cx| {
-                if let Some(item) = workspace
-                    .active_item(cx)
-                    .and_then(|item| item.downcast::<AgentItem>())
-                {
+                if let Some(item) = workspace.active_item(cx).and_then(|item| item.downcast::<AgentItem>()) {
                     item.update(cx, |item, cx| {
-                        item.panel
-                            .update(cx, |panel, cx| panel.new_thread(action, window, cx));
+                        item.panel.update(cx, |panel, cx| panel.new_thread(action, window, cx));
                         // Refresh subscriptions after creating new thread
                         item.refresh_thread_subscriptions(cx);
                     });
                 }
             })
             .register_action(|workspace, _: &OpenHistory, window, cx| {
-                if let Some(item) = workspace
-                    .active_item(cx)
-                    .and_then(|item| item.downcast::<AgentItem>())
-                {
+                if let Some(item) = workspace.active_item(cx).and_then(|item| item.downcast::<AgentItem>()) {
                     item.update(cx, |item, cx| {
-                        item.panel
-                            .update(cx, |panel, cx| panel.open_history(window, cx));
+                        item.panel.update(cx, |panel, cx| panel.open_history(window, cx));
                     });
                 }
             })
             .register_action(|workspace, _: &OpenSettings, window, cx| {
-                if let Some(item) = workspace
-                    .active_item(cx)
-                    .and_then(|item| item.downcast::<AgentItem>())
-                {
+                if let Some(item) = workspace.active_item(cx).and_then(|item| item.downcast::<AgentItem>()) {
                     item.update(cx, |item, cx| {
-                        item.panel
-                            .update(cx, |panel, cx| panel.open_configuration(window, cx));
+                        item.panel.update(cx, |panel, cx| panel.open_configuration(window, cx));
                     });
                 }
             })
             .register_action(|workspace, _: &NewTextThread, window, cx| {
-                if let Some(item) = workspace
-                    .active_item(cx)
-                    .and_then(|item| item.downcast::<AgentItem>())
-                {
+                if let Some(item) = workspace.active_item(cx).and_then(|item| item.downcast::<AgentItem>()) {
                     item.update(cx, |item, cx| {
-                        item.panel
-                            .update(cx, |panel, cx| panel.new_prompt_editor(window, cx));
+                        item.panel.update(cx, |panel, cx| panel.new_prompt_editor(window, cx));
                         // Refresh subscriptions after creating new text thread
                         item.refresh_thread_subscriptions(cx);
                     });

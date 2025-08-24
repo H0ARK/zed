@@ -187,7 +187,11 @@ impl Render for DirBrowser {
                                 // Set parent cwd and close the menu instead of navigating within
                                 if let Some(parent) = this.parent.upgrade() {
                                     let _ = parent.update(cx, |parent, cx| {
-                                        parent.cwd = Some(abs);
+                                        parent.cwd = Some(abs.clone());
+                                        // Sync with NavigationState (user-initiated change)
+                                        let _ = parent.navigation_state.update(cx, |nav_state, cx| {
+                                            nav_state.set_current_directory(Some(abs), cx)
+                                        });
                                         cx.notify();
                                     });
                                 }
@@ -256,6 +260,10 @@ impl Render for DirBrowser {
                                 if let Some(parent) = this.parent.upgrade() {
                                     let _ = parent.update(cx, |parent, cx| {
                                         parent.cwd = Some(abs_clone.clone());
+                                        // Sync with NavigationState (user-initiated change)
+                                        let _ = parent.navigation_state.update(cx, |nav_state, cx| {
+                                            nav_state.set_current_directory(Some(abs_clone.clone()), cx)
+                                        });
                                         cx.notify();
                                     });
                                 }
@@ -296,7 +304,7 @@ impl Render for DirBrowser {
 
 // Not exported as a component; used only as a child element via Render
 // Removed Git and project panel popovers from message editor header
-use workspace::{CollaboratorId, Workspace};
+use workspace::{CollaboratorId, NavigationState, Workspace};
 use cloud_llm_client::CompletionIntent;
 
 use crate::context_picker::{ContextPicker, ContextPickerCompletionProvider, crease_for_mention};
@@ -337,6 +345,7 @@ pub struct MessageEditor {
     refining_prompt: bool,
     _subscriptions: Vec<Subscription>,
     cwd: Option<PathBuf>,
+    navigation_state: Entity<NavigationState>,
 }
 
 const MIN_EDITOR_LINES: usize = 1;
@@ -547,9 +556,9 @@ impl MessageEditor {
             .or_else(|| project.read(cx).active_project_directory(cx).map(|p| p.to_path_buf()))
             .or_else(|| Some(paths::home_dir().clone()));
 
-        let this = Self {
+        let mut this = Self {
             editor: editor.clone(),
-            project,
+            project: project.clone(),
             user_store,
             thread,
             incompatible_tools_state: incompatible_tools.clone(),
@@ -568,10 +577,26 @@ impl MessageEditor {
             update_token_count_task: None,
             refining_prompt: false,
             _subscriptions: subscriptions,
-            cwd: initial_cwd,
+            cwd: initial_cwd.clone(),
+            navigation_state: NavigationState::get_or_init(project.clone(), cx),
         };
 
         // Do not auto-create a "/" worktree; scanning the entire filesystem can cause permission errors.
+        
+        // Initialize from NavigationState if available, but don't override if we already have a good cwd
+        if this.cwd.is_none() {
+            if let Some(nav_dir) = this.navigation_state.read(cx).current_directory() {
+                this.cwd = Some(nav_dir.clone());
+            }
+        } else if let Some(current_cwd) = &this.cwd {
+            // Quietly update NavigationState with our current directory (avoid reset)
+            let _ = this.navigation_state.update(cx, |nav_state, cx| {
+                if nav_state.current_directory().is_none() 
+                    || nav_state.current_directory() != Some(current_cwd) {
+                    let _ = nav_state.update_current_directory_quietly(Some(current_cwd.clone()), cx);
+                }
+            });
+        }
 
         this
     }

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use collections::HashSet;
 use fs::Fs;
+use futures::AsyncReadExt;
 use gpui::{DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Task};
+use http_client::{AsyncBody, http};
 use language_model::LanguageModelRegistry;
 use language_models::{
     AllLanguageModelSettings, OpenAiCompatibleSettingsContent,
@@ -85,21 +87,11 @@ impl ModelInput {
             window,
             cx,
         );
-        let max_completion_tokens = single_line_input(
-            "Max Completion Tokens",
-            "200000",
-            Some("200000"),
-            window,
-            cx,
-        );
-        let max_output_tokens = single_line_input(
-            "Max Output Tokens",
-            "Max Output Tokens",
-            Some("32000"),
-            window,
-            cx,
-        );
-        let max_tokens = single_line_input("Max Tokens", "Max Tokens", Some("200000"), window, cx);
+        let max_completion_tokens =
+            single_line_input("Max Completion Tokens", "200000", None, window, cx);
+        let max_output_tokens =
+            single_line_input("Max Output Tokens", "Max Output Tokens", None, window, cx);
+        let max_tokens = single_line_input("Max Tokens", "Max Tokens", None, window, cx);
         Self {
             name: model_name,
             max_completion_tokens,
@@ -113,29 +105,46 @@ impl ModelInput {
         if name.is_empty() {
             return Err(SharedString::from("Model Name cannot be empty"));
         }
+
+        // Optional fields: allow empty -> None
+        let max_completion_tokens =
+            {
+                let s = self.max_completion_tokens.read(cx).text(cx);
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s.parse::<u64>().map_err(|_| {
+                        SharedString::from("Max Completion Tokens must be a number")
+                    })?)
+                }
+            };
+
+        let max_output_tokens = {
+            let s = self.max_output_tokens.read(cx).text(cx);
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    s.parse::<u64>()
+                        .map_err(|_| SharedString::from("Max Output Tokens must be a number"))?,
+                )
+            }
+        };
+
+        // Required field: still must be provided
+        let max_tokens = self
+            .max_tokens
+            .read(cx)
+            .text(cx)
+            .parse::<u64>()
+            .map_err(|_| SharedString::from("Max Tokens must be a number"))?;
+
         Ok(AvailableModel {
             name,
             display_name: None,
-            max_completion_tokens: Some(
-                self.max_completion_tokens
-                    .read(cx)
-                    .text(cx)
-                    .parse::<u64>()
-                    .map_err(|_| SharedString::from("Max Completion Tokens must be a number"))?,
-            ),
-            max_output_tokens: Some(
-                self.max_output_tokens
-                    .read(cx)
-                    .text(cx)
-                    .parse::<u64>()
-                    .map_err(|_| SharedString::from("Max Output Tokens must be a number"))?,
-            ),
-            max_tokens: self
-                .max_tokens
-                .read(cx)
-                .text(cx)
-                .parse::<u64>()
-                .map_err(|_| SharedString::from("Max Tokens must be a number"))?,
+            max_completion_tokens,
+            max_output_tokens,
+            max_tokens,
         })
     }
 }
@@ -193,6 +202,12 @@ fn save_provider_to_settings(
     let mut models = Vec::new();
     let mut model_names: HashSet<String> = HashSet::default();
     for model in &input.models {
+        // Allow empty model rows: skip if name is empty/whitespace
+        let name = model.name.read(cx).text(cx);
+        if name.trim().is_empty() {
+            continue;
+        }
+
         match model.parse(cx) {
             Ok(model) => {
                 if !model_names.insert(model.name.clone()) {
@@ -273,6 +288,160 @@ impl AddLlmProviderModal {
     }
 
     fn render_model_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let refresh_handler = cx.listener(
+            |this: &mut Self, _event, window: &mut Window, cx: &mut Context<Self>| {
+                let api_url = this.input.api_url.read(cx).text(cx);
+                let api_key = this.input.api_key.read(cx).text(cx);
+
+                if api_url.trim().is_empty() || api_key.trim().is_empty() {
+                    this.last_error =
+                        Some("API URL and API Key are required to fetch models".into());
+                    cx.notify();
+                    return;
+                }
+
+                let base = api_url.trim_end_matches('/');
+                let url = if base.ends_with("/v1") {
+                    format!("{}/models", base)
+                } else {
+                    format!("{}/v1/models", base)
+                };
+
+                let request = match http::Request::builder()
+                    .uri(url)
+                    .method(http::Method::GET)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .body(AsyncBody::empty())
+                {
+                    Ok(req) => req,
+                    Err(e) => {
+                        this.last_error = Some(format!("Failed to build request: {}", e).into());
+                        cx.notify();
+                        return;
+                    }
+                };
+
+                let http_client = cx.http_client();
+                cx.spawn_in(window, async move |this, cx| -> anyhow::Result<()> {
+                    let mut response = match http_client.send(request).await {
+                        Ok(res) => res,
+                        Err(err) => {
+                            this.update(cx, |this, cx| {
+                                this.last_error =
+                                    Some(format!("Failed to fetch models: {}", err).into());
+                                cx.notify();
+                            })?;
+                            return Ok(());
+                        }
+                    };
+
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        this.update(cx, |this, cx| {
+                            this.last_error =
+                                Some(format!("Failed to fetch models: HTTP {}", status).into());
+                            cx.notify();
+                        })?;
+                        return Ok(());
+                    }
+
+                    let mut body = Vec::new();
+                    response.body_mut().read_to_end(&mut body).await.ok();
+
+                    let models = serde_json::from_slice::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| {
+                            let arr = if let Some(a) = v.get("data").and_then(|d| d.as_array()) {
+                                Some(a.clone())
+                            } else if let Some(a) = v.get("models").and_then(|d| d.as_array()) {
+                                Some(a.clone())
+                            } else if let Some(a) = v.as_array() {
+                                Some(a.clone())
+                            } else {
+                                None
+                            }?;
+                            Some(
+                                arr.into_iter()
+                                    .filter_map(|item| {
+                                        let id = item
+                                            .get("id")
+                                            .or_else(|| item.get("name"))
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string())?;
+                                        let get_num = |k: &str| {
+                                            item.get(k)
+                                                .and_then(|v| v.as_u64())
+                                                .or_else(|| {
+                                                    item.get(k).and_then(|v| {
+                                                        v.as_str().and_then(|s| s.parse::<u64>().ok())
+                                                    })
+                                                })
+                                        };
+                                        let max_tokens = get_num("max_tokens")
+                                            .or_else(|| get_num("context_window"))
+                                            .or_else(|| get_num("context_length"))
+                                            .or_else(|| get_num("max_context_tokens"));
+                                        let max_output_tokens = get_num("max_output_tokens")
+                                            .or_else(|| get_num("output_token_limit"));
+                                        let max_completion_tokens = get_num("max_completion_tokens")
+                                            .or_else(|| get_num("input_token_limit"));
+                                        Some((id, max_tokens, max_completion_tokens, max_output_tokens))
+                                    })
+                                    .collect::<Vec<(String, Option<u64>, Option<u64>, Option<u64>)>>(),
+                            )
+                        })
+                        .unwrap_or_default();
+
+                    this.update_in(cx, |this, inner_window, cx| {
+                        if models.is_empty() {
+                            this.last_error = Some("No models returned from provider".into());
+                            cx.notify();
+                            return;
+                        }
+
+                        let mut new_models = Vec::new();
+                        for (name, max_tokens, max_completion_tokens, max_output_tokens) in models {
+                            let mi = ModelInput::new(inner_window, cx);
+                            mi.name.update(cx, |input, cx| {
+                                input.editor().update(cx, |editor, cx| {
+                                    editor.set_text(name.as_str(), inner_window, cx);
+                                });
+                            });
+                            if let Some(v) = max_tokens {
+                                mi.max_tokens.update(cx, |input, cx| {
+                                    input.editor().update(cx, |editor, cx| {
+                                        editor.set_text(v.to_string().as_str(), inner_window, cx);
+                                    });
+                                });
+                            }
+                            if let Some(v) = max_completion_tokens {
+                                mi.max_completion_tokens.update(cx, |input, cx| {
+                                    input.editor().update(cx, |editor, cx| {
+                                        editor.set_text(v.to_string().as_str(), inner_window, cx);
+                                    });
+                                });
+                            }
+                            if let Some(v) = max_output_tokens {
+                                mi.max_output_tokens.update(cx, |input, cx| {
+                                    input.editor().update(cx, |editor, cx| {
+                                        editor.set_text(v.to_string().as_str(), inner_window, cx);
+                                    });
+                                });
+                            }
+                            new_models.push(mi);
+                        }
+                        this.input.models = new_models;
+                        this.last_error = None;
+                        cx.notify();
+                    })
+                    .ok();
+
+                    Ok(())
+                })
+                .detach_and_log_err(cx);
+            },
+        );
+
         v_flex()
             .mt_1()
             .gap_2()
@@ -281,16 +450,26 @@ impl AddLlmProviderModal {
                     .justify_between()
                     .child(Label::new("Models").size(LabelSize::Small))
                     .child(
-                        Button::new("add-model", "Add Model")
-                            .icon(IconName::Plus)
-                            .icon_position(IconPosition::Start)
-                            .icon_size(IconSize::XSmall)
-                            .icon_color(Color::Muted)
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.input.add_model(window, cx);
-                                cx.notify();
-                            })),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("refresh-models", "Refresh")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(refresh_handler),
+                            )
+                            .child(
+                                Button::new("add-model", "Add Model")
+                                    .icon(IconName::Plus)
+                                    .icon_position(IconPosition::Start)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.input.add_model(window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .children(
@@ -366,13 +545,7 @@ impl Render for AddLlmProviderModal {
             }))
             .child(
                 Modal::new("configure-context-server", None)
-                    .header(ModalHeader::new().headline("Add LLM Provider").description(
-                        match self.provider {
-                            LlmCompatibleProvider::OpenAi => {
-                                "This provider will use an OpenAI compatible API."
-                            }
-                        },
-                    ))
+                    .header(ModalHeader::new().headline("Add LLM Provider"))
                     .when_some(self.last_error.clone(), |this, error| {
                         this.section(
                             Section::new().child(

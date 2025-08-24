@@ -1,0 +1,450 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+warning: unused variable: `scroll_offset`
+   --> crates/ui/src/components/indent_guides.rs:150:13
+    |
+150 |             scroll_offset: Point<Pixels>,
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_scroll_offset`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `point`
+  --> crates/ui/src/components/scrollbar.rs:55:26
+   |
+55 |     fn set_offset(&self, point: Point<Pixels>) {
+   |                          ^^^^^ help: if this is intentional, prefix it with an underscore: `_point`
+
+warning: `ui` (lib) generated 2 warnings
+warning: unnecessary braces around method argument
+   --> crates/workspace/src/dock.rs:774:42
+    |
+774 | ...                   .tooltip({ move |window, cx| Tooltip::text(tooltip)(window, cx) }),
+    |                                ^^                                                    ^^
+    |
+    = note: `#[warn(unused_braces)]` on by default
+help: remove these braces
+    |
+774 -                                 .tooltip({ move |window, cx| Tooltip::text(tooltip)(window, cx) }),
+774 +                                 .tooltip(move |window, cx| Tooltip::text(tooltip)(window, cx)),
+    |
+
+warning: unused import: `OpenAgentTab`
+ --> crates/workspace/src/pane.rs:3:40
+  |
+3 |     CloseWindow, NewFile, NewTerminal, OpenAgentTab, OpenInTerminal, OpenOptions, OpenTerminal,
+  |                                        ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: variable does not need to be mutable
+   --> crates/workspace/src/dock.rs:738:21
+    |
+738 |                 let mut buttons: Vec<_> = self
+    |                     ----^^^^^^^
+    |                     |
+    |                     help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `binary_path`
+    --> crates/workspace/src/workspace.rs:7305:9
+     |
+7305 |     let binary_path = reload.binary_path.clone();
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_binary_path`
+     |
+     = note: `#[warn(unused_variables)]` on by default
+
+warning: methods `render_left_tools` and `render_right_tools` are never used
+  --> crates/workspace/src/status_bar.rs:70:8
+   |
+69 | impl StatusBar {
+   | -------------- methods in this implementation
+70 |     fn render_left_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
+   |        ^^^^^^^^^^^^^^^^^
+...
+77 |     fn render_right_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
+   |        ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: multiple associated items are never used
+   --> crates/workspace/src/status_bar.rs:85:12
+    |
+84  | impl StatusBar {
+    | -------------- associated items in this implementation
+85  |     pub fn new(active_pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    |            ^^^
+...
+98  |     pub fn add_left_item<T>(&mut self, item: Entity<T>, window: &mut Window, cx: &mut Context<Self>)
+    |            ^^^^^^^^^^^^^
+...
+109 |     pub fn item_of_type<T: StatusItemView>(&self) -> Option<Entity<T>> {
+    |            ^^^^^^^^^^^^
+...
+116 |     pub fn position_of_item<T>(&self) -> Option<usize>
+    |            ^^^^^^^^^^^^^^^^
+...
+133 |     pub fn insert_item_after<T>(
+    |            ^^^^^^^^^^^^^^^^^
+...
+154 |     pub fn remove_item_at(&mut self, position: usize, cx: &mut Context<Self>) {
+    |            ^^^^^^^^^^^^^^
+...
+163 |     pub fn add_right_item<T>(
+    |            ^^^^^^^^^^^^^^
+...
+178 |     pub fn set_active_pane(
+    |            ^^^^^^^^^^^^^^^
+...
+191 |     fn update_active_pane_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `workspace` (lib) generated 6 warnings (run `cargo fix --lib -p workspace` to apply 3 suggestions)
+warning: variant `Closed` is never constructed
+   --> crates/editor/src/editor.rs:257:5
+    |
+253 | enum ReportEditorEvent {
+    |      ----------------- variant in this enum
+...
+257 |     Closed,
+    |     ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `editor` (lib) generated 1 warning
+warning: multiple fields are never read
+   --> crates/agent/src/pointer_context_manager.rs:500:5
+    |
+494 | pub struct PointerContextManager {
+    |            --------------------- fields in this struct
+...
+500 |     thread_store: Option<WeakEntity<ThreadStore>>,
+    |     ^^^^^^^^^^^^
+501 |     project: WeakEntity<Project>,
+502 |     prompt_store: Option<Entity<PromptStore>>,
+    |     ^^^^^^^^^^^^
+...
+509 |     diff_manager: DiffManager,
+    |     ^^^^^^^^^^^^
+510 |     terminal_compressor: TerminalCompressor,
+    |     ^^^^^^^^^^^^^^^^^^^
+...
+513 |     active_refs: IndexSet<AgentContextKey>,
+    |     ^^^^^^^^^^^
+514 |     loaded_content: HashMap<ContextId, LoadedContent>,
+    |     ^^^^^^^^^^^^^^
+...
+518 |     budget_allocations: HashMap<ContentType, usize>,
+    |     ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: methods `emit_content_loaded`, `emit_budget_exceeded`, and `determine_content_type` are never used
+   --> crates/agent/src/pointer_context_manager.rs:728:8
+    |
+523 | impl PointerContextManager {
+    | -------------------------- methods in this implementation
+...
+728 |     fn emit_content_loaded(&mut self, context_id: ContextId, cx: &mut Context<Self>) {
+    |        ^^^^^^^^^^^^^^^^^^^
+...
+732 |     fn emit_budget_exceeded(&mut self, current: usize, limit: usize, cx: &mut Context<Self>) {
+    |        ^^^^^^^^^^^^^^^^^^^^
+...
+795 |     fn determine_content_type(&self, context: &crate::context::AgentContext) -> ContentType {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `time::Duration`
+ --> crates/ai_onboarding/src/ai_upsell_card.rs:1:22
+  |
+1 | use std::{sync::Arc, time::Duration};
+  |                      ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `AnimationExt`, `Animation`, `Transformation`, and `percentage`
+ --> crates/ai_onboarding/src/ai_upsell_card.rs:6:5
+  |
+6 |     Animation, AnimationExt, AnyElement, App, Entity, IntoElement, RenderOnce, Transformation,
+  |     ^^^^^^^^^  ^^^^^^^^^^^^                                                    ^^^^^^^^^^^^^^
+7 |     Window, percentage,
+  |             ^^^^^^^^^^
+
+warning: `agent` (lib) generated 2 warnings
+warning: `ai_onboarding` (lib) generated 2 warnings (run `cargo fix --lib -p ai_onboarding` to apply 2 suggestions)
+warning: unused import: `rpc::proto`
+  --> crates/title_bar/src/title_bar.rs:28:5
+   |
+28 | use rpc::proto;
+   |     ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `notifications::NotifyResultExt`
+  --> crates/title_bar/src/title_bar.rs:38:28
+   |
+38 | use workspace::{Workspace, notifications::NotifyResultExt};
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `title_bar` (lib) generated 2 warnings (run `cargo fix --lib -p title_bar` to apply 2 suggestions)
+   Compiling agent_ui v0.1.0 (/Users/conrad/Documents/GitHub/zed/crates/agent_ui)
+warning: unused import: `Dismissable`
+ --> crates/agent_ui/src/agent_panel.rs:7:15
+  |
+7 | use db::kvp::{Dismissable, KEY_VALUE_STORE};
+  |               ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused imports: `AddContextServer`, `DeleteRecentlyOpenThread`, `HistoryEntryElement`, `ResetTrialEndUpsell`, and `ResetTrialUpsell`
+  --> crates/agent_ui/src/agent_panel.rs:11:5
+   |
+11 |     AddContextServer, AgentDiffPane, ContinueThread, ContinueWithBurnMode,
+   |     ^^^^^^^^^^^^^^^^
+12 |     DeleteRecentlyOpenThread, ExpandMessageEditor, Follow, InlineAssistant, NewTextThread,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+13 |     NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, OpenSettingsModal, ResetTrialEndUpsell,
+   |                                                                                           ^^^^^^^^^^^^^^^^^^^
+14 |     ResetTrialUpsell, ToggleBurnMode, ToggleContextPicker, ToggleNavigationMenu, ToggleOptionsMenu,
+   |     ^^^^^^^^^^^^^^^^
+...
+23 |     thread_history::{HistoryEntryElement, ThreadHistory},
+   |                      ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ThreadSummary`
+  --> crates/agent_ui/src/agent_panel.rs:27:49
+   |
+27 |     Thread, ThreadError, ThreadEvent, ThreadId, ThreadSummary, TokenUsageRatio,
+   |                                                 ^^^^^^^^^^^^^
+
+warning: unused import: `ContextSummary`
+  --> crates/agent_ui/src/agent_panel.rs:34:57
+   |
+34 | use assistant_context::{AssistantContext, ContextEvent, ContextSummary};
+   |                                                         ^^^^^^^^^^^^^^
+
+warning: unused import: `zed_urls`
+  --> crates/agent_ui/src/agent_panel.rs:37:25
+   |
+37 | use client::{UserStore, zed_urls};
+   |                         ^^^^^^^^
+
+warning: unused import: `UsageLimit`
+  --> crates/agent_ui/src/agent_panel.rs:38:42
+   |
+38 | use cloud_llm_client::{CompletionIntent, UsageLimit};
+   |                                          ^^^^^^^^^^
+
+warning: unused imports: `Corner`, `DismissEvent`, `linear_color_stop`, and `linear_gradient`
+  --> crates/agent_ui/src/agent_panel.rs:43:5
+   |
+43 |     Corner, DismissEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
+   |     ^^^^^^  ^^^^^^^^^^^^
+44 |     KeyContext, Pixels, Subscription, Task, UpdateGlobal, WeakEntity, linear_color_stop,
+   |                                                                       ^^^^^^^^^^^^^^^^^
+45 |     linear_gradient, prelude::*, pulsating_between,
+   |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `ZED_CLOUD_PROVIDER_ID`
+  --> crates/agent_ui/src/agent_panel.rs:49:78
+   |
+49 |     ConfigurationError, LanguageModelProviderTosView, LanguageModelRegistry, ZED_CLOUD_PROVIDER_ID,
+   |                                                                              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `proto::Plan`
+  --> crates/agent_ui/src/agent_panel.rs:53:5
+   |
+53 | use proto::Plan;
+   |     ^^^^^^^^^^^
+
+warning: unused imports: `CheckboxWithLabel`, `PopoverMenu`, `ProgressBar`, `Tab`, `VectorName`, and `Vector`
+  --> crates/agent_ui/src/agent_panel.rs:61:13
+   |
+61 |     Banner, CheckboxWithLabel, ContextMenu, ElevationIndex, KeyBinding, PopoverMenu,
+   |             ^^^^^^^^^^^^^^^^^                                           ^^^^^^^^^^^
+62 |     PopoverMenuHandle, ProgressBar, Tab, Tooltip, Vector, VectorName, prelude::*,
+   |                        ^^^^^^^^^^^  ^^^           ^^^^^^  ^^^^^^^^^^
+
+warning: unused import: `tooltip_container`
+  --> crates/agent_ui/src/agent_settings_modal.rs:23:5
+   |
+23 |     tooltip_container,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `actions`
+ --> crates/agent_ui/src/language_model_selector.rs:7:84
+  |
+7 |     Action, AnyElement, App, BackgroundExecutor, DismissEvent, Subscription, Task, actions,
+  |                                                                                    ^^^^^^^
+
+warning: unused import: `proto::Plan`
+  --> crates/agent_ui/src/message_editor.rs:43:5
+   |
+43 | use proto::Plan;
+   |     ^^^^^^^^^^^
+
+warning: unused import: `Follow`
+   --> crates/agent_ui/src/message_editor.rs:314:71
+    |
+314 |     ActiveThread, AgentDiffPane, ChatWithFollow, ExpandMessageEditor, Follow, KeepAll,
+    |                                                                       ^^^^^^
+
+warning: unused variable: `window`
+   --> crates/agent_ui/src/agent_settings_modal.rs:636:36
+    |
+636 |     fn render_tools_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    |                                    ^^^^^^ help: if this is intentional, prefix it with an underscore: `_window`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused import: `StatefulInteractiveElement`
+  --> crates/agent_ui/src/message_editor.rs:62:50
+   |
+62 | use gpui::{AsyncApp, AsyncWindowContext, Corner, StatefulInteractiveElement as _};
+   |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `weak_panel`
+   --> crates/agent_ui/src/agent_panel.rs:620:13
+    |
+620 |         let weak_panel = weak_self.clone();
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_weak_panel`
+
+warning: unused variable: `cx`
+    --> crates/agent_ui/src/agent_panel.rs:1615:45
+     |
+1615 |     fn starts_open(&self, _window: &Window, cx: &App) -> bool {
+     |                                             ^^ help: if this is intentional, prefix it with an underscore: `_cx`
+
+warning: unused variable: `plan`
+    --> crates/agent_ui/src/agent_panel.rs:2661:61
+     |
+2661 |                     ThreadError::ModelRequestLimitReached { plan } => div().into_any(),
+     |                                                             ^^^^ help: try ignoring the field: `plan: _`
+
+warning: unused variable: `can_enable_burn_mode`
+    --> crates/agent_ui/src/agent_panel.rs:2667:25
+     |
+2667 |                         can_enable_burn_mode,
+     |                         ^^^^^^^^^^^^^^^^^^^^ help: try ignoring the field: `can_enable_burn_mode: _`
+
+warning: unused variable: `this`
+  --> crates/agent_ui/src/agent_settings_modal.rs:88:19
+   |
+88 |             move |this, cx| {
+   |                   ^^^^ help: if this is intentional, prefix it with an underscore: `_this`
+
+warning: unused variable: `cx`
+  --> crates/agent_ui/src/agent_settings_modal.rs:88:25
+   |
+88 |             move |this, cx| {
+   |                         ^^ help: if this is intentional, prefix it with an underscore: `_cx`
+
+warning: unused variable: `assistant_message_id`
+   --> crates/agent_ui/src/message_editor.rs:822:17
+    |
+822 |             let assistant_message_id = thread.insert_assistant_message(vec![], cx);
+    |                 ^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_assistant_message_id`
+
+warning: unused variable: `settings`
+   --> crates/agent_ui/src/profile_selector.rs:107:9
+    |
+107 |         settings: &AgentSettings,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_settings`
+
+warning: field `change_title_editor` is never read
+   --> crates/agent_ui/src/agent_panel.rs:181:9
+    |
+180 |     Thread {
+    |     ------ field in this variant
+181 |         change_title_editor: Entity<Editor>,
+    |         ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: field `title_editor` is never read
+   --> crates/agent_ui/src/agent_panel.rs:187:9
+    |
+185 |     TextThread {
+    |     ---------- field in this variant
+186 |         context_editor: Entity<TextThreadEditor>,
+187 |         title_editor: Entity<Editor>,
+    |         ^^^^^^^^^^^^
+
+warning: fields `hovered_recent_history_item`, `assistant_navigation_menu`, and `hide_upsell` are never read
+   --> crates/agent_ui/src/agent_panel.rs:388:5
+    |
+367 | pub struct AgentPanel {
+    |            ---------- fields in this struct
+...
+388 |     hovered_recent_history_item: Option<usize>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+391 |     assistant_navigation_menu: Option<Entity<ContextMenu>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+396 |     hide_upsell: bool,
+    |     ^^^^^^^^^^^
+
+warning: associated items `toggle_burn_mode` and `populate_recently_opened_menu_section` are never used
+    --> crates/agent_ui/src/agent_panel.rs:1356:8
+     |
+399  | impl AgentPanel {
+     | --------------- associated items in this implementation
+...
+1356 |     fn toggle_burn_mode(
+     |        ^^^^^^^^^^^^^^^^
+...
+1450 |     fn populate_recently_opened_menu_section(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `render_token_count` is never used
+    --> crates/agent_ui/src/agent_panel.rs:1856:8
+     |
+1630 | impl AgentPanel {
+     | --------------- method in this implementation
+...
+1856 |     fn render_token_count(&self, thread: &Thread, cx: &App) -> Option<AnyElement> {
+     |        ^^^^^^^^^^^^^^^^^^
+
+warning: field `navigation_state` is never read
+  --> crates/agent_ui/src/canvas_pane.rs:18:5
+   |
+13 | pub struct CanvasPane {
+   |            ---------- field in this struct
+...
+18 |     navigation_state: Entity<NavigationState>,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: field `workspace` is never read
+  --> crates/agent_ui/src/message_editor.rs:68:5
+   |
+65 | struct DirBrowser {
+   |        ---------- field in this struct
+...
+68 |     workspace: WeakEntity<Workspace>,
+   |     ^^^^^^^^^
+
+warning: method `is_editor_fully_empty` is never used
+   --> crates/agent_ui/src/message_editor.rs:695:12
+    |
+412 | impl MessageEditor {
+    | ------------------ method in this implementation
+...
+695 |     pub fn is_editor_fully_empty(&self, cx: &App) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ContextEditorToolbarItem` is never constructed
+    --> crates/agent_ui/src/text_thread_editor.rs:2970:12
+     |
+2970 | pub struct ContextEditorToolbarItem {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ContextEditorToolbarItemEvent` is never used
+    --> crates/agent_ui/src/text_thread_editor.rs:3061:10
+     |
+3061 | pub enum ContextEditorToolbarItemEvent {
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `agent_ui` (lib) generated 34 warnings (run `cargo fix --lib -p agent_ui` to apply 14 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.65s

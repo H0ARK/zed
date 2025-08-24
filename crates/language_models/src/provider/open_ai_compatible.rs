@@ -2,9 +2,9 @@ use anyhow::{Context as _, Result, anyhow};
 use credentials_provider::CredentialsProvider;
 
 use convert_case::{Case, Casing};
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{AsyncReadExt, FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, Subscription, Task, Window};
-use http_client::HttpClient;
+use http_client::{AsyncBody, HttpClient, http};
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
@@ -53,6 +53,7 @@ pub struct State {
     api_key: Option<String>,
     api_key_from_env: bool,
     settings: OpenAiCompatibleSettings,
+    available_models: Vec<AvailableModel>,
     _subscription: Subscription,
 }
 
@@ -138,6 +139,7 @@ impl OpenAiCompatibleLanguageModelProvider {
             settings: resolve_settings(&id, cx).cloned().unwrap_or_default(),
             api_key: None,
             api_key_from_env: false,
+            available_models: Vec::new(),
             _subscription: cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
                 let Some(settings) = resolve_settings(&this.id, cx) else {
                     return;
@@ -192,12 +194,7 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
-            .settings
-            .available_models
-            .first()
-            .map(|model| self.create_language_model(model.clone()))
+        self.provided_models(cx).into_iter().next()
     }
 
     fn default_fast_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
@@ -205,12 +202,26 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
-            .settings
-            .available_models
-            .iter()
-            .map(|model| self.create_language_model(model.clone()))
+        let state = self.state.read(cx);
+        // Start from fetched models if available, otherwise settings
+        let mut models = if !state.available_models.is_empty() {
+            state.available_models.clone()
+        } else {
+            state.settings.available_models.clone()
+        };
+        // If we have both, overlay settings entries by name
+        if !state.settings.available_models.is_empty() && !state.available_models.is_empty() {
+            for sm in &state.settings.available_models {
+                if let Some(pos) = models.iter().position(|m| m.name == sm.name) {
+                    models[pos] = sm.clone();
+                } else {
+                    models.push(sm.clone());
+                }
+            }
+        }
+        models
+            .into_iter()
+            .map(|model| self.create_language_model(model))
             .collect()
     }
 
@@ -219,7 +230,148 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        let state = self.state.clone();
+        let http_client = self.http_client.clone();
+        cx.spawn(async move |cx| {
+            // Perform authentication
+            let auth_result = cx
+                .update_entity(&state, |state, cx| state.authenticate(cx))?
+                .await;
+            if auth_result.is_ok() {
+                // If no models are configured in settings, try to fetch from the API
+                let (api_url, should_fetch, api_key) = match cx.read_entity(&state, |s, _| {
+                    (
+                        s.settings.api_url.clone(),
+                        s.settings.available_models.is_empty(),
+                        s.api_key.clone(),
+                    )
+                }) {
+                    Ok(vals) => vals,
+                    Err(_) => return auth_result,
+                };
+                if should_fetch {
+                    if let Some(api_key) = api_key {
+                        let base = api_url.trim_end_matches('/');
+                        let url = if base.ends_with("/v1") {
+                            format!("{}/models", base)
+                        } else {
+                            format!("{}/v1/models", base)
+                        };
+                        let request = http::Request::builder()
+                            .uri(url)
+                            .method(http::Method::GET)
+                            .header("Authorization", format!("Bearer {}", api_key))
+                            .body(AsyncBody::empty())
+                            .map_err(|e| anyhow!(e))?;
+                        if let Ok(mut response) = http_client.send(request).await {
+                            if response.status().is_success() {
+                                let mut body = Vec::new();
+                                response.body_mut().read_to_end(&mut body).await.ok();
+
+                                if let Ok(value) =
+                                    serde_json::from_slice::<serde_json::Value>(&body)
+                                {
+                                    let arr = if let Some(a) =
+                                        value.get("data").and_then(|d| d.as_array())
+                                    {
+                                        a.clone()
+                                    } else if let Some(a) =
+                                        value.get("models").and_then(|d| d.as_array())
+                                    {
+                                        a.clone()
+                                    } else if let Some(a) = value.as_array() {
+                                        a.clone()
+                                    } else {
+                                        Vec::new()
+                                    };
+
+                                    let models = arr
+                                        .into_iter()
+                                        .filter_map(|item| {
+                                            let id = item
+                                                .get("id")
+                                                .or_else(|| item.get("name"))
+                                                .and_then(|s| s.as_str())?
+                                                .to_string();
+
+                                            // Extract numeric value from top-level key or stringified number
+                                            let get_num = |k: &str| {
+                                                item.get(k).and_then(|v| v.as_u64()).or_else(|| {
+                                                    item.get(k).and_then(|v| {
+                                                        v.as_str().and_then(|s| s.parse::<u64>().ok())
+                                                    })
+                                                })
+                                            };
+                                            // Extract numeric value from nested object keys like "limits" or "token_limits"
+                                            let nested_num = |parent: &str, key: &str| {
+                                                item.get(parent)
+                                                    .and_then(|o| o.get(key))
+                                                    .and_then(|v| v.as_u64())
+                                                    .or_else(|| {
+                                                        item.get(parent).and_then(|o| {
+                                                            o.get(key).and_then(|v| {
+                                                                v.as_str().and_then(|s| s.parse::<u64>().ok())
+                                                            })
+                                                        })
+                                                    })
+                                            };
+
+                                            // Prefer provider-supplied limits; only fallback to default if nothing is present
+                                            let max_tokens_opt = get_num("max_tokens")
+                                                .or(get_num("context_window"))
+                                                .or(get_num("context_length"))
+                                                .or(get_num("max_context_tokens"))
+                                                .or(nested_num("limits", "context"))
+                                                .or(nested_num("limits", "max_context"))
+                                                .or(nested_num("token_limits", "context"))
+                                                .or(nested_num("token_limits", "max_context"));
+
+                                            let max_output_tokens = get_num("max_output_tokens")
+                                                .or(get_num("output_token_limit"))
+                                                .or(nested_num("limits", "output"))
+                                                .or(nested_num("limits", "completion"))
+                                                .or(nested_num("token_limits", "output"))
+                                                .or(nested_num("token_limits", "completion"));
+
+                                            let max_completion_tokens = get_num("max_completion_tokens")
+                                                .or(get_num("input_token_limit"))
+                                                .or(nested_num("limits", "input"))
+                                                .or(nested_num("limits", "prompt"))
+                                                .or(nested_num("token_limits", "input"))
+                                                .or(nested_num("token_limits", "prompt"));
+
+                                            let max_tokens = max_tokens_opt.unwrap_or(200_000);
+
+                                            log::debug!(
+                                                "OpenAI-compatible /v1/models: id={} max_tokens={} max_completion_tokens={:?} max_output_tokens={:?}",
+                                                id,
+                                                max_tokens,
+                                                max_completion_tokens,
+                                                max_output_tokens
+                                            );
+
+                                            Some(AvailableModel {
+                                                name: id,
+                                                display_name: None,
+                                                max_tokens,
+                                                max_output_tokens,
+                                                max_completion_tokens,
+                                            })
+                                        })
+                                        .collect::<Vec<_>>();
+
+                                    let _ = cx.update_entity(&state, |s, cx| {
+                                        s.available_models = models;
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            auth_result
+        })
     }
 
     fn configuration_view(&self, window: &mut Window, cx: &mut App) -> AnyView {

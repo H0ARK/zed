@@ -7,12 +7,12 @@ use std::time::Duration;
 use db::kvp::{Dismissable, KEY_VALUE_STORE};
 use serde::{Deserialize, Serialize};
 
-use zed_actions::agent::ToggleModelSelector;
 use crate::{
     AddContextServer, AgentDiffPane, ContinueThread, ContinueWithBurnMode,
     DeleteRecentlyOpenThread, ExpandMessageEditor, Follow, InlineAssistant, NewTextThread,
-    NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell,
-    ResetTrialUpsell, ToggleBurnMode, ToggleContextPicker, ToggleNavigationMenu, ToggleOptionsMenu,
+    NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, OpenSettingsModal,
+    ResetTrialEndUpsell, ResetTrialUpsell, ToggleBurnMode, ToggleContextPicker,
+    ToggleNavigationMenu, ToggleOptionsMenu,
     active_thread::{self, ActiveThread, ActiveThreadEvent},
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     agent_diff::AgentDiff,
@@ -36,6 +36,7 @@ use assistant_context::{AssistantContext, ContextEvent, ContextSummary};
 use assistant_slash_command::SlashCommandWorkingSet;
 use assistant_tool::ToolWorkingSet;
 use client::{UserStore, zed_urls};
+use cloud_llm_client::{CompletionIntent, UsageLimit};
 use editor::{Anchor, AnchorRangeExt as _, Editor, EditorEvent, MultiBuffer};
 use fs::Fs;
 use gpui::{
@@ -66,12 +67,12 @@ use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, ToggleZoom, ToolbarItemView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
+use zed_actions::agent::ToggleModelSelector;
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
-    agent::{OpenSettings, OpenOnboardingModal, ResetOnboarding},
+    agent::{OpenOnboardingModal, OpenSettings, ResetOnboarding},
     assistant::{OpenRulesLibrary, ToggleFocus},
 };
-use cloud_llm_client::{CompletionIntent, UsageLimit};
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
 
@@ -99,7 +100,13 @@ pub fn init(cx: &mut App) {
                 .register_action(|workspace, _: &OpenSettings, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
-                        panel.update(cx, |panel, cx| panel.open_configuration(window, cx));
+                        panel.update(cx, |panel, cx| panel.open_settings_modal(window, cx));
+                    }
+                })
+                .register_action(|workspace, _: &OpenSettingsModal, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| panel.open_settings_modal(window, cx));
                     }
                 })
                 .register_action(|workspace, _: &NewTextThread, window, cx| {
@@ -159,12 +166,12 @@ pub fn init(cx: &mut App) {
                     window.dispatch_action(workspace::RestoreBanner.boxed_clone(), cx);
                     window.refresh();
                 });
-                // .register_action(|_workspace, _: &ResetTrialUpsell, _window, cx| {
-                //     Upsell::set_dismissed(false, cx);
-                // })
-                // .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
-                //     TrialEndUpsell::set_dismissed(false, cx);
-                // });
+            // .register_action(|_workspace, _: &ResetTrialUpsell, _window, cx| {
+            //     Upsell::set_dismissed(false, cx);
+            // })
+            // .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
+            //     TrialEndUpsell::set_dismissed(false, cx);
+            // });
         },
     )
     .detach();
@@ -358,6 +365,12 @@ impl ActiveView {
     }
 }
 
+struct EmbeddedFile {
+    project_path: ProjectPath,
+    editor: Entity<Editor>,
+    buffer: Entity<MultiBuffer>,
+}
+
 pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     user_store: Entity<UserStore>,
@@ -388,6 +401,10 @@ pub struct AgentPanel {
     zoomed: bool,
     pending_serialization: Option<Task<Result<()>>>,
     hide_upsell: bool,
+    // Embedded file support
+    embedded_file: Option<EmbeddedFile>,
+    embedded_layout_ratio: f32,
+    embed_file_opens: bool,
 }
 
 impl AgentPanel {
@@ -560,7 +577,9 @@ impl AgentPanel {
             DefaultView::TextThread => {
                 let context =
                     context_store.update(cx, |context_store, cx| context_store.create(cx));
-                let lsp_adapter_delegate = make_lsp_adapter_delegate(&project.clone(), cx).unwrap();
+                let lsp_adapter_delegate = make_lsp_adapter_delegate(&project.clone(), cx)
+                    .log_err()
+                    .unwrap_or(None);
                 let context_editor = cx.new(|cx| {
                     let mut editor = TextThreadEditor::for_context(
                         context,
@@ -681,7 +700,7 @@ impl AgentPanel {
             local_timezone: UtcOffset::from_whole_seconds(
                 chrono::Local::now().offset().local_minus_utc(),
             )
-            .unwrap(),
+            .unwrap_or_else(|_| time::UtcOffset::UTC),
             inline_assist_context_store,
             previous_view: None,
             history_store: history_store.clone(),
@@ -695,6 +714,9 @@ impl AgentPanel {
             zoomed: false,
             pending_serialization: None,
             hide_upsell: false,
+            embedded_file: None,
+            embedded_layout_ratio: 0.5,
+            embed_file_opens: true,
         }
     }
 
@@ -1229,6 +1251,34 @@ impl AgentPanel {
         }
     }
 
+    pub(crate) fn open_settings_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::agent_settings_modal::AgentSettingsModal;
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let context_server_store = self.project.read(cx).context_server_store();
+        let tools = self.thread_store.read(cx).tools();
+        let fs = self.fs.clone();
+        let language_registry = self.language_registry.clone();
+        let workspace_weak = self.workspace.clone();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                AgentSettingsModal::new(
+                    fs,
+                    context_server_store,
+                    tools,
+                    language_registry,
+                    workspace_weak,
+                    window,
+                    cx,
+                )
+            })
+        });
+    }
+
     pub(crate) fn open_active_thread_as_markdown(
         &mut self,
         _: &OpenActiveThreadAsMarkdown,
@@ -1580,7 +1630,7 @@ impl Panel for AgentPanel {
 
     fn starts_open(&self, _window: &Window, cx: &App) -> bool {
         // Make the agent panel start open by default to serve as the primary interface
-        self.enabled(cx)
+        false //self.enabled(cx)
     }
 
     fn is_zoomed(&self, _window: &Window, _cx: &App) -> bool {
@@ -1740,43 +1790,43 @@ impl AgentPanel {
     //             }),
     //     );
 
-        // let recent_entries_menu = div().child(
-        //     PopoverMenu::new("agent-nav-menu")
-        //         .trigger_with_tooltip(
-        //             IconButton::new("agent-nav-menu", IconName::MenuAlt)
-        //                 .icon_size(IconSize::Small)
-        //                 .style(ui::ButtonStyle::Subtle),
-        //             {
-        //                 let focus_handle = focus_handle.clone();
-        //                 move |window, cx| {
-        //                     Tooltip::for_action_in(
-        //                         "Toggle Panel Menu",
-        //                         &ToggleNavigationMenu,
-        //                         &focus_handle,
-        //                         window,
-        //                         cx,
-        //                     )
-        //                 }
-        //             },
-        //         )
-        //         .anchor(Corner::TopLeft)
-        //         .with_handle(self.assistant_navigation_menu_handle.clone())
-        //         .menu({
-        //             let menu = self.assistant_navigation_menu.clone();
-        //             move |window, cx| {
-        //                 if let Some(menu) = menu.as_ref() {
-        //                     menu.update(cx, |_, cx| {
-        //                         cx.defer_in(window, |menu, window, cx| {
-        //                             menu.rebuild(window, cx);
-        //                         });
-        //                     });
-        //                 }
-        //                 menu.clone()
-        //             }
-        //         }),
-        // );
+    // let recent_entries_menu = div().child(
+    //     PopoverMenu::new("agent-nav-menu")
+    //         .trigger_with_tooltip(
+    //             IconButton::new("agent-nav-menu", IconName::MenuAlt)
+    //                 .icon_size(IconSize::Small)
+    //                 .style(ui::ButtonStyle::Subtle),
+    //             {
+    //                 let focus_handle = focus_handle.clone();
+    //                 move |window, cx| {
+    //                     Tooltip::for_action_in(
+    //                         "Toggle Panel Menu",
+    //                         &ToggleNavigationMenu,
+    //                         &focus_handle,
+    //                         window,
+    //                         cx,
+    //                     )
+    //                 }
+    //             },
+    //         )
+    //         .anchor(Corner::TopLeft)
+    //         .with_handle(self.assistant_navigation_menu_handle.clone())
+    //         .menu({
+    //             let menu = self.assistant_navigation_menu.clone();
+    //             move |window, cx| {
+    //                 if let Some(menu) = menu.as_ref() {
+    //                     menu.update(cx, |_, cx| {
+    //                         cx.defer_in(window, |menu, window, cx| {
+    //                             menu.rebuild(window, cx);
+    //                         });
+    //                     });
+    //                 }
+    //                 menu.clone()
+    //             }
+    //         }),
+    // );
 
-        // No toolbar options menu here; the consolidated menu is positioned in the content area.
+    // No toolbar options menu here; the consolidated menu is positioned in the content area.
 
     //     h_flex()
     //         .id("assistant-toolbar")
@@ -2383,10 +2433,7 @@ impl AgentPanel {
                                             cx,
                                         ))
                                         .on_click(|_event, window, cx| {
-                                            window.dispatch_action(
-                                                OpenSettings.boxed_clone(),
-                                                cx,
-                                            )
+                                            window.dispatch_action(OpenSettings.boxed_clone(), cx)
                                         }),
                                 )
                         })
@@ -2413,10 +2460,7 @@ impl AgentPanel {
                                             cx,
                                         ))
                                         .on_click(|_event, window, cx| {
-                                            window.dispatch_action(
-                                                OpenSettings.boxed_clone(),
-                                                cx,
-                                            )
+                                            window.dispatch_action(OpenSettings.boxed_clone(), cx)
                                         }),
                                 ),
                             Some(ConfigurationError::ProviderPendingTermsAcceptance(provider)) => {
@@ -2518,10 +2562,7 @@ impl AgentPanel {
                                             .map(|kb| kb.size(rems_from_px(12.0))),
                                         )
                                         .on_click(|_event, window, cx| {
-                                            window.dispatch_action(
-                                                OpenSettings.boxed_clone(),
-                                                cx,
-                                            )
+                                            window.dispatch_action(OpenSettings.boxed_clone(), cx)
                                         }),
                                 ),
                         ),
@@ -2637,9 +2678,10 @@ impl AgentPanel {
                     ThreadError::Message { header, message } => {
                         self.render_error_message(header, message, cx)
                     }
-                    ThreadError::RetryableError { message, can_enable_burn_mode } => {
-                        self.render_error_message("Retryable Error".into(), message, cx)
-                    }
+                    ThreadError::RetryableError {
+                        message,
+                        can_enable_burn_mode,
+                    } => self.render_error_message("Retryable Error".into(), message, cx),
                 })
                 .into_any(),
         )
@@ -2963,6 +3005,86 @@ impl AgentPanel {
     }
 }
 
+impl AgentPanel {
+    pub fn open_embedded_file(
+        &mut self,
+        project_path: ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.embed_file_opens {
+            return;
+        }
+        if self
+            .embedded_file
+            .as_ref()
+            .is_some_and(|f| f.project_path == project_path)
+        {
+            return;
+        }
+        let buffer_task = self.project.update(cx, |project, cx| {
+            project.open_buffer(project_path.clone(), cx)
+        });
+        let project = self.project.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(buffer) = buffer_task.await.log_err() else { return anyhow::Ok(()); };
+            this.update_in(cx, |this, window, cx| {
+                // If the panel was closed or another embedded file was opened, abort.
+                if this
+                    .embedded_file
+                    .as_ref()
+                    .is_some_and(|f| f.project_path == project_path)
+                {
+                    return;
+                }
+                let multi = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+                let editor = cx.new(|cx| {
+                    Editor::for_multibuffer(multi.clone(), Some(project.clone()), window, cx)
+                });
+                this.embedded_file = Some(EmbeddedFile {
+                    project_path,
+                    editor,
+                    buffer: multi,
+                });
+                cx.notify();
+            })
+            .ok();
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
+    pub fn close_embedded_file(&mut self, cx: &mut Context<Self>) {
+        if self.embedded_file.is_some() {
+            self.embedded_file = None;
+            cx.notify();
+        }
+    }
+
+    pub fn pop_out_embedded_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(embedded) = self.embedded_file.take() else {
+            return;
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |ws, cx| {
+                ws.open_path(embedded.project_path.clone(), None, true, window, cx)
+                    .detach_and_log_err(cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn embedded_file_title(&self, _cx: &App) -> SharedString {
+        // Convert the file name to an owned String to avoid returning a reference tied to a shorter lifetime.
+        self.embedded_file
+            .as_ref()
+            .and_then(|f| f.project_path.path.file_name())
+            .map(|os| os.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "File".to_string())
+            .into()
+    }
+}
+
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // WARNING: Changes to this element hierarchy can have
@@ -2974,7 +3096,7 @@ impl Render for AgentPanel {
         // - Font size works as expected and can be changed with cmd-+/cmd-
         // - Scrolling in all views works as expected
         // - Files can be dropped into the panel
-        let content = v_flex()
+        let base_content = v_flex()
             .key_context(self.key_context())
             .justify_between()
             .size_full()
@@ -2986,7 +3108,7 @@ impl Render for AgentPanel {
                 this.open_history(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                this.open_configuration(window, cx);
+                this.open_settings_modal(window, cx);
             }))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
             .on_action(cx.listener(Self::deploy_rules_library))
@@ -3001,41 +3123,24 @@ impl Render for AgentPanel {
             .on_action(cx.listener(|this, _: &ContinueThread, window, cx| {
                 this.continue_conversation(window, cx);
             }))
-            // .on_action(cx.listener(|this, _: &ContinueWithBurnMode, window, cx| {
-            //     this.thread.update(cx, |active_thread, cx| {
-            //         active_thread.thread().update(cx, |thread, _cx| {
-            //             thread.set_completion_mode(CompletionMode::Burn);
-            //         });
-            //     });
-            //     this.continue_conversation(window, cx);
-            // }))
-            // .on_action(cx.listener(Self::toggle_burn_mode))
-            // .child(self.render_toolbar(window, cx))
-            // .children(self.render_upsell(window, cx))
-            // .children(self.render_trial_end_upsell(window, cx))
             .map(|parent| match &self.active_view {
                 ActiveView::Thread { .. } => parent
                     .relative()
                     .child(self.render_active_thread_or_empty_state(window, cx))
                     .children(self.render_tool_use_limit_reached(window, cx))
-                    // Absolute-positioned consolidated options menu in the top-right
                     .child(
-                        h_flex()
-                            .w_full()
-                            .px_1()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex_none()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .bg(cx.theme().colors().panel_background)
-                                    .mb_1()
-                                    // Allow card to grow but keep default compact
-                                    .max_h(vh(0.3, window))
-                                    .child(self.message_editor.clone()),
-                            ),
+                        h_flex().w_full().px_1().child(
+                            div()
+                                .w_full()
+                                .flex_none()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().panel_background)
+                                .mb_1()
+                                .max_h(vh(0.3, window))
+                                .child(self.message_editor.clone()),
+                        ),
                     )
                     .children(self.render_last_error(cx))
                     .child(self.render_drag_target(cx)),
@@ -3053,14 +3158,88 @@ impl Render for AgentPanel {
                 ActiveView::Configuration => parent.children(self.configuration.clone()),
             });
 
+        let content_with_embed = if let Some(embedded) = &self.embedded_file {
+            // Split layout: main agent UI (flex_grow) + embedded editor section
+            v_flex()
+                .size_full()
+                .child(base_content.flex_grow())
+                .child(
+                    v_flex()
+                        .border_t_1()
+                        .bg(cx.theme().colors().editor_background)
+                        .h(px((window.viewport_size().height.0
+                            * self.embedded_layout_ratio)
+                            .max(100.0)))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .px_2()
+                                .py_1()
+                                .gap_2()
+                                .bg(cx.theme().colors().panel_background)
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border)
+                                .child(
+                                    Label::new(self.embedded_file_title(cx))
+                                        .weight(FontWeight::BOLD),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            ui::Button::new(
+                                                "pop-out-embedded-file",
+                                                "Open in Tab",
+                                            )
+                                            .style(ui::ButtonStyle::Subtle)
+                                            .on_click(
+                                                cx.listener(|this, _e, window, cx| {
+                                                    this.pop_out_embedded_file(window, cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            ui::Button::new("close-embedded-file", "Close")
+                                                .style(ui::ButtonStyle::Subtle)
+                                                .on_click(cx.listener(|this, _e, _window, cx| {
+                                                    this.close_embedded_file(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            ui::Button::new(
+                                                "toggle-embed-file-opens",
+                                                if self.embed_file_opens {
+                                                    "Detach Opens"
+                                                } else {
+                                                    "Embed Opens"
+                                                },
+                                            )
+                                            .style(ui::ButtonStyle::Subtle)
+                                            .on_click(
+                                                cx.listener(|this, _e, _window, cx| {
+                                                    this.embed_file_opens = !this.embed_file_opens;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                        )
+                        .child(embedded.editor.clone()),
+                )
+                .into_any()
+        } else {
+            base_content.into_any()
+        };
+
         match self.active_view.which_font_size_used() {
             WhichFontSize::AgentFont => {
                 WithRemSize::new(ThemeSettings::get_global(cx).agent_font_size(cx))
                     .size_full()
-                    .child(content)
+                    .child(content_with_embed)
                     .into_any()
             }
-            _ => content.into_any(),
+            _ => content_with_embed,
         }
     }
 }
