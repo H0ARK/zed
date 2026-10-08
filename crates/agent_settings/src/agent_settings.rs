@@ -237,6 +237,7 @@ pub struct AgentSettings {
     pub prevent_idle_sleep: bool,
     pub single_file_review: bool,
     pub model_parameters: Vec<LanguageModelParameters>,
+    pub infinite_context: bool,
     pub auto_compact: AutoCompactSettings,
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
@@ -822,6 +823,7 @@ impl Settings for AgentSettings {
             prevent_idle_sleep: agent.prevent_idle_sleep.unwrap(),
             single_file_review: agent.single_file_review.unwrap(),
             model_parameters: agent.model_parameters,
+            infinite_context: agent.infinite_context.unwrap_or(false),
             auto_compact: {
                 let auto_compact = agent.auto_compact.unwrap();
                 let threshold = parse_auto_compact_threshold(&auto_compact.threshold.unwrap().0)

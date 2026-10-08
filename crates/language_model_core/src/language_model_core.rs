@@ -65,6 +65,8 @@ pub enum LanguageModelCompletionEvent {
     },
     ReasoningDetails(serde_json::Value),
     UsageUpdate(TokenUsage),
+    /// An absolute provider-reported request snapshot, not an additional token charge.
+    CacheUsageUpdate(LanguageModelCacheUsage),
     Compaction(CompactionUpdate),
 }
 
@@ -522,6 +524,19 @@ pub enum StopReason {
     Refusal,
 }
 
+/// Provider-reported prompt cache measurement for a single request.
+///
+/// Updates replace the previous snapshot. Missing cache counters produce no
+/// measurement; a reported zero is a known cache miss. These tokens are already
+/// included in `TokenUsage` and must not be added to its totals.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+pub struct LanguageModelCacheUsage {
+    /// Total input tokens, including cache reads and writes.
+    pub input_tokens: u64,
+    /// Input tokens read from the prompt cache.
+    pub cached_tokens: u64,
+}
+
 #[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
     #[serde(default, skip_serializing_if = "is_default")]
@@ -851,6 +866,34 @@ impl ReasoningEffort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_usage_event_round_trips_without_becoming_token_usage() -> Result<()> {
+        for cached_tokens in [0, 60] {
+            let event = LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                input_tokens: 100,
+                cached_tokens,
+            });
+            let serialized = serde_json::to_value(&event)?;
+            assert_eq!(
+                serialized,
+                serde_json::json!({
+                    "CacheUsageUpdate": {"input_tokens": 100, "cached_tokens": cached_tokens}
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<LanguageModelCompletionEvent>(serialized)?,
+                event
+            );
+        }
+        for unknown in [
+            serde_json::json!({"input_tokens": 100}),
+            serde_json::json!({"input_tokens": 100, "cached_tokens": null}),
+        ] {
+            assert!(serde_json::from_value::<LanguageModelCacheUsage>(unknown).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_from_cloud_failure_with_upstream_http_error() {

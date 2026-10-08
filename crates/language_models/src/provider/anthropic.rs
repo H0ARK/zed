@@ -10,11 +10,11 @@ use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME, ApiKeyConfiguration, ApiKeyState,
     AuthenticateError, CompactionResult, EnvVar, FastModeConfirmation, IconOrSvg, LanguageModel,
-    LanguageModelClient, LanguageModelCompletionError, LanguageModelCompletionStream,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoiceSupport, ModelRateLimiters, ProviderSettingsView, env_var,
-    unavailable_error,
+    LanguageModelCacheUsage, LanguageModelClient, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelCompletionStream, LanguageModelId,
+    LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoiceSupport,
+    ModelRateLimiters, ProviderSettingsView, TokenUsage, env_var, unavailable_error,
 };
 use settings::{Settings, SettingsStore};
 use std::sync::{Arc, LazyLock};
@@ -399,7 +399,7 @@ impl LanguageModelClient for AnthropicLanguageModelProvider {
         let executor = cx.background_executor().clone();
         let future = request_limiter.stream(async move {
             let response = request.await?;
-            let events = AnthropicEventMapper::new(PROVIDER_NAME, PROVIDER_ID).map_stream(response);
+            let events = map_anthropic_events(response);
             Ok(language_model::stream_in_background(
                 events.boxed(),
                 executor,
@@ -514,6 +514,84 @@ impl LanguageModelClient for AnthropicLanguageModelProvider {
     }
 }
 
+#[derive(Default)]
+struct AnthropicCacheUsageState {
+    input_tokens_reported: bool,
+    cached_tokens_reported: bool,
+    iterations_reported: Option<bool>,
+}
+
+impl AnthropicCacheUsageState {
+    fn update(&mut self, usage: &anthropic::Usage) {
+        self.input_tokens_reported |= usage.input_tokens.is_some();
+        self.cached_tokens_reported |= usage.cache_read_input_tokens.is_some();
+        if let Some(iterations) = usage.iterations.as_ref() {
+            // The mapper replaces top-level accounting with iteration totals.
+            // Do not claim those totals are measured if any iteration is unknown.
+            self.iterations_reported = Some(
+                !iterations.is_empty()
+                    && iterations.iter().all(|iteration| {
+                        iteration.input_tokens.is_some()
+                            && iteration.cache_read_input_tokens.is_some()
+                    }),
+            );
+        }
+    }
+
+    fn measurement(&self, usage: TokenUsage) -> Option<LanguageModelCacheUsage> {
+        self.iterations_reported
+            .unwrap_or(self.input_tokens_reported && self.cached_tokens_reported)
+            .then(|| LanguageModelCacheUsage {
+                input_tokens: usage
+                    .input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens)
+                    .saturating_add(usage.cache_read_input_tokens),
+                cached_tokens: usage.cache_read_input_tokens,
+            })
+    }
+}
+
+fn map_anthropic_events(
+    events: BoxStream<'static, Result<anthropic::Event, AnthropicError>>,
+) -> LanguageModelCompletionStream {
+    let mut mapper = AnthropicEventMapper::new(PROVIDER_NAME, PROVIDER_ID);
+    let mut cache_usage = AnthropicCacheUsageState::default();
+    events
+        .flat_map(move |event| {
+            let mapped = match event {
+                Ok(event) => {
+                    match &event {
+                        anthropic::Event::MessageStart { message } => {
+                            cache_usage = AnthropicCacheUsageState::default();
+                            cache_usage.update(&message.usage);
+                        }
+                        anthropic::Event::MessageDelta { usage, .. } => cache_usage.update(usage),
+                        _ => {}
+                    }
+                    mapper.map_event(event)
+                }
+                Err(error) => vec![Err(error.into())],
+            };
+            let mut events = Vec::new();
+            for event in mapped {
+                let measurement = match &event {
+                    Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
+                        cache_usage.measurement(*usage)
+                    }
+                    _ => None,
+                };
+                events.push(event);
+                if let Some(measurement) = measurement {
+                    events.push(Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                        measurement,
+                    )));
+                }
+            }
+            futures::stream::iter(events)
+        })
+        .boxed()
+}
+
 /// Pick the model from `models` whose id starts with the earliest matching
 /// prefix in `preferred_prefixes`. Within a single prefix bucket the model
 /// with the lexicographically greatest id wins, which roughly corresponds to
@@ -606,6 +684,157 @@ mod tests {
     use language_model::{LanguageModelRequestMessage, MessageContent};
     use serde_json::json;
     use std::sync::Mutex;
+
+    fn map_anthropic_fixture_events(
+        events: Vec<serde_json::Value>,
+    ) -> Result<Vec<LanguageModelCompletionEvent>> {
+        let events = events
+            .into_iter()
+            .map(serde_json::from_value::<anthropic::Event>)
+            .collect::<Result<Vec<_>, _>>()?;
+        futures::executor::block_on(
+            map_anthropic_events(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
+    fn message_start_fixture(usage: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_test", "type": "message", "role": "assistant",
+                "content": [], "model": "claude-opus-4-7",
+                "stop_reason": null, "stop_sequence": null, "usage": usage
+            }
+        })
+    }
+
+    #[test]
+    fn cache_measurement_requires_reported_cache_reads() -> Result<()> {
+        for usage in [
+            json!({"input_tokens": 40}),
+            json!({"input_tokens": 40, "cache_read_input_tokens": null}),
+            json!({"input_tokens": 40, "cache_creation_input_tokens": 10}),
+            json!({"input_tokens": null, "cache_read_input_tokens": 0}),
+        ] {
+            let events = map_anthropic_fixture_events(vec![message_start_fixture(usage)])?;
+            assert!(!events.iter().any(|event| {
+                matches!(event, LanguageModelCompletionEvent::CacheUsageUpdate(_))
+            }));
+        }
+        for cached_tokens in [0, 60] {
+            let events = map_anthropic_fixture_events(vec![message_start_fixture(json!({
+                "input_tokens": 40, "output_tokens": 1,
+                "cache_creation_input_tokens": 10, "cache_read_input_tokens": cached_tokens
+            }))])?;
+            assert!(
+                events.contains(&LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 10,
+                    cache_read_input_tokens: cached_tokens,
+                }))
+            );
+            assert!(
+                events.contains(&LanguageModelCompletionEvent::CacheUsageUpdate(
+                    LanguageModelCacheUsage {
+                        input_tokens: 50 + cached_tokens,
+                        cached_tokens
+                    }
+                ))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_measurement_updates_are_absolute_across_sparse_deltas() -> Result<()> {
+        let events = map_anthropic_fixture_events(vec![
+            message_start_fixture(json!({
+                "input_tokens": 40, "output_tokens": 1,
+                "cache_creation_input_tokens": 10, "cache_read_input_tokens": 60
+            })),
+            json!({"type": "message_delta", "delta": {"stop_reason": null},
+                "usage": {"output_tokens": 7}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 100, "cache_read_input_tokens": 0}}),
+            json!({"type": "message_stop"}),
+        ])?;
+        let measurements: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                LanguageModelCompletionEvent::CacheUsageUpdate(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            measurements,
+            vec![
+                LanguageModelCacheUsage {
+                    input_tokens: 110,
+                    cached_tokens: 60
+                },
+                LanguageModelCacheUsage {
+                    input_tokens: 110,
+                    cached_tokens: 60
+                },
+                LanguageModelCacheUsage {
+                    input_tokens: 110,
+                    cached_tokens: 0
+                },
+            ]
+        );
+        assert!(
+            events.contains(&LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 7,
+                cache_creation_input_tokens: 10,
+                cache_read_input_tokens: 0,
+            }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_measurement_respects_compaction_iteration_accounting() -> Result<()> {
+        for cached_tokens in [Some(60), Some(0), None] {
+            let events = map_anthropic_fixture_events(vec![
+                message_start_fixture(json!({"input_tokens": 40, "cache_read_input_tokens": 60})),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 0, "cache_read_input_tokens": 0, "iterations": [
+                    {"type": "compaction", "input_tokens": 40, "output_tokens": 3,
+                        "cache_creation_input_tokens": 10, "cache_read_input_tokens": cached_tokens},
+                    {"type": "message", "input_tokens": 20, "output_tokens": 7,
+                        "cache_read_input_tokens": 0}
+                ]}}),
+            ])?;
+            let final_events = events.iter().skip(3).collect::<Vec<_>>();
+            assert_eq!(
+                final_events.first(),
+                Some(&&LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                    input_tokens: 60,
+                    output_tokens: 10,
+                    cache_creation_input_tokens: 10,
+                    cache_read_input_tokens: cached_tokens.unwrap_or(0),
+                }))
+            );
+            let measurement = final_events.iter().find_map(|event| match event {
+                LanguageModelCompletionEvent::CacheUsageUpdate(usage) => Some(*usage),
+                _ => None,
+            });
+            assert_eq!(
+                measurement,
+                cached_tokens.map(|cached_tokens| LanguageModelCacheUsage {
+                    input_tokens: 70 + cached_tokens,
+                    cached_tokens,
+                })
+            );
+        }
+        Ok(())
+    }
 
     fn parse_available_model(json: &str) -> AvailableModel {
         serde_json::from_str(json).expect("test fixture should parse")

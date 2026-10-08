@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+mod cache_report;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -297,6 +298,8 @@ actions!(
         ToggleNewThreadMenu,
         /// Toggles the options menu for agent settings and preferences.
         ToggleOptionsMenu,
+        /// Estimates cache reuse by replaying a native thread locally without model or tool calls.
+        ReplayThreadCache,
         /// Toggles the profile or mode selector for switching between agent profiles.
         ToggleProfileSelector,
         /// Cycles through available session modes.
@@ -1081,6 +1084,7 @@ mod tests {
             commit_message_instructions: None,
             thread_summary_model: None,
             compaction_model: None,
+            infinite_context: false,
             inline_alternatives: vec![],
             favorite_models: vec![],
             default_profile: AgentProfileId::default(),

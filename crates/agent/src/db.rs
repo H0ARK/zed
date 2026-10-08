@@ -1,9 +1,10 @@
+use crate::infinite_context::LockedMemoryArchive;
 use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::AgentProfileId;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
 use futures::{FutureExt, future::Shared};
@@ -17,7 +18,11 @@ use sqlez::{
     connection::Connection,
     statement::Statement,
 };
-use std::{io::ErrorKind, path::PathBuf, sync::Arc};
+use std::{
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 use ui::{App, SharedString};
 use util::path_list::PathList;
 use zed_env_vars::ZED_STATELESS;
@@ -53,6 +58,14 @@ impl From<&DbThreadMetadata> for acp_thread::AgentSessionInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbThread {
+    #[serde(default)]
+    pub measured_cache_usage: crate::thread::MeasuredCacheUsage,
+    #[serde(default)]
+    pub infinite_context: bool,
+    #[serde(default)]
+    pub memory_archived: bool,
+    #[serde(default)]
+    pub memory_turn_start: Option<(usize, u64)>,
     pub title: SharedString,
     pub messages: Vec<Arc<DbMessage>>,
     pub updated_at: DateTime<Utc>,
@@ -153,6 +166,10 @@ impl SharedThread {
 
     pub fn to_db_thread(self) -> DbThread {
         DbThread {
+            measured_cache_usage: Default::default(),
+            infinite_context: false,
+            memory_archived: false,
+            memory_turn_start: None,
             title: format!("🔗 {}", self.title).into(),
             messages: self.messages,
             updated_at: self.updated_at,
@@ -335,6 +352,10 @@ impl DbThread {
         }
 
         Ok(Self {
+            infinite_context: false,
+            memory_archived: false,
+            memory_turn_start: None,
+            measured_cache_usage: Default::default(),
             title: thread.summary,
             messages,
             updated_at: thread.updated_at,
@@ -393,6 +414,9 @@ impl Column for DataType {
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
+    memory_archive_root: PathBuf,
+    #[cfg(any(feature = "test-support", test))]
+    _memory_archive_directory: tempfile::TempDir,
     /// In production, saves take real time (serialization, zstd, disk I/O) while
     /// the user keeps typing, so new save requests routinely arrive mid-write.
     /// The test executor completes writes instantly, so tests use this gate to
@@ -487,9 +511,19 @@ impl ThreadsDatabase {
             }
         }
 
+        #[cfg(any(feature = "test-support", test))]
+        let memory_archive_directory = tempfile::tempdir()?;
+        #[cfg(any(feature = "test-support", test))]
+        let memory_archive_root = memory_archive_directory.path().to_path_buf();
+        #[cfg(not(any(feature = "test-support", test)))]
+        let memory_archive_root = paths::data_dir().join("agent/infinite_context");
+
         let db = Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
+            memory_archive_root,
+            #[cfg(any(feature = "test-support", test))]
+            _memory_archive_directory: memory_archive_directory,
             #[cfg(test)]
             write_gate: Mutex::new(None),
             #[cfg(test)]
@@ -635,6 +669,30 @@ impl ThreadsDatabase {
         })
     }
 
+    pub fn load_thread_json(&self, id: acp::SessionId) -> Task<Result<Vec<u8>>> {
+        let connection = self.connection.clone();
+
+        self.executor.spawn(async move {
+            let (data_type, data) = {
+                let connection = connection.lock();
+                let mut select =
+                    connection.select_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
+                    SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
+                "})?;
+
+                select(id.0.clone())?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Thread {} not found", id.0))?
+            };
+
+            match data_type {
+                DataType::Json => Ok(data),
+                DataType::Zstd => Ok(zstd::decode_all(data.as_slice())?),
+            }
+        })
+    }
+
     pub fn save_thread(
         &self,
         id: acp::SessionId,
@@ -701,8 +759,58 @@ impl ThreadsDatabase {
         }
     }
 
+    fn lock_memory_archives(root: &Path, ids: &[Arc<str>]) -> Result<Vec<LockedMemoryArchive>> {
+        for id in ids {
+            let mut components = Path::new(id.as_ref()).components();
+            anyhow::ensure!(
+                matches!(components.next(), Some(Component::Normal(_)))
+                    && components.next().is_none(),
+                "Invalid session ID for memory archive deletion: {id}"
+            );
+        }
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("Create memory archive root {}", root.display()))?;
+        let mut archives = Vec::new();
+        for id in ids {
+            let path = root.join(id.as_ref());
+            // Even an uninitialized archive needs a tombstone to fence a worker
+            // that has not opened its journal yet.
+            match std::fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Create memory archive {}", path.display()));
+                }
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("Inspect memory archive {}", path.display()))?;
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "Memory archive is not a directory: {}",
+                path.display()
+            );
+            let archive = LockedMemoryArchive::lock(path.clone()).with_context(|| {
+                format!(
+                    "Cannot delete memory archive {}; close the thread and wait for memory work to finish before retrying",
+                    path.display()
+                )
+            })?;
+            archives.push(archive);
+        }
+        Ok(archives)
+    }
+
+    fn remove_memory_archives(archives: &[LockedMemoryArchive]) -> Result<()> {
+        for archive in archives {
+            archive.delete_payload()?;
+        }
+        Ok(())
+    }
+
     pub fn delete_thread(&self, id: acp::SessionId) -> Task<Result<()>> {
         let connection = self.connection.clone();
+        let memory_archive_root = self.memory_archive_root.clone();
 
         self.executor.spawn(async move {
             let sandboxed_terminal_temp_dirs = {
@@ -713,14 +821,14 @@ impl ThreadsDatabase {
                     SELECT id FROM threads WHERE parent_id = ?
                 "})?;
 
-                // Collect target thread together with all of its transitive
-                // subagent threads
                 let mut ids_to_delete = vec![id.0.clone()];
                 let mut frontier = vec![id.0.clone()];
                 while let Some(parent) = frontier.pop() {
                     for child in select_children(parent)? {
-                        ids_to_delete.push(child.clone());
-                        frontier.push(child);
+                        if !ids_to_delete.contains(&child) {
+                            ids_to_delete.push(child.clone());
+                            frontier.push(child);
+                        }
                     }
                 }
 
@@ -732,6 +840,10 @@ impl ThreadsDatabase {
                 let mut delete = connection.exec_bound::<Arc<str>>(indoc! {"
                     DELETE FROM threads WHERE id = ?
                 "})?;
+
+                // A locked descendant must prevent deletion of the whole tree.
+                let archives = Self::lock_memory_archives(&memory_archive_root, &ids_to_delete)?;
+                Self::remove_memory_archives(&archives)?;
 
                 let mut sandboxed_terminal_temp_dirs = Vec::new();
                 for thread_id in ids_to_delete {
@@ -756,26 +868,53 @@ impl ThreadsDatabase {
 
     pub fn delete_threads(&self) -> Task<Result<()>> {
         let connection = self.connection.clone();
+        let memory_archive_root = self.memory_archive_root.clone();
 
         self.executor.spawn(async move {
             let sandboxed_terminal_temp_dirs = {
                 let connection = connection.lock();
 
-                let mut select = connection.select_bound::<(), (DataType, Vec<u8>)>(indoc! {"
-                    SELECT data_type, data FROM threads
+                let mut select =
+                    connection.select_bound::<(), (Arc<str>, DataType, Vec<u8>)>(indoc! {"
+                    SELECT id, data_type, data FROM threads
                 "})?;
-
-                let sandboxed_terminal_temp_dirs = select(())?
-                    .into_iter()
-                    .filter_map(|(data_type, data)| {
-                        Self::sandboxed_terminal_temp_dir(data_type, data)
-                    })
-                    .collect::<Vec<_>>();
+                let rows = select(())?;
+                let mut ids_to_delete =
+                    rows.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>();
+                // Earlier deletions may have left archives without database rows.
+                match std::fs::read_dir(&memory_archive_root) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let id: Arc<str> = entry?
+                                .file_name()
+                                .into_string()
+                                .map_err(|_| anyhow::anyhow!("Invalid memory archive session ID"))?
+                                .into();
+                            if !ids_to_delete.contains(&id) {
+                                ids_to_delete.push(id);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("Read memory archive root {}", memory_archive_root.display())
+                        });
+                    }
+                }
 
                 let mut delete = connection.exec_bound::<()>(indoc! {"
                     DELETE FROM threads
                 "})?;
 
+                let archives = Self::lock_memory_archives(&memory_archive_root, &ids_to_delete)?;
+                Self::remove_memory_archives(&archives)?;
+                let sandboxed_terminal_temp_dirs = rows
+                    .into_iter()
+                    .filter_map(|(_, data_type, data)| {
+                        Self::sandboxed_terminal_temp_dir(data_type, data)
+                    })
+                    .collect::<Vec<_>>();
                 delete(())?;
 
                 sandboxed_terminal_temp_dirs
@@ -822,6 +961,10 @@ mod tests {
 
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
+            measured_cache_usage: Default::default(),
+            infinite_context: false,
+            memory_archived: false,
+            memory_turn_start: None,
             title: title.to_string().into(),
             messages: Vec::new(),
             updated_at,
@@ -840,6 +983,72 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
         }
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_preserves_stored_json(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let json = br#"{
+            "version": "0.1.0",
+            "summary": "Legacy thread",
+            "unknown_field": {"preserved": true}
+        }
+"#;
+
+        for data_type in [DataType::Json, DataType::Zstd] {
+            let thread_id = session_id(match data_type {
+                DataType::Json => "raw-json-thread",
+                DataType::Zstd => "raw-zstd-thread",
+            });
+            let data = match data_type {
+                DataType::Json => json.to_vec(),
+                DataType::Zstd => zstd::encode_all(json.as_slice(), 3).expect("compress JSON"),
+            };
+            {
+                let connection = database.connection.lock();
+                let mut insert = connection
+                    .exec_bound::<(Arc<str>, DataType, Vec<u8>)>(indoc! {"
+                        INSERT INTO threads (id, summary, updated_at, data_type, data)
+                        VALUES (?1, 'Legacy thread', '2024-01-01T00:00:00Z', ?2, ?3)
+                    "})
+                    .expect("prepare raw thread insert");
+                insert((thread_id.0.clone(), data_type, data)).expect("insert raw thread");
+            }
+
+            let restored = database
+                .load_thread_json(thread_id)
+                .await
+                .expect("load raw thread JSON without migration");
+            assert_eq!(restored.as_slice(), json);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_rejects_invalid_zstd(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let thread_id = session_id("invalid-zstd-thread");
+        {
+            let connection = database.connection.lock();
+            let mut insert = connection
+                .exec_bound::<(Arc<str>, Vec<u8>)>(indoc! {"
+                    INSERT INTO threads (id, summary, updated_at, data_type, data)
+                    VALUES (?1, 'Invalid thread', '2024-01-01T00:00:00Z', 'zstd', ?2)
+                "})
+                .expect("prepare invalid thread insert");
+            insert((thread_id.0.clone(), b"not zstd".to_vec())).expect("insert invalid thread");
+        }
+
+        assert!(database.load_thread_json(thread_id).await.is_err());
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_errors_for_missing_thread(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let error = database
+            .load_thread_json(session_id("missing-thread"))
+            .await
+            .expect_err("missing thread must be an error");
+        assert!(error.to_string().contains("missing-thread"));
     }
 
     #[gpui::test]
@@ -1096,6 +1305,337 @@ mod tests {
             .expect("thread should exist");
         assert_eq!(loaded.sandboxed_terminal_temp_dir, Some(temp_dir.clone()));
         std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    fn make_memory_archive(database: &ThreadsDatabase, id: &acp::SessionId) -> PathBuf {
+        let path = database.memory_archive_root.join(id.0.as_ref());
+        std::fs::create_dir_all(path.join("main")).expect("create memory archive");
+        std::fs::write(path.join("main/plaintext.jsonl"), b"private conversation")
+            .expect("write memory archive");
+        path
+    }
+
+    fn assert_memory_archive_deleted(path: &Path) {
+        let mut entries = std::fs::read_dir(path)
+            .expect("read deleted archive")
+            .map(|entry| {
+                entry
+                    .expect("read archive entry")
+                    .file_name()
+                    .into_string()
+                    .expect("archive entry name")
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries, vec!["deleted".to_string(), "lock".to_string()]);
+        assert_eq!(
+            std::fs::metadata(path.join("deleted"))
+                .expect("deletion marker")
+                .len(),
+            0
+        );
+        let error = crate::infinite_context::InfiniteContext::open(path.to_path_buf())
+            .err()
+            .expect("deleted archive must not reopen");
+        assert!(error.to_string().contains("has been deleted"));
+    }
+
+    async fn save_memory_test_thread(
+        database: &ThreadsDatabase,
+        id: &acp::SessionId,
+        parent: Option<&acp::SessionId>,
+    ) {
+        let mut thread = make_thread("Memory archive", Utc::now());
+        thread.subagent_context = parent.map(|parent| crate::SubagentContext {
+            parent_thread_id: parent.clone(),
+            depth: 1,
+        });
+        database
+            .save_thread(id.clone(), thread, PathList::default())
+            .await
+            .expect("save archive test thread");
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_removes_memory_archives_recursively(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let parent_id = session_id("memory-parent");
+        let child_id = session_id("memory-child");
+        let grandchild_id = session_id("memory-grandchild");
+        let unrelated_id = session_id("memory-unrelated");
+        let mut deleted_paths = Vec::new();
+        for (id, parent) in [
+            (&parent_id, None),
+            (&child_id, Some(&parent_id)),
+            (&grandchild_id, Some(&child_id)),
+        ] {
+            save_memory_test_thread(&database, id, parent).await;
+            deleted_paths.push(make_memory_archive(&database, id));
+        }
+        save_memory_test_thread(&database, &unrelated_id, None).await;
+        let unrelated_path = make_memory_archive(&database, &unrelated_id);
+
+        database
+            .delete_thread(parent_id)
+            .await
+            .expect("delete tree");
+
+        for path in &deleted_paths {
+            assert_memory_archive_deleted(path);
+        }
+        assert!(unrelated_path.join("main/plaintext.jsonl").exists());
+        let remaining = database
+            .list_threads()
+            .await
+            .expect("list remaining threads");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining.first().expect("unrelated thread").id,
+            unrelated_id
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_removes_orphaned_memory_archive(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let id = session_id("memory-orphan");
+        let path = make_memory_archive(&database, &id);
+
+        database
+            .delete_thread(id)
+            .await
+            .expect("delete orphan archive");
+
+        assert_memory_archive_deleted(&path);
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_tombstones_uninitialized_memory_archive(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let id = session_id("memory-uninitialized");
+        save_memory_test_thread(&database, &id, None).await;
+        let path = database.memory_archive_root.join(id.0.as_ref());
+        assert!(!path.exists());
+
+        database
+            .delete_thread(id.clone())
+            .await
+            .expect("delete thread");
+        assert_memory_archive_deleted(&path);
+        database.delete_thread(id).await.expect("repeat deletion");
+        assert_memory_archive_deleted(&path);
+        assert!(
+            database
+                .list_threads()
+                .await
+                .expect("list threads")
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_threads_removes_memory_archives_and_orphans(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let parent_id = session_id("memory-parent");
+        let child_id = session_id("memory-child");
+        let missing_id = session_id("memory-missing");
+        save_memory_test_thread(&database, &parent_id, None).await;
+        save_memory_test_thread(&database, &child_id, Some(&parent_id)).await;
+        save_memory_test_thread(&database, &missing_id, None).await;
+        let paths = [
+            make_memory_archive(&database, &parent_id),
+            make_memory_archive(&database, &child_id),
+            make_memory_archive(&database, &session_id("memory-orphan")),
+            database.memory_archive_root.join(missing_id.0.as_ref()),
+        ];
+        {
+            let connection = database.connection.lock();
+            let mut update = connection
+                .exec_bound::<Arc<str>>("UPDATE threads SET data = X'00' WHERE id = ?")
+                .expect("prepare corrupt thread update");
+            update(child_id.0).expect("corrupt stored thread");
+        }
+
+        database.delete_threads().await.expect("delete all threads");
+
+        for path in &paths {
+            assert_memory_archive_deleted(path);
+        }
+        database
+            .delete_threads()
+            .await
+            .expect("repeat bulk deletion");
+        for path in &paths {
+            assert_memory_archive_deleted(path);
+        }
+        assert!(
+            database
+                .list_threads()
+                .await
+                .expect("list threads")
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_refuses_locked_descendant_memory_archive(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let parent_id = session_id("memory-parent");
+        let child_id = session_id("memory-child");
+        save_memory_test_thread(&database, &parent_id, None).await;
+        save_memory_test_thread(&database, &child_id, Some(&parent_id)).await;
+        let parent_path = make_memory_archive(&database, &parent_id);
+        let child_path = database.memory_archive_root.join(child_id.0.as_ref());
+        let store = crate::infinite_context::InfiniteContext::open(child_path.clone())
+            .expect("open locked memory store");
+        std::fs::write(child_path.join("private.txt"), b"private conversation")
+            .expect("write locked archive");
+
+        let error = database
+            .delete_thread(parent_id.clone())
+            .await
+            .expect_err("locked descendant must prevent deletion");
+
+        assert!(error.to_string().contains("memory-child"));
+        assert!(parent_path.join("main/plaintext.jsonl").exists());
+        assert!(child_path.join("private.txt").exists());
+        assert_eq!(
+            database.list_threads().await.expect("list threads").len(),
+            2
+        );
+        drop(store);
+
+        database
+            .delete_thread(parent_id)
+            .await
+            .expect("retry deletion");
+        assert_memory_archive_deleted(&parent_path);
+        assert_memory_archive_deleted(&child_path);
+    }
+
+    #[gpui::test]
+    async fn test_delete_threads_refuses_locked_memory_archive(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let id = session_id("memory-locked");
+        save_memory_test_thread(&database, &id, None).await;
+        let path = database.memory_archive_root.join(id.0.as_ref());
+        let store = crate::infinite_context::InfiniteContext::open(path.clone())
+            .expect("open locked memory store");
+        let orphan_path = make_memory_archive(&database, &session_id("memory-orphan"));
+
+        database
+            .delete_threads()
+            .await
+            .expect_err("locked archive must prevent bulk deletion");
+
+        assert!(path.exists());
+        assert!(orphan_path.join("main/plaintext.jsonl").exists());
+        assert_eq!(
+            database.list_threads().await.expect("list threads").len(),
+            1
+        );
+        drop(store);
+
+        database
+            .delete_threads()
+            .await
+            .expect("retry bulk deletion");
+        assert_memory_archive_deleted(&path);
+        assert_memory_archive_deleted(&orphan_path);
+    }
+
+    #[gpui::test]
+    async fn test_delete_thread_surfaces_memory_archive_cleanup_errors(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let id = session_id("memory-invalid-directory");
+        save_memory_test_thread(&database, &id, None).await;
+        let path = database.memory_archive_root.join(id.0.as_ref());
+        std::fs::write(&path, b"private conversation").expect("create invalid archive path");
+
+        let error = database
+            .delete_thread(id)
+            .await
+            .expect_err("archive cleanup failure must reach the caller");
+
+        assert!(error.to_string().contains("not a directory"));
+        assert!(path.exists());
+        assert_eq!(
+            database.list_threads().await.expect("list threads").len(),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_delete_threads_surfaces_memory_archive_cleanup_errors(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let id = session_id("memory-invalid-directory");
+        save_memory_test_thread(&database, &id, None).await;
+        let path = database.memory_archive_root.join(id.0.as_ref());
+        std::fs::write(&path, b"private conversation").expect("create invalid archive path");
+        let orphan_path = make_memory_archive(&database, &session_id("memory-orphan"));
+
+        database
+            .delete_threads()
+            .await
+            .expect_err("archive cleanup failure must reach the caller");
+
+        assert!(path.exists());
+        assert!(orphan_path.join("main/plaintext.jsonl").exists());
+        assert_eq!(
+            database.list_threads().await.expect("list threads").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_memory_archive_deletion_lock_blocks_engine_open() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("memory-locked");
+        std::fs::create_dir(&path).expect("create archive directory");
+        let archives =
+            ThreadsDatabase::lock_memory_archives(directory.path(), &[Arc::from("memory-locked")])
+                .expect("acquire deletion lock");
+
+        assert!(crate::infinite_context::InfiniteContext::open(path.clone()).is_err());
+        drop(archives);
+        crate::infinite_context::InfiniteContext::open(path)
+            .expect("open after deletion lock drops");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_memory_archive_deletion_rejects_directory_symlinks() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let root = directory.path().join("archives");
+        std::fs::create_dir(&root).expect("create archive root");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        let sentinel = outside.join("private.txt");
+        std::fs::write(&sentinel, b"private conversation").expect("write sentinel");
+        std::os::unix::fs::symlink(&outside, root.join("memory-symlink"))
+            .expect("create archive symlink");
+
+        assert!(
+            ThreadsDatabase::lock_memory_archives(&root, &[Arc::from("memory-symlink")],).is_err()
+        );
+        assert!(sentinel.exists());
+        assert!(!outside.join("deleted").exists());
+    }
+
+    #[test]
+    fn test_memory_archive_deletion_rejects_path_traversal() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let sentinel = directory.path().join("private.txt");
+        std::fs::write(&sentinel, b"private conversation").expect("write sentinel");
+
+        assert!(
+            ThreadsDatabase::lock_memory_archives(
+                &directory.path().join("archives"),
+                &[Arc::from("..")],
+            )
+            .is_err()
+        );
+        assert!(sentinel.exists());
     }
 
     #[gpui::test]

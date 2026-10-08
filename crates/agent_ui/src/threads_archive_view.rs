@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::cache_report::CacheReport;
 
 use crate::thread_metadata_store::{
     ThreadId, ThreadMetadata, ThreadMetadataStore, worktree_info_from_thread_paths,
@@ -19,8 +20,8 @@ use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     AnyElement, App, Context, Decorations, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, ListState, Render, SharedString, Subscription, Task, TaskExt, WeakEntity, Window,
-    list, prelude::*, px,
+    Focusable, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    prelude::*, px,
 };
 use itertools::Itertools as _;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -41,7 +42,7 @@ use util::ResultExt;
 use util::paths::PathExt;
 use workspace::{
     CloseWindow, ModalView, PathList, RecentWorkspace, SerializedWorkspaceLocation, Workspace,
-    WorkspaceDb, WorkspaceId,
+    WorkspaceDb, WorkspaceId, notifications::NotifyResultExt,
 };
 
 use zed_actions::agents_sidebar::FocusSidebarFilter;
@@ -102,6 +103,13 @@ impl TimeBucket {
     }
 }
 
+fn saved_replay_session_id(thread: &ThreadMetadata) -> Option<acp::SessionId> {
+    if thread.agent_id != *agent::ZED_AGENT_ID {
+        return None;
+    }
+    thread.session_id.clone()
+}
+
 pub fn fuzzy_match_positions(query: &str, candidate: &str) -> Option<Vec<usize>> {
     let query_chars: Vec<char> = query.chars().collect();
     if query_chars.is_empty() {
@@ -157,6 +165,7 @@ pub struct ThreadsArchiveView {
     archived_branch_names: HashMap<ThreadId, HashMap<PathBuf, String>>,
     _load_branch_names_task: Task<()>,
     thread_filter: ThreadFilter,
+    cache_report: Option<Entity<CacheReport>>,
 }
 
 impl ThreadsArchiveView {
@@ -231,11 +240,27 @@ impl ThreadsArchiveView {
             archived_branch_names: HashMap::default(),
             _load_branch_names_task: Task::ready(()),
             thread_filter: ThreadFilter::All,
+            cache_report: None,
         };
 
         this.update_items(cx);
         this.reload_branch_names_if_threads_changed(cx);
         this
+    }
+
+    fn replay_saved_thread(&mut self, thread: &ThreadMetadata, cx: &mut Context<Self>) {
+        let Some(id) = saved_replay_session_id(thread) else {
+            return;
+        };
+        let input = ThreadStore::global(cx).update(cx, |store, cx| store.load_thread_json(&id, cx));
+        let title = thread.display_title();
+        let workspace = self.workspace.clone();
+        self.cache_report = Some(cx.new(|cx| {
+            CacheReport::new(id, title, input, cx, move |cx| {
+                CacheReport::warn_cleanup_failure(&workspace, cx);
+            })
+        }));
+        cx.notify();
     }
 
     pub fn has_selection(&self) -> bool {
@@ -691,57 +716,79 @@ impl ThreadsArchiveView {
                         }
                     }));
 
+                let cache_button = saved_replay_session_id(thread).map(|_| {
+                    Button::new("saved-cache-report", "Cache report")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .disabled(!cfg!(unix))
+                        .tooltip(Tooltip::text(if cfg!(unix) {
+                            "Estimate cache reuse from saved history locally, without reopening the thread or calling models or tools."
+                        } else {
+                            "Offline cache replay requires macOS or Linux for private temporary journal permissions."
+                        }))
+                        .on_click({
+                            let thread = thread.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.replay_saved_thread(&thread, cx);
+                                cx.stop_propagation();
+                            })
+                        })
+                });
+
                 if is_restoring {
                     base.status(AgentThreadStatus::Running)
                         .action_slot(
-                            IconButton::new("cancel-restore", IconName::Close)
-                                .hover_background(button_hover_bg)
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Cancel Restore"))
-                                .on_click({
-                                    let thread_id = thread.thread_id;
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.clear_restoring(&thread_id, cx);
-                                        cx.emit(ThreadsArchiveViewEvent::CancelRestore {
-                                            thread_id,
-                                        });
-                                        cx.stop_propagation();
-                                    })
-                                }),
+                            h_flex().gap_1().children(cache_button).child(
+                                IconButton::new("cancel-restore", IconName::Close)
+                                    .hover_background(button_hover_bg)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Cancel Restore"))
+                                    .on_click({
+                                        let thread_id = thread.thread_id;
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.clear_restoring(&thread_id, cx);
+                                            cx.emit(ThreadsArchiveViewEvent::CancelRestore {
+                                                thread_id,
+                                            });
+                                            cx.stop_propagation();
+                                        })
+                                    }),
+                            ),
                         )
                         .into_any_element()
                 } else if is_archived {
                     base.action_slot(
-                        IconButton::new("delete-thread", IconName::Trash)
-                            .hover_background(button_hover_bg)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip({
-                                move |_window, cx| {
-                                    Tooltip::for_action_in(
-                                        "Delete Thread",
-                                        &RemoveSelectedThread,
-                                        &focus_handle,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click({
-                                let agent = thread.agent_id.clone();
-                                let thread_id = thread.thread_id;
-                                let session_id = thread.session_id.clone();
-                                cx.listener(move |this, _, _, cx| {
-                                    this.preserve_selection_on_next_update = true;
-                                    this.delete_thread(
-                                        thread_id,
-                                        session_id.clone(),
-                                        agent.clone(),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
+                        h_flex().gap_1().children(cache_button).child(
+                            IconButton::new("delete-thread", IconName::Trash)
+                                .hover_background(button_hover_bg)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Delete Thread",
+                                            &RemoveSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
                                 })
-                            }),
+                                .on_click({
+                                    let agent = thread.agent_id.clone();
+                                    let thread_id = thread.thread_id;
+                                    let session_id = thread.session_id.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.delete_thread(
+                                            thread_id,
+                                            session_id.clone(),
+                                            agent.clone(),
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    })
+                                }),
+                        ),
                     )
                     .on_click({
                         let thread = thread.clone();
@@ -752,27 +799,29 @@ impl ThreadsArchiveView {
                     .into_any_element()
                 } else {
                     base.action_slot(
-                        IconButton::new("archive-thread", IconName::Archive)
-                            .hover_background(button_hover_bg)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip({
-                                move |_window, cx| {
-                                    Tooltip::for_action_in(
-                                        "Archive Thread",
-                                        &ArchiveSelectedThread,
-                                        &focus_handle,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click({
-                                let thread_id = thread.thread_id;
-                                cx.listener(move |this, _, _, cx| {
-                                    this.archive_thread(thread_id, cx);
-                                    cx.stop_propagation();
+                        h_flex().gap_1().children(cache_button).child(
+                            IconButton::new("archive-thread", IconName::Archive)
+                                .hover_background(button_hover_bg)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Archive Thread",
+                                            &ArchiveSelectedThread,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
                                 })
-                            }),
+                                .on_click({
+                                    let thread_id = thread.thread_id;
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.archive_thread(thread_id, cx);
+                                        cx.stop_propagation();
+                                    })
+                                }),
+                        ),
                     )
                     .on_click({
                         let thread = thread.clone();
@@ -802,7 +851,6 @@ impl ThreadsArchiveView {
             return;
         };
 
-        self.preserve_selection_on_next_update = true;
         self.delete_thread(
             thread.thread_id,
             thread.session_id.clone(),
@@ -818,11 +866,17 @@ impl ThreadsArchiveView {
         agent: AgentId,
         cx: &mut Context<Self>,
     ) {
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(thread_id, cx));
-
         let agent = Agent::from(agent);
 
         let Some(agent_connection_store) = self.agent_connection_store.upgrade() else {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(
+                        "Could not delete thread: the agent connection is unavailable. Reopen the Agent Panel and retry deletion.",
+                        cx,
+                    );
+                })
+                .log_err();
             return;
         };
         let fs = <dyn Fs>::global(cx);
@@ -833,10 +887,15 @@ impl ThreadsArchiveView {
                 .read(cx)
                 .wait_for_connection()
         });
-        cx.spawn(async move |_this, cx| {
-            crate::thread_worktree_archive::cleanup_thread_archived_worktrees(thread_id, cx).await;
-
-            let state = task.await?;
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let Some(state) = task
+                .await
+                .map_err(|error| format!("Could not connect to the agent to delete the thread. Retry deletion once the agent is available.\n\n{error}"))
+                .notify_workspace_async_err(workspace.clone(), cx)
+            else {
+                return;
+            };
             let task = cx.update(|cx| {
                 if let Some(session_id) = &session_id {
                     if let Some(list) = state
@@ -852,9 +911,26 @@ impl ThreadsArchiveView {
                     Task::ready(Ok(()))
                 }
             });
-            task.await
+            if task
+                .await
+                .map_err(|error| format!("Could not delete thread. Close the thread and wait for memory work to finish, then retry deletion.\n\n{error:#}"))
+                .notify_workspace_async_err(workspace, cx)
+                .is_none()
+            {
+                return;
+            }
+
+            crate::thread_worktree_archive::cleanup_thread_archived_worktrees(thread_id, cx).await;
+            cx.update(|cx| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |this, _cx| {
+                        this.preserve_selection_on_next_update = true;
+                    });
+                }
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(thread_id, cx));
+            });
         })
-        .detach_and_log_err(cx);
+        .detach();
     }
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1114,6 +1190,7 @@ impl Render for ThreadsArchiveView {
             .size_full()
             .child(self.render_header(window, cx))
             .when(!has_query, |this| this.child(self.render_toolbar(cx)))
+            .children(self.cache_report.clone())
             .child(content)
     }
 }
@@ -1649,6 +1726,31 @@ impl PickerDelegate for ProjectPickerDelegate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_cache_replay_uses_native_session_identity_not_sidebar_identity() {
+        let mut thread = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new("saved-native-session")),
+            agent_id: agent::ZED_AGENT_ID.clone(),
+            title: Some("Saved title".into()),
+            title_override: None,
+            updated_at: Utc::now(),
+            created_at: None,
+            interacted_at: None,
+            worktree_paths: project::WorktreePaths::from_folder_paths(&PathList::default()),
+            remote_connection: None,
+            archived: true,
+        };
+        assert_eq!(saved_replay_session_id(&thread), thread.session_id);
+        thread.thread_id = ThreadId::new();
+        assert_eq!(saved_replay_session_id(&thread), thread.session_id);
+        thread.agent_id = "external-agent".into();
+        assert!(saved_replay_session_id(&thread).is_none());
+        thread.agent_id = agent::ZED_AGENT_ID.clone();
+        thread.session_id = None;
+        assert!(saved_replay_session_id(&thread).is_none());
+    }
 
     #[test]
     fn test_fuzzy_match_positions_returns_byte_indices() {

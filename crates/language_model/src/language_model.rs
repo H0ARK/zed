@@ -435,6 +435,7 @@ pub trait LanguageModelClient: 'static {
                                     ..
                                 }) => None,
                                 Ok(LanguageModelCompletionEvent::Compaction(_)) => None,
+                                Ok(LanguageModelCompletionEvent::CacheUsageUpdate(_)) => None,
                                 Ok(LanguageModelCompletionEvent::UsageUpdate(token_usage)) => {
                                     *last_token_usage.lock() = token_usage;
                                     None

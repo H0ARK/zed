@@ -3,12 +3,13 @@ use collections::HashMap;
 use futures::{Stream, StreamExt};
 use http_client::StatusCode;
 use language_model_core::{
-    CompactedContext, CompactionUpdate, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelCustomToolFormat, LanguageModelCustomToolGrammarSyntax, LanguageModelImage,
-    LanguageModelProviderId, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelRequestToolInput, LanguageModelToolChoice, LanguageModelToolResultContent,
-    LanguageModelToolUse, LanguageModelToolUseId, LanguageModelToolUseInput, MessageContent,
-    ProviderErrorCategory, Role, StopReason, TokenUsage, provider_name_for_id,
+    CompactedContext, CompactionUpdate, LanguageModelCacheUsage, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelCustomToolFormat,
+    LanguageModelCustomToolGrammarSyntax, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestToolInput,
+    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse,
+    LanguageModelToolUseId, LanguageModelToolUseInput, MessageContent, ProviderErrorCategory, Role,
+    StopReason, TokenUsage, provider_name_for_id,
     util::{fix_streamed_json, parse_tool_arguments},
 };
 use std::pin::Pin;
@@ -1017,6 +1018,11 @@ impl OpenAiResponseEventMapper {
                     events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
                         token_usage_from_response_usage(usage),
                     )));
+                    if let Some(cache_usage) = cache_usage_from_response_usage(usage) {
+                        events.push(Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                            cache_usage,
+                        )));
+                    }
                 }
                 events.push(Ok(LanguageModelCompletionEvent::Stop(stop_reason)));
                 events
@@ -1145,6 +1151,11 @@ impl OpenAiResponseEventMapper {
             events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
                 token_usage_from_response_usage(usage),
             )));
+            if let Some(cache_usage) = cache_usage_from_response_usage(usage) {
+                events.push(Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                    cache_usage,
+                )));
+            }
         }
 
         let stop_reason = self.pending_stop_reason.take().unwrap_or(default_reason);
@@ -1477,8 +1488,19 @@ fn response_content_is_refusal(content: &serde_json::Value) -> bool {
     content_type == Some("refusal") || !refusal.is_empty()
 }
 
+pub fn cache_usage_from_response_usage(usage: &ResponsesUsage) -> Option<LanguageModelCacheUsage> {
+    Some(LanguageModelCacheUsage {
+        input_tokens: usage.input_tokens?,
+        cached_tokens: usage.input_tokens_details.as_ref()?.cached_tokens?,
+    })
+}
+
 pub fn token_usage_from_response_usage(usage: &ResponsesUsage) -> TokenUsage {
-    let cache_read_input_tokens = usage.input_tokens_details.cached_tokens;
+    let cache_read_input_tokens = usage
+        .input_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or_default();
 
     TokenUsage {
         input_tokens: usage
@@ -1657,7 +1679,9 @@ mod tests {
                 response: ResponseSummary {
                     usage: Some(ResponseUsage {
                         input_tokens: Some(5),
-                        input_tokens_details: ResponseInputTokensDetails { cached_tokens: 2 },
+                        input_tokens_details: Some(ResponseInputTokensDetails {
+                            cached_tokens: Some(2),
+                        }),
                         output_tokens: Some(3),
                         total_tokens: Some(8),
                         ..Default::default()
@@ -1687,6 +1711,13 @@ mod tests {
         ));
         assert!(matches!(
             mapped[3],
+            LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                input_tokens: 5,
+                cached_tokens: 2,
+            })
+        ));
+        assert!(matches!(
+            mapped[4],
             LanguageModelCompletionEvent::Stop(StopReason::EndTurn)
         ));
     }
@@ -1732,6 +1763,112 @@ mod tests {
             }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn response_cache_usage_distinguishes_unknown_from_reported_zero() -> Result<()> {
+        for unknown in [
+            json!({}),
+            json!({"input_tokens": 100}),
+            json!({"input_tokens": 100, "input_tokens_details": null}),
+            json!({"input_tokens": 100, "input_tokens_details": {}}),
+            json!({"input_tokens": 100, "input_tokens_details": {"cached_tokens": null}}),
+            json!({"input_tokens_details": {"cached_tokens": 0}}),
+            json!({"input_tokens": null, "input_tokens_details": {"cached_tokens": 0}}),
+        ] {
+            let usage: ResponseUsage = serde_json::from_value(unknown.clone())?;
+            assert_eq!(cache_usage_from_response_usage(&usage), None, "{unknown}");
+            let events = map_response_events(vec![ResponsesStreamEvent::Completed {
+                response: ResponseSummary {
+                    usage: Some(usage),
+                    ..Default::default()
+                },
+            }]);
+            assert!(!events.iter().any(|event| {
+                matches!(event, LanguageModelCompletionEvent::CacheUsageUpdate(_))
+            }));
+        }
+        for cached_tokens in [0, 60] {
+            let usage: ResponseUsage = serde_json::from_value(json!({
+                "input_tokens": 100, "input_tokens_details": {"cached_tokens": cached_tokens}
+            }))?;
+            let measurement = LanguageModelCacheUsage {
+                input_tokens: 100,
+                cached_tokens,
+            };
+            assert_eq!(cache_usage_from_response_usage(&usage), Some(measurement));
+            let serialized = serde_json::to_value(&usage)?;
+            let deserialized: ResponseUsage = serde_json::from_value(serialized)?;
+            assert_eq!(
+                cache_usage_from_response_usage(&deserialized),
+                Some(measurement)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_final_usage_reports_cache_snapshot_without_double_counting() -> Result<()> {
+        for cached_tokens in [0, 60] {
+            for incomplete in [false, true] {
+                let event: ResponsesStreamEvent = serde_json::from_value(json!({
+                    "type": if incomplete { "response.incomplete" } else { "response.completed" },
+                    "response": {
+                        "output": [],
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "usage": {
+                            "input_tokens": 100,
+                            "input_tokens_details": {"cached_tokens": cached_tokens},
+                            "output_tokens": 7, "total_tokens": 107
+                        }
+                    }
+                }))?;
+                let events = map_response_events(vec![event]);
+                let token_usage =
+                    token_usage_from_response_usage(&serde_json::from_value(json!({
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": cached_tokens},
+                        "output_tokens": 7
+                    }))?);
+                assert_eq!(token_usage.total_tokens(), 107);
+                assert_eq!(
+                    events,
+                    vec![
+                        LanguageModelCompletionEvent::UsageUpdate(token_usage),
+                        LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                            input_tokens: 100,
+                            cached_tokens,
+                        }),
+                        LanguageModelCompletionEvent::Stop(if incomplete {
+                            StopReason::MaxTokens
+                        } else {
+                            StopReason::EndTurn
+                        }),
+                    ]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_chat_request_preserves_usage_reporting() -> Result<()> {
+        let request = into_open_ai(
+            LanguageModelRequest::default(),
+            "gpt-4.1",
+            true,
+            false,
+            None,
+            ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+            None,
+            false,
+        )?;
+        assert!(
+            request
+                .stream_options
+                .is_some_and(|options| options.include_usage)
+        );
         Ok(())
     }
 

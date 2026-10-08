@@ -1,4 +1,6 @@
+pub mod cache_replay;
 mod db;
+pub mod infinite_context;
 mod legacy_thread;
 mod native_agent_server;
 pub mod outline;

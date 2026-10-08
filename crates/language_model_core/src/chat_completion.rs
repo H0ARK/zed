@@ -9,8 +9,8 @@
 
 use crate::util::{fix_streamed_json, parse_tool_arguments};
 use crate::{
-    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelToolUse,
-    LanguageModelToolUseInput, StopReason, TokenUsage,
+    LanguageModelCacheUsage, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    LanguageModelToolUse, LanguageModelToolUseInput, StopReason, TokenUsage,
 };
 use collections::HashMap;
 use futures::{Stream, StreamExt};
@@ -182,6 +182,13 @@ pub struct PromptTokensDetails {
 }
 
 impl Usage {
+    pub fn cache_usage(&self) -> Option<LanguageModelCacheUsage> {
+        Some(LanguageModelCacheUsage {
+            input_tokens: self.prompt_tokens?,
+            cached_tokens: self.prompt_tokens_details.as_ref()?.cached_tokens?,
+        })
+    }
+
     /// Converts to a [`TokenUsage`] update, splitting cache reads and writes
     /// out of `prompt_tokens` when the provider reports them.
     ///
@@ -458,6 +465,11 @@ impl ChatCompletionEventMapper {
         let mut events = Vec::new();
         if let Some(token_usage) = event.usage.as_ref().and_then(|usage| usage.token_usage()) {
             events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(token_usage)));
+        }
+        if let Some(cache_usage) = event.usage.as_ref().and_then(|usage| usage.cache_usage()) {
+            events.push(Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                cache_usage,
+            )));
         }
 
         let Some(choice) = event.choices.first() else {
@@ -740,6 +752,91 @@ mod tests {
             event.choices[0].delta.as_ref().unwrap().content.as_deref(),
             Some("hi")
         );
+    }
+
+    #[test]
+    fn cache_usage_requires_reported_input_and_cache_read_tokens() -> anyhow::Result<()> {
+        for unknown in [
+            serde_json::json!({}),
+            serde_json::json!({"prompt_tokens": 100}),
+            serde_json::json!({"prompt_tokens": 100, "prompt_tokens_details": null}),
+            serde_json::json!({"prompt_tokens": 100, "prompt_tokens_details": {}}),
+            serde_json::json!({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": null}}),
+            serde_json::json!({"prompt_tokens_details": {"cached_tokens": 0}}),
+            serde_json::json!({"prompt_tokens": null, "prompt_tokens_details": {"cached_tokens": 0}}),
+            serde_json::json!({"prompt_tokens": 100, "prompt_tokens_details": {"cache_write_tokens": 10}}),
+        ] {
+            let usage: Usage = serde_json::from_value(unknown.clone())?;
+            assert_eq!(usage.cache_usage(), None, "{unknown}");
+            let event: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+                "choices": [], "usage": unknown
+            }))?;
+            assert!(
+                !ChatCompletionEventMapper::new()
+                    .map_event(event)
+                    .iter()
+                    .any(|event| {
+                        matches!(event, Ok(LanguageModelCompletionEvent::CacheUsageUpdate(_)))
+                    })
+            );
+        }
+        for cached_tokens in [0, 60] {
+            let usage: Usage = serde_json::from_value(serde_json::json!({
+                "prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": cached_tokens}
+            }))?;
+            assert_eq!(
+                usage.cache_usage(),
+                Some(LanguageModelCacheUsage {
+                    input_tokens: 100,
+                    cached_tokens,
+                })
+            );
+            assert!(usage.token_usage().is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_final_usage_reports_absolute_cache_snapshot_after_stop() -> anyhow::Result<()> {
+        for cached_tokens in [0, 60] {
+            let chunks: Vec<ResponseStreamEvent> = serde_json::from_value(serde_json::json!([
+                {"choices": [{"index": 0, "delta": {"content": "answer"}}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {
+                    "prompt_tokens": 100, "completion_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 10}
+                }}
+            ]))?;
+            let events = futures::executor::block_on(
+                ChatCompletionEventMapper::new()
+                    .map_stream(Box::pin(futures::stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(Ok::<_, LanguageModelCompletionError>),
+                    )))
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                events,
+                vec![
+                    LanguageModelCompletionEvent::Text("answer".into()),
+                    LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+                    LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                        input_tokens: 90 - cached_tokens,
+                        output_tokens: 7,
+                        cache_creation_input_tokens: 10,
+                        cache_read_input_tokens: cached_tokens,
+                    }),
+                    LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                        input_tokens: 100,
+                        cached_tokens,
+                    }),
+                ]
+            );
+        }
+        Ok(())
     }
 
     #[test]

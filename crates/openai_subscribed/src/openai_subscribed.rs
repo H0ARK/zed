@@ -828,7 +828,22 @@ pub fn compact(
                 LanguageModelCompletionEvent::UsageUpdate(updated_usage) => {
                     usage = updated_usage;
                 }
-                _ => {}
+                LanguageModelCompletionEvent::Queued { .. }
+                | LanguageModelCompletionEvent::Started
+                | LanguageModelCompletionEvent::Stop(_)
+                | LanguageModelCompletionEvent::Text(_)
+                | LanguageModelCompletionEvent::Thinking { .. }
+                | LanguageModelCompletionEvent::RedactedThinking { .. }
+                | LanguageModelCompletionEvent::ToolUse(_)
+                | LanguageModelCompletionEvent::ToolUseJsonParseError { .. }
+                | LanguageModelCompletionEvent::StartMessage { .. }
+                | LanguageModelCompletionEvent::ReasoningDetails(_)
+                | LanguageModelCompletionEvent::CacheUsageUpdate(_)
+                | LanguageModelCompletionEvent::Compaction(
+                    language_model::CompactionUpdate::Started
+                    | language_model::CompactionUpdate::SummaryDelta(_)
+                    | language_model::CompactionUpdate::Failed,
+                ) => {}
             }
         }
 
@@ -2198,6 +2213,26 @@ mod tests {
             panic!("expected the streamed provider compaction state");
         };
         assert_eq!(compaction_state.provider_id(), &PROVIDER_ID);
+        assert!(matches!(
+            events.get(2),
+            Some(Ok(LanguageModelCompletionEvent::UsageUpdate(
+                language_model::TokenUsage {
+                    input_tokens: 60_000,
+                    output_tokens: 1_000,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 40_000,
+                }
+            )))
+        ));
+        assert!(matches!(
+            events.get(3),
+            Some(Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                language_model::LanguageModelCacheUsage {
+                    input_tokens: 100_000,
+                    cached_tokens: 40_000,
+                }
+            )))
+        ));
         let items = open_ai::responses::provider_compaction_items(&compaction_state, &PROVIDER_ID)
             .expect("the compacted state should parse")
             .expect("the compacted state should be owned by the subscription provider");
@@ -2274,6 +2309,15 @@ mod tests {
         )
         .await
         .expect("manual compaction should succeed");
+        assert_eq!(
+            result.usage,
+            language_model::TokenUsage {
+                input_tokens: 60_000,
+                output_tokens: 1_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 40_000,
+            }
+        );
         let language_model::CompactedContext::ProviderState(compaction_state) = result.context
         else {
             panic!("expected provider compaction state");
@@ -2313,6 +2357,11 @@ mod tests {
                 "response": {
                     "status": "completed",
                     "output": [],
+                    "usage": {
+                        "input_tokens": 100_000,
+                        "output_tokens": 1_000,
+                        "input_tokens_details": {"cached_tokens": 40_000},
+                    },
                 },
             }),
         ]

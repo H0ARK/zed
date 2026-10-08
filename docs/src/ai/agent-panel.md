@@ -167,6 +167,38 @@ If the selected model's context window is too small for automatic compaction (le
 
 Configure automatic compaction with `agent.auto_compact`. See [Agent Settings](./agent-settings.md#automatic-compaction) for options.
 
+### Infinite Memory {#infinite-memory}
+
+Zed Agent threads have an **Infinite memory** toggle below the panel toolbar. This mode keeps an append-only conversation archive and uses bounded summaries of older material to construct model context. It does not provide unlimited model tokens or guarantee perfect recall. Long tool output is clipped, and memory-summary model calls may incur additional cost.
+
+The toggle is saved with each native conversation once it contains messages; empty drafts are not saved. To enable it by default for new Zed Agent threads, set:
+
+```json
+{
+  "agent": {
+    "infinite_context": true
+  }
+}
+```
+
+The default is `false`. Wait for the current turn and background memory summaries to finish before changing a thread's mode. **Summarizing memory…** indicates that summary work is running. Turning the mode off preserves its archive and append-only history; it does not restore editing or truncation of older messages. Automatic compaction is disabled for append-only memory history.
+
+Infinite memory and the cache controls below apply only to the Zed Agent, not external ACP agents or terminal threads.
+
+### Measured Cache Reuse {#measured-cache-reuse}
+
+Below the toolbar, **Measured cache reuse** reports cached input tokens divided by total input tokens, separately for agent requests, memory-summary requests, and their token-weighted combination. Total input includes cached tokens. This is observed provider usage, not billing savings and not the offline estimate below.
+
+Only requests with explicit provider cache counters are counted. Supported providers include OpenAI subscription models through the shared Responses usage events. Availability depends on the provider and model; **not reported** means no explicit measurements have arrived, not a zero-percent cache hit rate. Older history without counters is excluded. **N/A** means a percentage cannot be calculated from the reported totals; **unavailable** means the combined totals could not be computed safely.
+
+### Offline Cache Report {#cache-report}
+
+Click **Cache report** below the toolbar, or run {#action agent::ReplayThreadCache}, to replay an idle Zed Agent thread's snapshot locally. Thread History also offers **Cache report** on saved Zed Agent entries, without reopening or unarchiving the conversation.
+
+The report stays tied to its source snapshot, even when you switch threads. It never executes recorded tools, calls a model API, or changes the source conversation. Replay runs in the background; **Cancel** dismisses it and requests cancellation. Replacing a report or closing its view also requests cancellation. Replay uses private temporary journals on macOS and Linux and removes them on completion, failure, or cancellation. A persistent warning appears if cleanup fails, even after the report has been dismissed. Offline replay is unavailable on other platforms.
+
+The **Offline estimate** is intentionally separate from measured cache reuse. It estimates UTF-8 bytes rather than provider tokens and uses extractive stand-in summaries, an Anthropic-style five-minute cache, a 20-block lookup window, one-second request gaps, and separate summary-model cache scope. It does not recover the original system prompt or tools, or model token eligibility, concurrency, or latency. Treat it as a local comparison, not a prediction of provider cache hits or billing savings.
+
 ## Changing Models {#changing-models}
 
 After you've configured your LLM providers—either via [API access](./use-api-access.md) or through [Zed-hosted models](../account/zed-hosted-models.md)—you can switch between their models by clicking on the model selector on the message editor or by using the {#kb agent::ToggleModelSelector} keybinding.

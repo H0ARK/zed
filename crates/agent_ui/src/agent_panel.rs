@@ -37,7 +37,9 @@ use zed_actions::{
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
+use crate::ReplayThreadCache;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::cache_report::{CacheReport, render_measured_cache_usage, snapshot_json};
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
@@ -450,6 +452,12 @@ pub fn init(cx: &mut App) {
 
                     if let Some(thread) = thread {
                         AgentDiffPane::deploy_in_workspace(thread, workspace, window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &ReplayThreadCache, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| panel.replay_active_thread(cx));
                     }
                 })
                 .register_action(|workspace, _: &ToggleOptionsMenu, window, cx| {
@@ -1145,6 +1153,8 @@ pub struct AgentPanel {
     _thread_view_subscription: Option<Subscription>,
     _active_thread_focus_subscription: Option<Subscription>,
     _base_view_observation: Option<Subscription>,
+    native_thread_observation: Option<(gpui::EntityId, Subscription)>,
+    cache_report: Option<Entity<CacheReport>>,
     _draft_editor_observation: Option<Subscription>,
     _active_draft_reclaim_observation: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
@@ -1567,6 +1577,8 @@ impl AgentPanel {
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
             _base_view_observation: None,
+            native_thread_observation: None,
+            cache_report: None,
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
@@ -4336,6 +4348,122 @@ impl AgentPanel {
         }
     }
 
+    fn observe_native_thread(&mut self, cx: &mut Context<Self>) {
+        let thread = self.active_native_agent_thread(cx);
+        let entity_id = thread.as_ref().map(Entity::entity_id);
+        if self.native_thread_observation.as_ref().map(|(id, _)| *id) == entity_id {
+            return;
+        }
+        self.native_thread_observation = thread.map(|thread| {
+            let observation = cx.observe(&thread, |_this, _thread, cx| cx.notify());
+            (thread.entity_id(), observation)
+        });
+    }
+
+    fn toggle_infinite_context(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.active_native_agent_thread(cx) else {
+            return;
+        };
+        let enabled = !thread.read(cx).infinite_context_enabled();
+        if let Err(error) = thread.update(cx, |thread, cx| {
+            thread.set_infinite_context_enabled(enabled, cx)
+        }) {
+            log::warn!("Could not change infinite memory: {error:#}");
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Could not change infinite memory. Wait for the current turn and memory summaries to finish.",
+                cx,
+            );
+        }
+        // The native server observes Thread notifications and persists the mode
+        // with the rest of the session, preserving its draft and work directories.
+    }
+
+    fn replay_active_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.active_native_agent_thread(cx) else {
+            return;
+        };
+        let thread = thread.read(cx);
+        if !thread.is_turn_complete() || thread.memory_summaries_running() {
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Wait for the current turn and memory summaries before generating a cache report.",
+                cx,
+            );
+            return;
+        }
+        if thread.is_empty() {
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Send a message before generating a cache report.",
+                cx,
+            );
+            return;
+        }
+        let id = thread.id().clone();
+        let title = thread
+            .title()
+            .unwrap_or_else(|| crate::DEFAULT_THREAD_TITLE.into());
+        let snapshot = thread.snapshot_for_cache_replay(cx);
+        let input = cx.background_spawn(async move { snapshot_json(snapshot) });
+        let workspace = self.workspace.clone();
+        self.cache_report = Some(cx.new(|cx| {
+            CacheReport::new(id, title, input, cx, move |cx| {
+                CacheReport::warn_cleanup_failure(&workspace, cx);
+            })
+        }));
+        cx.notify();
+    }
+
+    fn render_native_memory_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.active_native_agent_thread(cx)?;
+        let thread = thread.read(cx);
+        let enabled = thread.infinite_context_enabled();
+        let summarizing = thread.memory_summaries_running();
+        let busy = !thread.is_turn_complete() || summarizing;
+        Some(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .flex_wrap()
+                .child(
+                    Button::new("infinite-context", "Infinite memory")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .toggle_state(enabled)
+                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .disabled(busy)
+                        .tooltip(Tooltip::text(if busy {
+                            "Wait for the current turn and memory summaries before changing this mode."
+                        } else if thread.memory_history_is_append_only() {
+                            "Preserve conversation text with bounded summaries, not unlimited model tokens. Summary calls may cost extra. Disabling keeps the archive and append-only history."
+                        } else {
+                            "Preserve conversation text with bounded summaries, not unlimited model tokens. Long tool output is clipped. Summary calls may cost extra. Enabling makes this history append-only."
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_infinite_context(cx))),
+                )
+                .child(
+                    Button::new("replay-thread-cache", "Cache report")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .disabled(busy || thread.is_empty() || !cfg!(unix))
+                        .tooltip(Tooltip::text(if cfg!(unix) {
+                            "Replay a snapshot locally to estimate cache reuse. No model calls or recorded tools are executed. Wait for the current turn and memory summaries to finish."
+                        } else {
+                            "Offline cache replay requires macOS or Linux for private temporary journal permissions."
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.replay_active_thread(cx))),
+                )
+                .when(summarizing, |this| {
+                    this.child(Label::new("Summarizing memory…").size(LabelSize::Small).color(Color::Muted))
+                })
+                .into_any_element(),
+        )
+    }
+
     fn set_base_view(
         &mut self,
         new_view: BaseView,
@@ -4364,6 +4492,7 @@ impl AgentPanel {
     }
 
     fn refresh_base_view_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.observe_native_thread(cx);
         self._base_view_observation = match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
                 self._thread_view_subscription =
@@ -4380,6 +4509,7 @@ impl AgentPanel {
                     this._thread_view_subscription =
                         Self::subscribe_to_active_thread_view(&server_view, window, cx);
                     this.observe_active_draft_for_empty_editor(&server_view, cx);
+                    this.observe_native_thread(cx);
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
                     cx.notify();
@@ -6636,6 +6766,10 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
             .on_action(cx.listener(Self::manage_skills))
             .on_action(cx.listener(Self::toggle_options_menu))
+            .on_action(cx.listener(|this, _: &ReplayThreadCache, _, cx| {
+                cx.stop_propagation();
+                this.replay_active_thread(cx);
+            }))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
@@ -6656,6 +6790,13 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
+            .children(self.render_native_memory_controls(cx))
+            .when_some(self.active_native_agent_thread(cx), |this, thread| {
+                this.child(render_measured_cache_usage(
+                    thread.read(cx).measured_cache_usage(),
+                ))
+                .children(self.cache_report.clone())
+            })
             .children(self.render_new_user_onboarding(window, cx))
             .map(|parent| match self.visible_surface() {
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
@@ -7239,6 +7380,66 @@ mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[gpui::test]
+    async fn native_memory_controls_follow_the_actual_thread_and_hide_for_external_agents(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn Fs>::set_global(fs.clone(), cx);
+        });
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.selected_agent = Agent::NativeAgent;
+                panel.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+            });
+            panel
+        });
+        cx.run_until_parked();
+
+        let thread = panel.read_with(cx, |panel, cx| {
+            panel.active_native_agent_thread(cx).expect("native thread")
+        });
+        panel.update(cx, |panel, cx| {
+            assert!(panel.render_native_memory_controls(cx).is_some());
+            assert_eq!(
+                panel.native_thread_observation.as_ref().map(|(id, _)| *id),
+                Some(thread.entity_id()),
+            );
+            panel.toggle_infinite_context(cx);
+            assert!(thread.read(cx).infinite_context_enabled());
+            panel.toggle_infinite_context(cx);
+            assert!(!thread.read(cx).infinite_context_enabled());
+            assert!(thread.read(cx).memory_history_is_append_only());
+        });
+        cx.run_until_parked();
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert!(panel.active_native_agent_thread(cx).is_none());
+            assert!(panel.render_native_memory_controls(cx).is_none());
+            assert!(panel.native_thread_observation.is_none());
+            panel.toggle_infinite_context(cx);
+            panel.replay_active_thread(cx);
+            assert!(panel.cache_report.is_none());
+        });
+        assert!(!thread.read_with(cx, |thread, _| thread.infinite_context_enabled()));
     }
 
     #[gpui::test]
@@ -11711,6 +11912,10 @@ mod tests {
         let source_session_id = acp::SessionId::new("source-thread-session");
         let source_title: SharedString = "Source Thread Title".into();
         let db_thread = agent::DbThread {
+            measured_cache_usage: Default::default(),
+            infinite_context: false,
+            memory_archived: false,
+            memory_turn_start: None,
             title: source_title.clone(),
             messages: Vec::new(),
             updated_at: Utc::now(),

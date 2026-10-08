@@ -343,6 +343,10 @@ pub struct AgentSettingsContent {
     /// Default: []
     #[serde(default)]
     pub model_parameters: Vec<LanguageModelParameters>,
+    /// Preserve an append-only conversation archive with bounded memory summaries.
+    ///
+    /// Default: false
+    pub infinite_context: Option<bool>,
     /// Settings for automatic agent context compaction, which summarizes
     /// earlier messages to free up room in the model's context window once the
     /// context grows too large.

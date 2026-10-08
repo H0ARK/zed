@@ -41,12 +41,12 @@ use gpui::{
 };
 use heck::ToSnakeCase as _;
 use language_model::{
-    CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
-    LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    CompletionIntent, LanguageModel, LanguageModelCacheUsage, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role,
+    SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -69,6 +69,10 @@ use std::{
 };
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
+
+#[path = "thread_memory.rs"]
+mod memory;
+pub use memory::{append_memory_view, clip_memory_output, memory_summary_task, memory_tools};
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
@@ -167,8 +171,88 @@ impl std::fmt::Display for PromptId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUsageTotals {
+    /// Requests with explicit cache measurements; absent counters are not cache misses.
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl CacheUsageTotals {
+    pub fn cache_read_percentage(&self) -> Option<f64> {
+        (self.input_tokens > 0 && self.cached_tokens <= self.input_tokens)
+            .then(|| 100.0 * self.cached_tokens as f64 / self.input_tokens as f64)
+    }
+
+    fn update(
+        &mut self,
+        previous: &mut Option<LanguageModelCacheUsage>,
+        next: LanguageModelCacheUsage,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            next.cached_tokens <= next.input_tokens,
+            "Reported cached tokens exceed input tokens"
+        );
+        let old = previous.unwrap_or(LanguageModelCacheUsage {
+            input_tokens: 0,
+            cached_tokens: 0,
+        });
+        let input_tokens = self
+            .input_tokens
+            .checked_sub(old.input_tokens)
+            .and_then(|total| total.checked_add(next.input_tokens))
+            .ok_or_else(|| {
+                anyhow!("Measured input-token total overflow or inconsistent cache usage")
+            })?;
+        let cached_tokens = self
+            .cached_tokens
+            .checked_sub(old.cached_tokens)
+            .and_then(|total| total.checked_add(next.cached_tokens))
+            .ok_or_else(|| {
+                anyhow!("Measured cached-token total overflow or inconsistent cache usage")
+            })?;
+        let requests = self
+            .requests
+            .checked_add(u64::from(previous.is_none()))
+            .ok_or_else(|| anyhow!("Measured request count overflow"))?;
+        *self = Self {
+            requests,
+            input_tokens,
+            cached_tokens,
+        };
+        *previous = Some(next);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredCacheUsage {
+    #[serde(default)]
+    pub agent: CacheUsageTotals,
+    #[serde(default)]
+    pub summary: CacheUsageTotals,
+}
+
+impl MeasuredCacheUsage {
+    pub fn combined(&self) -> Option<CacheUsageTotals> {
+        Some(CacheUsageTotals {
+            requests: self.agent.requests.checked_add(self.summary.requests)?,
+            input_tokens: self
+                .agent
+                .input_tokens
+                .checked_add(self.summary.input_tokens)?,
+            cached_tokens: self
+                .agent
+                .cached_tokens
+                .checked_add(self.summary.cached_tokens)?,
+        })
+    }
+}
+
 pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+const TERMINAL_USAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 enum RetryStrategy {
@@ -1275,6 +1359,10 @@ impl From<&ThreadModel> for Option<DbLanguageModel> {
 /// streamed chunk or scroll, and some fields never change after creation.
 #[derive(PartialEq)]
 pub(crate) struct StreamingSaveKey {
+    measured_cache_usage: MeasuredCacheUsage,
+    infinite_context: bool,
+    memory_archived: bool,
+    memory_turn_start: Option<(usize, u64)>,
     message_count: usize,
     title: Option<SharedString>,
     summary: Option<SharedString>,
@@ -1288,6 +1376,7 @@ pub(crate) struct StreamingSaveKey {
 }
 
 pub struct Thread {
+    memory: memory::MemoryRuntime,
     id: acp::SessionId,
     prompt_id: PromptId,
     updated_at: DateTime<Utc>,
@@ -1314,6 +1403,7 @@ pub struct Thread {
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
+    measured_cache_usage: MeasuredCacheUsage,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1445,6 +1535,7 @@ impl Thread {
                 .map_or(ThreadModel::Unset, ThreadModel::Unresolved),
         };
         Self {
+            memory: memory::MemoryRuntime::new(settings.infinite_context, false, None),
             id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
@@ -1461,6 +1552,7 @@ impl Thread {
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
+            measured_cache_usage: MeasuredCacheUsage::default(),
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
@@ -1821,6 +1913,11 @@ impl Thread {
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
         Self {
+            memory: memory::MemoryRuntime::new(
+                db_thread.infinite_context,
+                db_thread.memory_archived || db_thread.infinite_context,
+                db_thread.memory_turn_start,
+            ),
             id,
             prompt_id: PromptId::new(),
             title: if db_thread.title.is_empty() {
@@ -1840,6 +1937,7 @@ impl Thread {
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
+            measured_cache_usage: db_thread.measured_cache_usage,
             current_request_token_usage: TokenUsage::default(),
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
@@ -1944,15 +2042,18 @@ impl Thread {
 
     /// A field added here must also go in `StreamingSaveKey`, unless saving it
     /// can wait until the response finishes streaming.
-    pub fn to_db(&self, cx: &App) -> Task<DbThread> {
-        let initial_project_snapshot = self.initial_project_snapshot.clone();
-        let mut thread = DbThread {
+    pub fn snapshot_for_cache_replay(&self, _cx: &App) -> DbThread {
+        DbThread {
+            infinite_context: self.memory.enabled,
+            memory_archived: self.memory.archived,
+            memory_turn_start: self.memory.boundary,
             title: self.title().unwrap_or_default(),
             messages: self.messages.clone(),
             updated_at: self.updated_at,
             detailed_summary: self.summary.clone(),
-            initial_project_snapshot: None,
+            initial_project_snapshot: self.initial_project_snapshot.peek().cloned().flatten(),
             cumulative_token_usage: self.cumulative_token_usage,
+            measured_cache_usage: self.measured_cache_usage,
             request_token_usage: self.request_token_usage.clone(),
             model: (&self.model).into(),
             profile: Some(self.profile_id.clone()),
@@ -1969,8 +2070,12 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
-        };
+        }
+    }
 
+    pub fn to_db(&self, cx: &App) -> Task<DbThread> {
+        let initial_project_snapshot = self.initial_project_snapshot.clone();
+        let mut thread = self.snapshot_for_cache_replay(cx);
         cx.background_spawn(async move {
             let initial_project_snapshot = initial_project_snapshot.await;
             thread.initial_project_snapshot = initial_project_snapshot;
@@ -1984,6 +2089,10 @@ impl Thread {
 
     pub(crate) fn streaming_save_key(&self) -> StreamingSaveKey {
         StreamingSaveKey {
+            measured_cache_usage: self.measured_cache_usage,
+            infinite_context: self.memory.enabled,
+            memory_archived: self.memory.archived,
+            memory_turn_start: self.memory.boundary,
             message_count: self.messages.len(),
             title: self.title.clone(),
             summary: self.summary.clone(),
@@ -2360,6 +2469,7 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.cancel_memory_work();
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
                 subagent.update(cx, |thread, cx| thread.cancel(cx)).detach();
@@ -2375,10 +2485,32 @@ impl Thread {
 
         cx.spawn(async move |this, cx| {
             turn_task.await;
-            this.update(cx, |this, cx| {
-                this.flush_pending_message(cx);
-            })
-            .ok();
+            if let Some(task) = this
+                .read_with(cx, |this, _| this.pending_memory_work())
+                .log_err()
+                .flatten()
+            {
+                task.await
+                    .map_err(|error| anyhow!("Infinite memory: {error:#}"))
+                    .log_err();
+            }
+            let task = this
+                .update(cx, |this, cx| {
+                    if this.running_turn.is_none() {
+                        this.flush_pending_message(cx);
+                        return this
+                            .memory_history_is_append_only()
+                            .then(|| this.start_memory_work(false, cx));
+                    }
+                    None
+                })
+                .log_err()
+                .flatten();
+            if let Some(task) = task {
+                task.await
+                    .map_err(|error| anyhow!("Infinite memory: {error:#}"))
+                    .log_err();
+            }
         })
     }
 
@@ -2467,6 +2599,10 @@ impl Thread {
         client_user_message_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.memory_history_is_append_only(),
+            "Archived memory history is append-only; send a new message instead of editing or retrying."
+        );
         self.cancel(cx).detach();
         // Clear pending message since cancel will try to flush it asynchronously,
         // and we don't want that content to be added after we truncate
@@ -2494,6 +2630,10 @@ impl Thread {
         let last_user_message = self.last_user_message()?;
         let tokens = self.request_token_usage.get(&last_user_message.id)?;
         Some(*tokens)
+    }
+
+    pub fn measured_cache_usage(&self) -> MeasuredCacheUsage {
+        self.measured_cache_usage
     }
 
     pub fn cumulative_token_usage(&self) -> language_model::TokenUsage {
@@ -2590,6 +2730,7 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.flush_pending_message(cx);
         self.messages.push(Arc::new(Message::Resume));
         cx.notify();
 
@@ -2609,6 +2750,9 @@ impl Thread {
     where
         T: Into<UserMessageContent>,
     {
+        if self.memory_history_is_append_only() {
+            self.flush_pending_message(cx);
+        }
         let content = content.into_iter().map(Into::into).collect::<Arc<_>>();
         log::debug!("Thread::send content: {:?}", content);
 
@@ -2641,6 +2785,10 @@ impl Thread {
         id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        anyhow::ensure!(
+            !self.memory_history_is_append_only(),
+            "Destructive context compaction is unavailable for archived memory history."
+        );
         let model = self
             .compaction_model(cx)
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
@@ -2735,6 +2883,9 @@ impl Thread {
         path_style: PathStyle,
         cx: &mut Context<Self>,
     ) {
+        if self.memory_history_is_append_only() {
+            self.flush_pending_message(cx);
+        }
         let content = blocks
             .into_iter()
             .map(|block| UserMessageContent::from_content_block(block, path_style))
@@ -2777,7 +2928,17 @@ impl Thread {
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);
-        let message_ix = self.messages.len().saturating_sub(1);
+        let message_ix = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(&**message, Message::User(_) | Message::Resume))
+            .unwrap_or_else(|| self.messages.len().saturating_sub(1));
+        if self.memory_history_is_append_only() {
+            self.memory.turn_start = message_ix;
+            self.memory.boundary = None;
+            self.memory.prior_view = None;
+            self.clear_completed_memory_work();
+        }
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
@@ -2786,7 +2947,7 @@ impl Thread {
             async move |this, cx| {
                 log::debug!("Starting agent turn execution");
 
-                let turn_result =
+                let mut turn_result =
                     Self::run_turn_internal(&this, &event_stream, cancellation_rx.clone(), cx)
                         .await;
 
@@ -2798,7 +2959,44 @@ impl Thread {
                     return;
                 }
 
-                _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
+                {
+                    let final_memory = async {
+                        let previous_error = if let Some(task) =
+                            this.read_with(cx, |this, _| this.latest_memory_work())?
+                        {
+                            task.await.err()
+                        } else {
+                            None
+                        };
+                        let task = this.update(cx, |this, cx| {
+                            this.flush_pending_message(cx);
+                            this.memory_history_is_append_only().then(|| {
+                                this.start_memory_work(
+                                    this.memory.enabled && previous_error.is_none(),
+                                    cx,
+                                )
+                            })
+                        })?;
+                        if let Some(task) = task {
+                            task.await
+                                .map_err(|error| anyhow!("Infinite memory: {error:#}"))?;
+                        }
+                        if let Some(error) = previous_error {
+                            return Err(anyhow!("Infinite memory: {error:#}"));
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .fuse();
+                    futures::pin_mut!(final_memory);
+                    futures::select! {
+                        result = final_memory => {
+                            if let Err(error) = result { turn_result = Err(error); }
+                        },
+                        _ = cancellation_rx.changed().fuse() => {
+                            if *cancellation_rx.borrow() { return; }
+                        }
+                    }
+                }
 
                 match turn_result {
                     Ok(()) => {
@@ -2810,7 +3008,12 @@ impl Thread {
                         match error.downcast::<CompletionError>() {
                             Ok(CompletionError::Refusal) => {
                                 event_stream.send_stop(acp::StopReason::Refusal);
-                                _ = this.update(cx, |this, _| this.messages.truncate(message_ix));
+                                this.update(cx, |this, _| {
+                                    if !this.memory_history_is_append_only() {
+                                        this.messages.truncate(message_ix);
+                                    }
+                                })
+                                .log_err();
                             }
                             Ok(CompletionError::MaxTokens) => {
                                 event_stream.send_stop(acp::StopReason::MaxTokens);
@@ -2840,6 +3043,14 @@ impl Thread {
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
         loop {
+            if *cancellation_rx.borrow() {
+                return Ok(());
+            }
+            if let ControlFlow::Break(()) =
+                Self::prepare_memory_request(this, cancellation_rx.clone(), cx).await?
+            {
+                return Ok(());
+            }
             match Self::perform_compaction_if_needed(
                 this,
                 event_stream,
@@ -2917,6 +3128,12 @@ impl Thread {
                 }
             }
 
+            if !this.read_with(cx, |this, _| {
+                this.completion_request_is_active(event_stream, &mut cancellation_rx)
+            })? {
+                return Ok(());
+            }
+
             // Re-read the model and refresh tools on each iteration so that
             // mid-turn changes (e.g. the user switches model, toggles tools,
             // or changes profile) take effect between tool-call rounds.
@@ -2947,10 +3164,22 @@ impl Thread {
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
+            if *cancellation_rx.borrow() {
+                return Ok(());
+            }
             let events = match provider {
-                Ok(provider) => provider.stream_completion(&model, request, cx).await,
+                Ok(provider) => futures::select_biased! {
+                    _ = cancellation_rx.changed().fuse() => return Ok(()),
+                    result = provider.stream_completion(&model, request, cx).fuse() => result,
+                },
                 Err(error) => Err(error),
             };
+            if !this.read_with(cx, |this, _| {
+                this.completion_request_is_active(event_stream, &mut cancellation_rx)
+            })? {
+                return Ok(());
+            }
+            let mut cache_usage = None;
             let (mut events, mut error) = match events {
                 Ok(events) => (events.fuse(), None),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
@@ -2960,10 +3189,18 @@ impl Thread {
             let mut early_tool_results: Vec<(usize, LanguageModelToolResult)> = Vec::new();
             let mut cancelled = false;
             let mut had_refusal = false;
+            let mut terminal_error = None;
+            let mut terminal_usage_timer: Option<Task<()>> = None;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
                 let first_event = futures::select! {
                     event = events.next().fuse() => event,
+                    _ = async {
+                        match terminal_usage_timer.as_mut() {
+                            Some(timer) => timer.await,
+                            None => futures::future::pending().await,
+                        }
+                    }.fuse() => break,
                     tool_result = futures::StreamExt::select_next_some(&mut tool_results) => {
                         let (owning_message_ix, tool_result) = tool_result;
                         let is_error = tool_result.is_error;
@@ -3008,6 +3245,10 @@ impl Thread {
 
                 // Process the batch in a single update
                 let batch_result = this.update(cx, |this, cx| {
+                    if !this.completion_request_is_active(event_stream, &mut cancellation_rx) {
+                        cancelled = true;
+                        return (Vec::new(), None);
+                    }
                     let mut batch_tool_results = Vec::new();
                     let mut batch_error = None;
 
@@ -3015,10 +3256,33 @@ impl Thread {
                         log::trace!("Received completion event: {:?}", event);
                         match event {
                             Ok(event) => {
+                                match &event {
+                                    LanguageModelCompletionEvent::Stop(StopReason::Refusal) => {
+                                        had_refusal = true;
+                                        continue;
+                                    }
+                                    LanguageModelCompletionEvent::Stop(StopReason::MaxTokens) => {
+                                        terminal_error = Some(CompletionError::MaxTokens);
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                                // Some providers publish final usage after Stop. Drain
+                                // those snapshots without accepting more response content.
+                                if (had_refusal || terminal_error.is_some())
+                                    && !matches!(
+                                        &event,
+                                        LanguageModelCompletionEvent::UsageUpdate(_)
+                                            | LanguageModelCompletionEvent::CacheUsageUpdate(_)
+                                    )
+                                {
+                                    continue;
+                                }
                                 match this.handle_completion_event(
                                     event,
                                     event_stream,
                                     cancellation_rx.clone(),
+                                    &mut cache_usage,
                                     cx,
                                 ) {
                                     Ok(Some(task)) => batch_tool_results.push(task),
@@ -3040,6 +3304,15 @@ impl Thread {
                     (batch_tool_results, batch_error)
                 })?;
 
+                if cancelled {
+                    break;
+                }
+                // Final usage can arrive in a later chunk, but a terminal stop must
+                // still finish if the provider leaves its stream open indefinitely.
+                if (had_refusal || terminal_error.is_some()) && terminal_usage_timer.is_none() {
+                    terminal_usage_timer =
+                        Some(cx.background_executor().timer(TERMINAL_USAGE_TIMEOUT));
+                }
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
                     let is_refusal = err
@@ -3062,6 +3335,30 @@ impl Thread {
             // that need their own permits.
             drop(events);
 
+            if !this.read_with(cx, |this, _| {
+                this.completion_request_is_active(event_stream, &mut cancellation_rx)
+            })? {
+                for (owning_message_ix, tool_result) in early_tool_results {
+                    Self::process_tool_result(
+                        this,
+                        event_stream,
+                        cx,
+                        owning_message_ix,
+                        tool_result,
+                    )?;
+                }
+                while let Some((owning_message_ix, tool_result)) = tool_results.next().await {
+                    Self::process_tool_result(
+                        this,
+                        event_stream,
+                        cx,
+                        owning_message_ix,
+                        tool_result,
+                    )?;
+                }
+                return Ok(());
+            }
+
             // Drop streaming tool input senders that never received their final input.
             // This prevents deadlock when the LLM stream ends (e.g. because of an error)
             // before sending a tool use with `is_input_complete: true`.
@@ -3074,6 +3371,10 @@ impl Thread {
                     running_turn.streaming_tool_inputs.drain();
                 }
             })?;
+
+            if let Some(error) = terminal_error {
+                return Err(error.into());
+            }
 
             if had_refusal {
                 let maybe_fallback = this.update(cx, |this, cx| -> Option<LanguageModel> {
@@ -3112,7 +3413,11 @@ impl Thread {
                     log::info!("Refusal fallback: retrying with {}", fallback.id().0);
                     let fallback_name = fallback.name().0.clone();
                     this.update(cx, |this, cx| {
-                        this.pending_message = None;
+                        if this.memory_history_is_append_only() {
+                            this.flush_pending_message(cx);
+                        } else {
+                            this.pending_message = None;
+                        }
                         this.set_model(fallback.clone(), cx);
                     })?;
                     event_stream.send_retry(acp_thread::RetryStatus {
@@ -3137,6 +3442,11 @@ impl Thread {
             }
             while let Some((owning_message_ix, tool_result)) = tool_results.next().await {
                 Self::process_tool_result(this, event_stream, cx, owning_message_ix, tool_result)?;
+            }
+            if !this.read_with(cx, |this, _| {
+                this.completion_request_is_active(event_stream, &mut cancellation_rx)
+            })? {
+                return Ok(());
             }
 
             this.update(cx, |this, cx| {
@@ -3289,6 +3599,8 @@ impl Thread {
             let mut stream = stream?;
 
             let mut summary = String::new();
+            let mut cache_usage = None;
+            let mut terminal_error = None;
             loop {
                 let event = futures::select! {
                     event = stream.next().fuse() => event,
@@ -3315,6 +3627,23 @@ impl Thread {
                             this.accumulate_token_usage(usage);
                         })?;
                     }
+                    LanguageModelCompletionEvent::CacheUsageUpdate(usage) => {
+                        this.update(cx, |this, cx| -> Result<()> {
+                            this.measured_cache_usage
+                                .summary
+                                .update(&mut cache_usage, usage)?;
+                            this.updated_at = Utc::now();
+                            cx.notify();
+                            Ok(())
+                        })??;
+                    }
+                    LanguageModelCompletionEvent::Stop(StopReason::Refusal) => {
+                        terminal_error = Some(anyhow!("Compaction model refused the summary"));
+                    }
+                    LanguageModelCompletionEvent::Stop(StopReason::MaxTokens) => {
+                        terminal_error =
+                            Some(anyhow!("Compaction model exceeded its output token limit"));
+                    }
                     LanguageModelCompletionEvent::Stop(_)
                     | LanguageModelCompletionEvent::Started
                     | LanguageModelCompletionEvent::Queued { .. }
@@ -3333,6 +3662,9 @@ impl Thread {
                 return Ok(ControlFlow::Break(()));
             }
 
+            if let Some(error) = terminal_error {
+                return Err(error);
+            }
             let summary = summary.trim().to_string();
             if summary.is_empty() {
                 log::warn!("Compaction produced an empty summary");
@@ -3387,6 +3719,24 @@ impl Thread {
         owning_message_ix: usize,
         tool_result: LanguageModelToolResult,
     ) -> Result<(), anyhow::Error> {
+        // A canceled turn still owns its pending tool output, but must not write
+        // into a superseding turn or revise an already flushed memory message.
+        let accepts_tool_result =
+            this.read_with(cx, |this, _| match this.running_turn.as_ref() {
+                Some(turn) => turn.event_stream.sender.same_receiver(&event_stream.sender),
+                None => {
+                    owning_message_ix == this.messages.len()
+                        && this.pending_message.as_ref().is_some_and(|message| {
+                            message.content.iter().any(|content| {
+                                matches!(content, AgentMessageContent::ToolUse(tool_use)
+                                    if tool_use.id == tool_result.tool_use_id)
+                            })
+                        })
+                }
+            })?;
+        if !accepts_tool_result {
+            return Ok(());
+        }
         log::debug!("Tool finished {:?}", tool_result);
 
         event_stream.update_tool_call_fields(
@@ -3458,6 +3808,18 @@ impl Thread {
         })
     }
 
+    fn completion_request_is_active(
+        &self,
+        event_stream: &ThreadEventStream,
+        cancellation_rx: &mut watch::Receiver<bool>,
+    ) -> bool {
+        !*cancellation_rx.borrow()
+            && self
+                .running_turn
+                .as_ref()
+                .is_some_and(|turn| turn.event_stream.sender.same_receiver(&event_stream.sender))
+    }
+
     /// A helper method that's called on every streamed completion event.
     /// Returns an optional tool result task, which the main agentic loop will
     /// send back to the model when it resolves.
@@ -3465,9 +3827,13 @@ impl Thread {
         &mut self,
         event: LanguageModelCompletionEvent,
         event_stream: &ThreadEventStream,
-        cancellation_rx: watch::Receiver<bool>,
+        mut cancellation_rx: watch::Receiver<bool>,
+        cache_usage: &mut Option<LanguageModelCacheUsage>,
         cx: &mut Context<Self>,
     ) -> Result<Option<Task<(usize, LanguageModelToolResult)>>> {
+        if !self.completion_request_is_active(event_stream, &mut cancellation_rx) {
+            return Ok(None);
+        }
         log::trace!("Handling streamed completion event: {:?}", event);
         use LanguageModelCompletionEvent::*;
 
@@ -3532,6 +3898,11 @@ impl Thread {
                     telemetry.emit("succeeded", None, Some(total_input_tokens(usage)));
                 }
                 self.update_token_usage(usage, cx);
+            }
+            CacheUsageUpdate(usage) => {
+                self.measured_cache_usage.agent.update(cache_usage, usage)?;
+                self.updated_at = Utc::now();
+                cx.notify();
             }
             Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
             Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
@@ -3744,9 +4115,10 @@ impl Thread {
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
         );
         let supports_images = self.model().is_some_and(|model| model.supports_images());
+        let clip_output = self.memory_history_is_append_only();
         let tool_result = tool.run(tool_input, tool_event_stream, cx);
         cx.foreground_executor().spawn(async move {
-            let (is_error, output) = match tool_result.await {
+            let (is_error, mut output) = match tool_result.await {
                 Ok(mut output) => {
                     let contains_image = output
                         .llm_output
@@ -3795,7 +4167,12 @@ impl Thread {
                     tool_use_id,
                     tool_name,
                     is_error,
-                    content: output.llm_output,
+                    content: {
+                        if clip_output {
+                            memory::clip_tool_output(&mut output.llm_output);
+                        }
+                        output.llm_output
+                    },
                     output: Some(output.raw_output),
                 },
             )
@@ -3972,6 +4349,7 @@ impl Thread {
         let task = cx
             .spawn(async move |this, cx| {
                 let mut summary = String::new();
+                let mut cache_usage = None;
                 let provider = cx
                     .update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))
                     .log_err()?;
@@ -3983,6 +4361,19 @@ impl Thread {
                     let event = event.log_err()?;
                     let text = match event {
                         LanguageModelCompletionEvent::Text(text) => text,
+                        LanguageModelCompletionEvent::CacheUsageUpdate(usage) => {
+                            this.update(cx, |this, cx| -> Result<()> {
+                                this.measured_cache_usage
+                                    .summary
+                                    .update(&mut cache_usage, usage)?;
+                                this.updated_at = Utc::now();
+                                cx.notify();
+                                Ok(())
+                            })
+                            .log_err()?
+                            .log_err()?;
+                            continue;
+                        }
                         _ => continue,
                     };
 
@@ -4155,6 +4546,15 @@ impl Thread {
         completion_intent: CompletionIntent,
         cx: &App,
     ) -> Result<LanguageModelRequest> {
+        self.build_completion_request_with_memory(completion_intent, None, cx)
+    }
+
+    fn build_completion_request_with_memory(
+        &self,
+        completion_intent: CompletionIntent,
+        summary_view: Option<String>,
+        cx: &App,
+    ) -> Result<LanguageModelRequest> {
         let completion_intent =
             if self.is_subagent() && completion_intent == CompletionIntent::UserPrompt {
                 CompletionIntent::Subagent
@@ -4224,7 +4624,35 @@ impl Thread {
             .unwrap_or_default();
 
         log::debug!("Request includes {} tools", available_tools.len());
-        let messages = self.build_request_messages(available_tools, cx);
+        let messages = if self.memory.enabled {
+            let is_summary = summary_view.is_some();
+            let view = match summary_view {
+                Some(view) => view,
+                None => self.memory_view()?,
+            };
+            let mut request = LanguageModelRequest::default();
+            request.messages = self.build_request_messages_until(available_tools, 0, cx);
+            if let Some(system) = request.messages.first_mut() {
+                system
+                    .content
+                    .push(include_str!("./prompts/infinite_context_prompt.txt").into());
+            }
+            append_memory_view(&mut request, view);
+            if !is_summary {
+                for message in self.messages.iter().skip(self.memory.turn_start) {
+                    request.messages.extend(message.to_request());
+                }
+                if let Some(message) = &self.pending_message {
+                    request.messages.extend(message.to_request());
+                }
+                if let Some(last) = request.messages.last_mut() {
+                    last.cache = true;
+                }
+            }
+            request.messages
+        } else {
+            self.build_request_messages(available_tools, cx)
+        };
         log::debug!("Request will include {} messages", messages.len());
 
         let request = LanguageModelRequest {
@@ -4342,6 +4770,9 @@ impl Thread {
             }
         }
 
+        if self.memory.enabled {
+            tools.extend(self.memory_tools());
+        }
         tools
     }
 
@@ -4414,7 +4845,8 @@ impl Thread {
     }
 
     pub(crate) fn auto_compaction_enabled(&self, cx: &App) -> bool {
-        AgentSettings::get_global(cx).auto_compact.enabled
+        !self.memory_history_is_append_only()
+            && AgentSettings::get_global(cx).auto_compact.enabled
             && self.input_token_capacity().is_some_and(|max_input_tokens| {
                 // Models with a small context window don't leave enough headroom for a
                 // compaction pass; the UI warns the user about the token limit instead.
@@ -7065,7 +7497,7 @@ mod tests {
         );
     }
 
-    async fn setup_thread_for_test(
+    pub(super) async fn setup_thread_for_test(
         cx: &mut TestAppContext,
     ) -> (
         Entity<Thread>,

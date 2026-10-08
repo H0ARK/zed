@@ -658,7 +658,7 @@ pub struct ResponseUsage {
     #[serde(default)]
     pub input_tokens: Option<u64>,
     #[serde(default)]
-    pub input_tokens_details: ResponseInputTokensDetails,
+    pub input_tokens_details: Option<ResponseInputTokensDetails>,
     #[serde(default)]
     pub output_tokens: Option<u64>,
     #[serde(default)]
@@ -670,7 +670,7 @@ pub struct ResponseUsage {
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ResponseInputTokensDetails {
     #[serde(default)]
-    pub cached_tokens: u64,
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]

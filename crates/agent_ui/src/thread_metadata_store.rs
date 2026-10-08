@@ -1836,6 +1836,10 @@ mod tests {
 
     fn make_db_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
+            infinite_context: false,
+            memory_archived: false,
+            memory_turn_start: None,
+            measured_cache_usage: Default::default(),
             title: title.to_string().into(),
             messages: Vec::new(),
             updated_at,

@@ -1276,6 +1276,7 @@
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.
+    "infinite_context": false,
     "auto_compact": {
       // Whether to automatically compact the agent's context near the limit.
       "enabled": true,

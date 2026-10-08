@@ -108,6 +108,7 @@ pub async fn collect_compaction_result(
             | LanguageModelCompletionEvent::ToolUseJsonParseError { .. }
             | LanguageModelCompletionEvent::StartMessage { .. }
             | LanguageModelCompletionEvent::ReasoningDetails(_)
+            | LanguageModelCompletionEvent::CacheUsageUpdate(_)
             | LanguageModelCompletionEvent::Compaction(CompactionUpdate::Started)
             | LanguageModelCompletionEvent::Compaction(CompactionUpdate::SummaryDelta(_)) => {}
         }
@@ -838,8 +839,9 @@ mod tests {
     use crate::{AnthropicModelMode, UsageIteration, UsageIterationType};
     use futures::executor::block_on;
     use language_model_core::{
-        ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME, LanguageModelCompletionEvent,
-        LanguageModelImage, LanguageModelRequestMessage, MessageContent, TokenUsage,
+        ANTHROPIC_PROVIDER_ID, ANTHROPIC_PROVIDER_NAME, LanguageModelCacheUsage,
+        LanguageModelCompletionEvent, LanguageModelImage, LanguageModelRequestMessage,
+        MessageContent, TokenUsage,
     };
 
     #[test]
@@ -851,7 +853,8 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 60_000,
             output_tokens: 1_000,
-            ..Default::default()
+            cache_creation_input_tokens: 5_000,
+            cache_read_input_tokens: 40_000,
         };
         let stream = futures::stream::iter([
             Ok(LanguageModelCompletionEvent::Compaction(
@@ -860,7 +863,25 @@ mod tests {
             Ok(LanguageModelCompletionEvent::Compaction(
                 CompactionUpdate::Finished(context.clone()),
             )),
+            Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                LanguageModelCacheUsage {
+                    input_tokens: 105_000,
+                    cached_tokens: 40_000,
+                },
+            )),
             Ok(LanguageModelCompletionEvent::UsageUpdate(usage)),
+            Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                LanguageModelCacheUsage {
+                    input_tokens: 105_000,
+                    cached_tokens: 40_000,
+                },
+            )),
+            Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                LanguageModelCacheUsage {
+                    input_tokens: 105_000,
+                    cached_tokens: 0,
+                },
+            )),
             Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)),
         ])
         .boxed();

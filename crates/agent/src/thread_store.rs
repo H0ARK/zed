@@ -59,6 +59,20 @@ impl ThreadStore {
         })
     }
 
+    /// Returns the stored versioned JSON without deserializing or migrating it.
+    pub fn load_thread_json(
+        &mut self,
+        id: &acp::SessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<u8>>> {
+        let id = id.clone();
+        let database_future = ThreadsDatabase::connect(cx);
+        cx.background_spawn(async move {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            database.load_thread_json(id).await
+        })
+    }
+
     pub fn save_thread(
         &mut self,
         id: acp::SessionId,
@@ -151,6 +165,10 @@ mod tests {
 
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
+            infinite_context: false,
+            memory_archived: false,
+            memory_turn_start: None,
+            measured_cache_usage: Default::default(),
             title: title.to_string().into(),
             messages: Vec::new(),
             updated_at,
@@ -169,6 +187,70 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
         }
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_returns_versioned_json(cx: &mut TestAppContext) {
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        cx.run_until_parked();
+
+        let thread_id = session_id("raw-thread");
+        let thread = make_thread(
+            "Raw thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid date"),
+        );
+        thread_store
+            .update(cx, |store, cx| {
+                store.save_thread(thread_id.clone(), thread, PathList::default(), cx)
+            })
+            .await
+            .expect("save thread");
+        let json = thread_store
+            .update(cx, |store, cx| store.load_thread_json(&thread_id, cx))
+            .await
+            .expect("load raw thread JSON");
+        let json: serde_json::Value = serde_json::from_slice(&json).expect("parse stored JSON");
+        assert_eq!(
+            json.get("version").expect("stored version"),
+            DbThread::VERSION
+        );
+        assert_eq!(json.get("title").expect("stored title"), "Raw thread");
+        assert_eq!(
+            json.get("infinite_context")
+                .expect("stored infinite_context"),
+            false
+        );
+        assert_eq!(
+            json.get("memory_archived").expect("stored memory_archived"),
+            false
+        );
+        assert_eq!(
+            json.get("memory_turn_start")
+                .expect("stored memory_turn_start"),
+            &serde_json::Value::Null
+        );
+        assert_eq!(
+            json.get("measured_cache_usage")
+                .expect("stored measured_cache_usage"),
+            &serde_json::to_value(crate::thread::MeasuredCacheUsage::default())
+                .expect("serialize default cache usage")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_errors_for_missing_thread(cx: &mut TestAppContext) {
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        cx.run_until_parked();
+
+        let error = thread_store
+            .update(cx, |store, cx| {
+                store.load_thread_json(&session_id("missing-thread"), cx)
+            })
+            .await
+            .expect_err("missing thread must be an error");
+        assert!(error.to_string().contains("missing-thread"));
     }
 
     #[gpui::test]
