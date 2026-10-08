@@ -1284,7 +1284,7 @@ impl ActiveThread {
     /// Spawns a task to save the active thread.
     ///
     /// Only one task to save the thread will be in flight at a time.
-    fn save_thread(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_thread(&mut self, cx: &mut Context<Self>) {
         let thread = self.thread.clone();
         self.save_thread_task = Some(cx.spawn(async move |this, cx| {
             let task = this
@@ -1308,6 +1308,9 @@ impl ActiveThread {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.thread.read(cx).memory_history_is_append_only() {
+            return;
+        }
         let editor = crate::message_editor::create_editor(
             self.workspace.clone(),
             self.context_store.downgrade(),
@@ -2734,7 +2737,9 @@ impl ActiveThread {
         let is_direct_terminal_command = tool_use.id.to_string().starts_with("term-");
 
         if is_direct_terminal_command {
-            return self.render_direct_terminal_command(tool_use, window, workspace, cx).into_any_element();
+            return self
+                .render_direct_terminal_command(tool_use, window, workspace, cx)
+                .into_any_element();
         }
 
         let is_open = self
@@ -3236,57 +3241,67 @@ impl ActiveThread {
                         Animation::new(Duration::from_secs(2)).repeat(),
                         |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
                     )
-                    .into_any_element()
+                    .into_any_element(),
             ),
             ToolUseStatus::Error(_) => Some(
                 Icon::new(IconName::Close)
                     .color(Color::Error)
                     .size(IconSize::Small)
-                    .into_any_element()
+                    .into_any_element(),
             ),
             ToolUseStatus::Finished(_) | ToolUseStatus::NeedsConfirmation => None,
         };
 
         // Terminal output content - show real-time terminal output when running, or final result when finished
         let terminal_output = match &tool_use.status {
-            ToolUseStatus::Finished(_) => {
-                rendered_tool_use.as_ref().map(|rendered| {
-                    div()
-                        .w_full()
-                        .text_ui_sm(cx)
-                        .child(
-                            MarkdownElement::new(
-                                rendered.output.clone(),
-                                tool_use_markdown_style(window, cx),
-                            )
-                            .code_block_renderer(markdown::CodeBlockRenderer::Default {
-                                copy_button: false,
-                                copy_button_on_hover: false,
-                                border: false,
-                            })
-                            .on_url_click({
-                                let workspace = self.workspace.clone();
-                                move |text, window, cx| {
-                                    open_markdown_link(text, workspace.clone(), window, cx);
-                                }
-                            })
+            ToolUseStatus::Finished(_) => rendered_tool_use.as_ref().map(|rendered| {
+                div()
+                    .w_full()
+                    .text_ui_sm(cx)
+                    .child(
+                        MarkdownElement::new(
+                            rendered.output.clone(),
+                            tool_use_markdown_style(window, cx),
                         )
-                        .into_any_element()
-                })
-            }
+                        .code_block_renderer(markdown::CodeBlockRenderer::Default {
+                            copy_button: false,
+                            copy_button_on_hover: false,
+                            border: false,
+                        })
+                        .on_url_click({
+                            let workspace = self.workspace.clone();
+                            move |text, window, cx| {
+                                open_markdown_link(text, workspace.clone(), window, cx);
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            }),
             ToolUseStatus::Running | ToolUseStatus::InputStillStreaming => {
                 // Show real-time terminal output if a terminal card is available
-                log::info!("Direct terminal command running, tool_use.id: {}", tool_use.id);
+                log::info!(
+                    "Direct terminal command running, tool_use.id: {}",
+                    tool_use.id
+                );
 
                 if let Some(card) = self.thread.read(cx).card_for_tool(&tool_use.id) {
-                    log::info!("Found terminal card for tool_use.id: {}, rendering card", tool_use.id);
+                    log::info!(
+                        "Found terminal card for tool_use.id: {}, rendering card",
+                        tool_use.id
+                    );
                     Some(card.render(&tool_use.status, window, workspace.clone(), cx))
                 } else {
-                    log::warn!("No terminal card found for tool_use.id: {}, showing fallback", tool_use.id);
+                    log::warn!(
+                        "No terminal card found for tool_use.id: {}, showing fallback",
+                        tool_use.id
+                    );
 
                     // Debug: Check if any cards are available
                     let thread = self.thread.read(cx);
-                    log::info!("Thread has pending tool uses: {}", thread.has_pending_tool_uses());
+                    log::info!(
+                        "Thread has pending tool uses: {}",
+                        thread.has_pending_tool_uses()
+                    );
 
                     // Fallback to running indicator if no card is available
                     Some(
@@ -3300,7 +3315,9 @@ impl ActiveThread {
                                         "arrow-circle",
                                         Animation::new(Duration::from_secs(2)).repeat(),
                                         |icon, delta| {
-                                            icon.transform(Transformation::rotate(percentage(delta)))
+                                            icon.transform(Transformation::rotate(percentage(
+                                                delta,
+                                            )))
                                         },
                                     ),
                             )
@@ -3310,29 +3327,27 @@ impl ActiveThread {
                                     .color(Color::Muted)
                                     .buffer_font(cx),
                             )
-                            .into_any_element()
+                            .into_any_element(),
                     )
                 }
-            },
-            ToolUseStatus::Error(_) => {
-                rendered_tool_use.as_ref().map(|rendered| {
-                    div()
-                        .text_ui_sm(cx)
-                        .child(
-                            MarkdownElement::new(
-                                rendered.output.clone(),
-                                tool_use_markdown_style(window, cx),
-                            )
-                            .on_url_click({
-                                let workspace = self.workspace.clone();
-                                move |text, window, cx| {
-                                    open_markdown_link(text, workspace.clone(), window, cx);
-                                }
-                            })
-                        )
-                        .into_any_element()
-                })
             }
+            ToolUseStatus::Error(_) => rendered_tool_use.as_ref().map(|rendered| {
+                div()
+                    .text_ui_sm(cx)
+                    .child(
+                        MarkdownElement::new(
+                            rendered.output.clone(),
+                            tool_use_markdown_style(window, cx),
+                        )
+                        .on_url_click({
+                            let workspace = self.workspace.clone();
+                            move |text, window, cx| {
+                                open_markdown_link(text, workspace.clone(), window, cx);
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            }),
             ToolUseStatus::Pending | ToolUseStatus::NeedsConfirmation => None,
         };
 
@@ -3359,26 +3374,27 @@ impl ActiveThread {
                                             .size(IconSize::XSmall)
                                             .color(Color::Muted),
                                     )
-                                    .child(
-                                        h_flex().pr_8().text_size(rems(0.8125)).children(
-                                            rendered_tool_use.map(|rendered| {
-                                                MarkdownElement::new(
-                                                    rendered.label,
-                                                    tool_use_markdown_style(window, cx),
-                                                )
-                                                .on_url_click({
-                                                    let workspace = self.workspace.clone();
-                                                    move |text, window, cx| {
-                                                        open_markdown_link(text, workspace.clone(), window, cx);
-                                                    }
-                                                })
+                                    .child(h_flex().pr_8().text_size(rems(0.8125)).children(
+                                        rendered_tool_use.map(|rendered| {
+                                            MarkdownElement::new(
+                                                rendered.label,
+                                                tool_use_markdown_style(window, cx),
+                                            )
+                                            .on_url_click({
+                                                let workspace = self.workspace.clone();
+                                                move |text, window, cx| {
+                                                    open_markdown_link(
+                                                        text,
+                                                        workspace.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
                                             })
-                                        ),
-                                    ),
+                                        }),
+                                    )),
                             )
-                            .children(status_icon.map(|icon| {
-                                h_flex().gap_1().child(icon)
-                            })),
+                            .children(status_icon.map(|icon| h_flex().gap_1().child(icon))),
                     )
                     .children(terminal_output.map(|output| {
                         v_flex()

@@ -6,9 +6,7 @@ use uuid;
 use crate::agent_model_selector::AgentModelSelector;
 use crate::language_model_selector::ToggleModelSelector;
 use crate::tool_compatibility::{IncompatibleToolsState, IncompatibleToolsTooltip};
-use crate::ui::{
-    preview::{AgentPreview, UsageCallout},
-};
+use crate::ui::preview::{AgentPreview, UsageCallout};
 use agent::{
     context::{AgentContextKey, ContextLoadResult, load_context},
     context_store::ContextStoreEvent,
@@ -48,20 +46,23 @@ use std::time::Duration;
 use util::paths;
 
 // use util::ResultExt;
+use crate::{
+    AddContextServer, NewTextThread, OpenHistory, ToggleOptionsMenu,
+    text_thread_editor::humanize_token_count,
+};
+use client::zed_urls;
+use copilot::copilot_chat;
+use gpui::{AsyncApp, AsyncWindowContext, Corner, StatefulInteractiveElement as _};
 use theme::ThemeSettings;
 use ui::{
     Callout, ContextMenu, Disclosure, Divider, DividerColor, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProgressBar, Tooltip, prelude::*,
 };
-use client::zed_urls;
-use zed_llm_client::UsageLimit;
+use util::ResultExt;
+use workspace::ToggleZoom;
 use zed_actions::agent::OpenConfiguration;
 use zed_actions::assistant::OpenRulesLibrary;
-use crate::{AddContextServer, NewTextThread, ToggleOptionsMenu, OpenHistory, text_thread_editor::humanize_token_count};
-use workspace::ToggleZoom;
-use gpui::{AsyncApp, AsyncWindowContext, Corner, StatefulInteractiveElement as _};
-use copilot::copilot_chat;
-use util::ResultExt;
+use zed_llm_client::UsageLimit;
 struct DirBrowser {
     parent: WeakEntity<MessageEditor>,
     project: Entity<Project>,
@@ -99,10 +100,12 @@ impl DirBrowser {
         };
 
         // Re-render on search edits so filtering updates live.
-        this._subscriptions.push(cx.subscribe(&search_editor, |_this, _, event, cx| match event {
-            EditorEvent::BufferEdited => cx.notify(),
-            _ => {}
-        }));
+        this._subscriptions.push(
+            cx.subscribe(&search_editor, |_this, _, event, cx| match event {
+                EditorEvent::BufferEdited => cx.notify(),
+                _ => {}
+            }),
+        );
 
         this
     }
@@ -130,7 +133,10 @@ impl Render for DirBrowser {
         // Add ".." navigation if not at worktree root
         if let Some(wt) = worktree.as_ref() {
             if !rel.as_os_str().is_empty() {
-                let parent_rel = rel.parent().unwrap_or_else(|| std::path::Path::new("")).to_path_buf();
+                let parent_rel = rel
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .to_path_buf();
                 let wt_clone = wt.clone();
                 children.push(
                     ui::ListItem::new("go-up")
@@ -155,7 +161,9 @@ impl Render for DirBrowser {
 
             let mut dir_items: Vec<(Arc<std::path::Path>, String, Option<PathBuf>)> = Vec::new();
             for entry in snapshot.child_entries(&rel) {
-                if !entry.is_dir() { continue; }
+                if !entry.is_dir() {
+                    continue;
+                }
                 let name = entry
                     .path
                     .file_name()
@@ -226,7 +234,9 @@ impl Render for DirBrowser {
                     if path.is_dir() {
                         if !query.is_empty() {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                if !name.to_lowercase().contains(&query) { continue; }
+                                if !name.to_lowercase().contains(&query) {
+                                    continue;
+                                }
                             }
                         }
                         entries.push(path);
@@ -235,7 +245,8 @@ impl Render for DirBrowser {
                 entries.sort_by(|a, b| {
                     let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    (an.starts_with('.'), an.to_lowercase()).cmp(&(bn.starts_with('.'), bn.to_lowercase()))
+                    (an.starts_with('.'), an.to_lowercase())
+                        .cmp(&(bn.starts_with('.'), bn.to_lowercase()))
                 });
 
                 for abs in entries {
@@ -283,13 +294,18 @@ impl Render for DirBrowser {
         v_flex()
             .w(px(420.0))
             .gap_1()
+            .child(EditorElement::new(
+                &self.search_editor,
+                EditorStyle {
+                    text: text_style,
+                    ..Default::default()
+                },
+            ))
             .child(
-                EditorElement::new(
-                    &self.search_editor,
-                    EditorStyle { text: text_style, ..Default::default() },
-                ),
+                div()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant),
             )
-            .child(div().border_t_1().border_color(cx.theme().colors().border_variant))
             .child(v_flex().children(children))
     }
 }
@@ -307,12 +323,12 @@ use crate::{
     ModelUsageContext, NewThread, OpenAgentDiff, RejectAll, RemoveAllContext, ToggleBurnMode,
     ToggleContextPicker, ToggleProfileSelector, register_agent_preview,
 };
-use gpui::Action;
 use agent::{
     MessageCrease, Thread, TokenUsageRatio, TotalTokenUsage,
     context_store::ContextStore,
     thread_store::{TextThreadStore, ThreadStore},
 };
+use gpui::Action;
 
 #[derive(RegisterComponent)]
 pub struct MessageEditor {
@@ -544,7 +560,12 @@ impl MessageEditor {
         let initial_cwd = project
             .read(cx)
             .first_project_directory(cx)
-            .or_else(|| project.read(cx).active_project_directory(cx).map(|p| p.to_path_buf()))
+            .or_else(|| {
+                project
+                    .read(cx)
+                    .active_project_directory(cx)
+                    .map(|p| p.to_path_buf())
+            })
             .or_else(|| Some(paths::home_dir().clone()));
 
         let this = Self {
@@ -765,7 +786,9 @@ impl MessageEditor {
 
         // Intercept cd to update the working directory state
         let mut effective_command = command.clone();
-        if let Some(new_cwd) = Self::resolve_cd_command(&command, self.cwd.clone(), &self.project, cx) {
+        if let Some(new_cwd) =
+            Self::resolve_cd_command(&command, self.cwd.clone(), &self.project, cx)
+        {
             self.cwd = Some(new_cwd);
             cx.notify();
             // Run pwd to reflect new state to the user
@@ -852,10 +875,14 @@ impl MessageEditor {
     ) -> Option<PathBuf> {
         // Accept commands like: cd, cd .., cd path, cd "path with spaces"
         let trimmed = command.trim_start();
-        if !trimmed.starts_with("cd") { return None; }
+        if !trimmed.starts_with("cd") {
+            return None;
+        }
         let mut parts = trimmed.splitn(2, char::is_whitespace);
         let first = parts.next()?;
-        if first != "cd" { return None; }
+        if first != "cd" {
+            return None;
+        }
         let arg = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty());
 
         let base = current
@@ -866,11 +893,11 @@ impl MessageEditor {
             None => paths::home_dir().clone(),
             Some(path_str) => {
                 // Remove surrounding quotes if present
-                let unquoted = path_str
-                    .trim_matches('"')
-                    .trim_matches('\'');
+                let unquoted = path_str.trim_matches('"').trim_matches('\'');
                 // Tilde expansion
-                let expanded = shellexpand::full(unquoted).unwrap_or_else(|_| unquoted.into()).to_string();
+                let expanded = shellexpand::full(unquoted)
+                    .unwrap_or_else(|_| unquoted.into())
+                    .to_string();
                 let p = std::path::PathBuf::from(&expanded);
                 if p.is_absolute() { p } else { base.join(p) }
             }
@@ -1095,7 +1122,11 @@ impl MessageEditor {
         cx.notify();
     }
 
-    fn render_agent_options_menu(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_agent_options_menu(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let thread = self.thread.read(cx);
         let user_store = self.user_store.read(cx);
         let thread_id = thread.id().clone();
@@ -1103,7 +1134,11 @@ impl MessageEditor {
         let usage = user_store.model_request_usage();
         let account_url = zed_urls::account_url(cx);
         let focus_handle = self.editor.focus_handle(cx);
-        let zoom_in_label = if self.editor_is_expanded { "Zoom Out" } else { "Zoom In" };
+        let zoom_in_label = if self.editor_is_expanded {
+            "Zoom Out"
+        } else {
+            "Zoom In"
+        };
         PopoverMenu::new("agent-options-menu")
             .trigger_with_tooltip(
                 IconButton::new("agent-options-menu", IconName::Ellipsis)
@@ -1132,7 +1167,9 @@ impl MessageEditor {
                         .when(!is_empty, |menu| {
                             menu.action(
                                 "New From Summary",
-                                Box::new(NewThread { from_thread_id: Some(thread_id.clone()) }),
+                                Box::new(NewThread {
+                                    from_thread_id: Some(thread_id.clone()),
+                                }),
                             )
                         })
                         .separator();
@@ -1142,7 +1179,9 @@ impl MessageEditor {
                         .action(
                             "View Server Extensions",
                             Box::new(zed_actions::Extensions {
-                                category_filter: Some(zed_actions::ExtensionCategoryFilter::ContextServers),
+                                category_filter: Some(
+                                    zed_actions::ExtensionCategoryFilter::ContextServers,
+                                ),
                             }),
                         )
                         .action("Add Custom Server…", Box::new(AddContextServer))
@@ -1154,18 +1193,26 @@ impl MessageEditor {
                             .custom_entry(
                                 move |_window, cx| {
                                     let used_percentage = match usage.limit {
-                                        UsageLimit::Limited(limit) => Some(((usage.amount as f32) / (limit as f32)) * 100.0),
+                                        UsageLimit::Limited(limit) => {
+                                            Some(((usage.amount as f32) / (limit as f32)) * 100.0)
+                                        }
                                         UsageLimit::Unlimited => None,
                                     };
 
                                     h_flex()
                                         .flex_1()
                                         .gap_1p5()
-                                        .children(used_percentage.map(|percent| ProgressBar::new("usage", percent, 100.0, cx)))
+                                        .children(used_percentage.map(|percent| {
+                                            ProgressBar::new("usage", percent, 100.0, cx)
+                                        }))
                                         .child(
                                             Label::new(match usage.limit {
-                                                UsageLimit::Limited(limit) => { format!("{} / {limit}", usage.amount) }
-                                                UsageLimit::Unlimited => { format!("{} / ∞", usage.amount) }
+                                                UsageLimit::Limited(limit) => {
+                                                    format!("{} / {limit}", usage.amount)
+                                                }
+                                                UsageLimit::Unlimited => {
+                                                    format!("{} / ∞", usage.amount)
+                                                }
                                             })
                                             .size(LabelSize::Small)
                                             .color(Color::Muted),
@@ -1266,12 +1313,15 @@ impl MessageEditor {
 
         // Get conversation token usage, or use default if no conversation yet
         let conversation_token_usage = thread.total_token_usage().unwrap_or_else(|| {
-            TotalTokenUsage { total: 0, max: 8192 } // Default reasonable max tokens
+            TotalTokenUsage {
+                total: 0,
+                max: 8192,
+            } // Default reasonable max tokens
         });
 
         let combined_usage = conversation_token_usage.add(unsent_tokens);
 
-        // Show token count if we have tokens or estimated tokens  
+        // Show token count if we have tokens or estimated tokens
         if combined_usage.total == 0 && !is_estimating {
             return None;
         }
@@ -1299,9 +1349,7 @@ impl MessageEditor {
                                 .justify_center()
                                 .rounded_full()
                                 .bg(cx.theme().colors().text.opacity(0.1))
-                                .child(
-                                    div().size_1().rounded_full().bg(cx.theme().colors().text),
-                                ),
+                                .child(div().size_1().rounded_full().bg(cx.theme().colors().text)),
                         )
                         .tooltip(move |window, cx| {
                             Tooltip::with_meta(
@@ -1309,7 +1357,7 @@ impl MessageEditor {
                                 None,
                                 format!(
                                     "Current Conversation Tokens: {}",
-                                    humanize_token_count(total_token_usage.total)
+                                    humanize_token_count(conversation_token_usage.total)
                                 ),
                                 window,
                                 cx,
@@ -2477,4 +2525,3 @@ impl AgentPreview for MessageEditor {
 }
 
 register_agent_preview!(MessageEditor);
-

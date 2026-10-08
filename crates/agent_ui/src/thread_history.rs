@@ -699,47 +699,87 @@ impl RenderOnce for HistoryEntryElement {
                     ),
             )
             .on_hover(self.on_hover)
-            .end_slot::<IconButton>(if self.hovered || self.selected {
+            .end_slot::<gpui::Div>(if self.hovered || self.selected {
                 Some(
-                    IconButton::new("delete", IconName::TrashAlt)
-                        .shape(IconButtonShape::Square)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .tooltip(move |window, cx| {
-                            Tooltip::for_action("Delete", &RemoveSelectedThread, window, cx)
-                        })
-                        .on_click({
-                            let agent_panel = self.agent_panel.clone();
-
-                            let f: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static> =
-                                match &self.entry {
-                                    HistoryEntry::Thread(thread) => {
-                                        let id = thread.id.clone();
-
-                                        Box::new(move |_event, _window, cx| {
+                    h_flex()
+                        .gap_1()
+                        .when_some(
+                            match &self.entry {
+                                HistoryEntry::Thread(thread) => Some(thread),
+                                HistoryEntry::Context(_) => None,
+                            },
+                            |this, thread| {
+                                let agent_panel = self.agent_panel.clone();
+                                let id = thread.id.clone();
+                                let title = thread.summary.clone();
+                                this.child(
+                                    IconButton::new("offline-cache-report", IconName::FileText)
+                                        .shape(IconButtonShape::Square)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .disabled(!cfg!(unix))
+                                        .tooltip(Tooltip::text(if cfg!(unix) {
+                                            "Offline cache report"
+                                        } else {
+                                            "Offline cache replay currently requires macOS or Linux for private temporary journal permissions."
+                                        }))
+                                        .on_click(move |_event, _window, cx| {
+                                            cx.stop_propagation();
                                             agent_panel
                                                 .update(cx, |this, cx| {
-                                                    this.delete_thread(&id, cx)
-                                                        .detach_and_log_err(cx);
+                                                    this.replay_saved_thread(
+                                                        id.clone(),
+                                                        title.clone(),
+                                                        cx,
+                                                    );
                                                 })
-                                                .ok();
-                                        })
-                                    }
-                                    HistoryEntry::Context(context) => {
-                                        let path = context.path.clone();
+                                                .log_err();
+                                        }),
+                                )
+                            },
+                        )
+                        .child(
+                            IconButton::new("delete", IconName::TrashAlt)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::for_action("Delete", &RemoveSelectedThread, window, cx)
+                                })
+                                .on_click({
+                                    let agent_panel = self.agent_panel.clone();
 
-                                        Box::new(move |_event, _window, cx| {
-                                            agent_panel
-                                                .update(cx, |this, cx| {
-                                                    this.delete_context(path.clone(), cx)
-                                                        .detach_and_log_err(cx);
-                                                })
-                                                .ok();
-                                        })
-                                    }
-                                };
-                            f
-                        }),
+                                    let f: Box<
+                                        dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+                                    > = match &self.entry {
+                                        HistoryEntry::Thread(thread) => {
+                                            let id = thread.id.clone();
+
+                                            Box::new(move |_event, _window, cx| {
+                                                agent_panel
+                                                    .update(cx, |this, cx| {
+                                                        this.delete_thread(&id, cx)
+                                                            .detach_and_log_err(cx);
+                                                    })
+                                                    .ok();
+                                            })
+                                        }
+                                        HistoryEntry::Context(context) => {
+                                            let path = context.path.clone();
+
+                                            Box::new(move |_event, _window, cx| {
+                                                agent_panel
+                                                    .update(cx, |this, cx| {
+                                                        this.delete_context(path.clone(), cx)
+                                                            .detach_and_log_err(cx);
+                                                    })
+                                                    .ok();
+                                            })
+                                        }
+                                    };
+                                    f
+                                }),
+                        ),
                 )
             } else {
                 None

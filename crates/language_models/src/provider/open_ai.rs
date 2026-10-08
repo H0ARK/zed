@@ -8,11 +8,11 @@ use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, Subscription, Task, Window};
 use http_client::HttpClient;
 use language_model::{
-    AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
-    RateLimiter, Role, StopReason, TokenUsage,
+    AuthenticateError, LanguageModel, LanguageModelCacheUsage, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolResultContent,
+    LanguageModelToolUse, MessageContent, RateLimiter, Role, StopReason, TokenUsage,
 };
 use menu;
 use open_ai::{ImageUrl, Model, ResponseStreamEvent, stream_completion};
@@ -444,6 +444,9 @@ pub fn into_open_ai(
         model: model_id.into(),
         messages,
         stream,
+        stream_options: stream.then_some(open_ai::StreamOptions {
+            include_usage: true,
+        }),
         stop: request.stop,
         temperature: request.temperature.unwrap_or(1.0),
         max_completion_tokens: max_output_tokens,
@@ -536,12 +539,32 @@ impl OpenAiEventMapper {
     ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
         let mut events = Vec::new();
         if let Some(usage) = event.usage {
+            let cached_tokens = usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens);
+            let cache_read_input_tokens = cached_tokens.unwrap_or(0);
+            let Some(input_tokens) = usage.prompt_tokens.checked_sub(cache_read_input_tokens)
+            else {
+                return vec![Err(LanguageModelCompletionError::Other(anyhow!(
+                    "Invalid OpenAI Chat Completions usage: cached_tokens ({cache_read_input_tokens}) exceeds prompt_tokens ({})",
+                    usage.prompt_tokens,
+                )))];
+            };
+
             events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                input_tokens: usage.prompt_tokens,
+                input_tokens,
                 output_tokens: usage.completion_tokens,
                 cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
+                cache_read_input_tokens,
             })));
+            if let Some(cached_tokens) = cached_tokens {
+                events.push(Ok(LanguageModelCompletionEvent::CacheUsageUpdate(
+                    LanguageModelCacheUsage {
+                        input_tokens: usage.prompt_tokens,
+                        cached_tokens,
+                    },
+                )));
+            }
         }
 
         let Some(choice) = event.choices.first() else {
@@ -978,6 +1001,199 @@ mod tests {
     use language_model::LanguageModelRequestMessage;
 
     use super::*;
+
+    fn cache_usage_chunk(details: Option<serde_json::Value>) -> Result<ResponseStreamEvent> {
+        let mut usage = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+        });
+        if let Some(details) = details {
+            usage["prompt_tokens_details"] = details;
+        }
+        Ok(serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [],
+            "usage": usage,
+        }))?)
+    }
+
+    #[test]
+    fn cache_usage_unknown_preserves_previous_accounting() -> Result<()> {
+        let mut mapper = OpenAiEventMapper::new();
+        for details in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"cached_tokens": null})),
+            Some(serde_json::json!({"audio_tokens": 10, "future_detail": {}})),
+        ] {
+            let events = mapper
+                .map_event(cache_usage_chunk(details)?)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                events,
+                vec![LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                })]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_usage_measured_including_zero() -> Result<()> {
+        let mut mapper = OpenAiEventMapper::new();
+        for cached_tokens in [0, 64, 100] {
+            let events = mapper
+                .map_event(cache_usage_chunk(Some(serde_json::json!({
+                    "cached_tokens": cached_tokens,
+                    "audio_tokens": 10,
+                    "future_detail": {},
+                })))?)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            let usage = TokenUsage {
+                input_tokens: 100 - cached_tokens,
+                output_tokens: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: cached_tokens,
+            };
+            assert_eq!(usage.total_tokens(), 120);
+            assert_eq!(
+                events,
+                vec![
+                    LanguageModelCompletionEvent::UsageUpdate(usage),
+                    LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                        input_tokens: 100,
+                        cached_tokens,
+                    }),
+                ]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_usage_repeated_snapshots_are_absolute() -> Result<()> {
+        let mut mapper = OpenAiEventMapper::new();
+        for (prompt_tokens, cached_tokens) in [(100, 64), (100, 64), (120, 80), (120, 0)] {
+            let mut chunk = cache_usage_chunk(Some(serde_json::json!({
+                "cached_tokens": cached_tokens,
+            })))?;
+            let usage = chunk.usage.as_mut().context("missing usage")?;
+            usage.prompt_tokens = prompt_tokens;
+            usage.total_tokens = prompt_tokens + usage.completion_tokens;
+            let events = mapper
+                .map_event(chunk)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                events,
+                vec![
+                    LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                        input_tokens: prompt_tokens - cached_tokens,
+                        output_tokens: 20,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: cached_tokens,
+                    }),
+                    LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                        input_tokens: prompt_tokens,
+                        cached_tokens,
+                    }),
+                ]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_usage_invalid_counts_return_error() -> Result<()> {
+        let mut mapper = OpenAiEventMapper::new();
+        for cached_tokens in [101, u64::MAX] {
+            let events = mapper.map_event(cache_usage_chunk(Some(serde_json::json!({
+                "cached_tokens": cached_tokens,
+            })))?);
+            assert_eq!(events.len(), 1);
+            let Some(Err(LanguageModelCompletionError::Other(error))) = events.first() else {
+                anyhow::bail!("expected an invalid cache usage error, got {events:?}");
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Invalid OpenAI Chat Completions usage: cached_tokens ({cached_tokens}) exceeds prompt_tokens (100)"
+                )
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_usage_final_empty_choices_chunk_maps_after_stop() -> Result<()> {
+        let text_chunk: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": "stop"}],
+            "usage": null,
+        }))?;
+        let usage_chunk = cache_usage_chunk(Some(serde_json::json!({"cached_tokens": 64})))?;
+        let stream = OpenAiEventMapper::new()
+            .map_stream(futures::stream::iter(vec![Ok(text_chunk), Ok(usage_chunk)]).boxed());
+        let events = smol::block_on(stream.collect::<Vec<_>>())
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            events,
+            vec![
+                LanguageModelCompletionEvent::Text("Hello".into()),
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+                LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                    input_tokens: 36,
+                    output_tokens: 20,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 64,
+                }),
+                LanguageModelCompletionEvent::CacheUsageUpdate(LanguageModelCacheUsage {
+                    input_tokens: 100,
+                    cached_tokens: 64,
+                }),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_chat_completion_requests_include_usage() -> Result<()> {
+        for (model_id, streaming) in [("gpt-4o", true), ("o1-preview", false)] {
+            let request = into_open_ai(
+                LanguageModelRequest {
+                    thread_id: None,
+                    prompt_id: None,
+                    intent: None,
+                    mode: None,
+                    messages: vec![],
+                    tools: vec![],
+                    tool_choice: None,
+                    stop: vec![],
+                    temperature: None,
+                },
+                model_id,
+                false,
+                None,
+            );
+            let value = serde_json::to_value(request)?;
+            assert_eq!(value["stream"], streaming);
+            if streaming {
+                assert_eq!(value["stream_options"]["include_usage"], true);
+            } else {
+                assert!(value.get("stream_options").is_none());
+            }
+        }
+        Ok(())
+    }
 
     #[gpui::test]
     fn tiktoken_rs_support(cx: &TestAppContext) {

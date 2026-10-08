@@ -11,11 +11,13 @@ use crate::language_model_selector::ToggleModelSelector;
 use crate::{
     AddContextServer, AgentDiffPane, ContinueThread, ContinueWithBurnMode,
     DeleteRecentlyOpenThread, ExpandMessageEditor, Follow, InlineAssistant, NewTextThread,
-    NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell,
-    ResetTrialUpsell, ToggleBurnMode, ToggleContextPicker, ToggleNavigationMenu, ToggleOptionsMenu,
+    NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ReplayThreadCache,
+    ResetTrialEndUpsell, ResetTrialUpsell, ToggleBurnMode, ToggleContextPicker,
+    ToggleNavigationMenu, ToggleOptionsMenu,
     active_thread::{self, ActiveThread, ActiveThreadEvent},
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     agent_diff::AgentDiff,
+    cache_report::{CacheReport, render_measured_cache_usage},
     message_editor::{MessageEditor, MessageEditorEvent},
     slash_command::SlashCommandCompletionProvider,
     text_thread_editor::{
@@ -65,6 +67,7 @@ use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, ToggleZoom, ToolbarItemView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::NotifyResultExt as _,
 };
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
@@ -94,6 +97,12 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| panel.open_history(window, cx));
+                    }
+                })
+                .register_action(|workspace, _: &ReplayThreadCache, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| panel.replay_active_thread(cx));
                     }
                 })
                 .register_action(|workspace, _: &OpenConfiguration, window, cx| {
@@ -159,12 +168,12 @@ pub fn init(cx: &mut App) {
                     window.dispatch_action(workspace::RestoreBanner.boxed_clone(), cx);
                     window.refresh();
                 });
-                // .register_action(|_workspace, _: &ResetTrialUpsell, _window, cx| {
-                //     Upsell::set_dismissed(false, cx);
-                // })
-                // .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
-                //     TrialEndUpsell::set_dismissed(false, cx);
-                // });
+            // .register_action(|_workspace, _: &ResetTrialUpsell, _window, cx| {
+            //     Upsell::set_dismissed(false, cx);
+            // })
+            // .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
+            //     TrialEndUpsell::set_dismissed(false, cx);
+            // });
         },
     )
     .detach();
@@ -388,6 +397,7 @@ pub struct AgentPanel {
     zoomed: bool,
     pending_serialization: Option<Task<Result<()>>>,
     hide_upsell: bool,
+    cache_report: Option<Entity<CacheReport>>,
 }
 
 impl AgentPanel {
@@ -672,6 +682,7 @@ impl AgentPanel {
                 thread_subscription,
                 active_thread_subscription,
                 message_editor_subscription,
+                cx.observe(&thread, |_, _, cx| cx.notify()),
             ],
             _default_model_subscription,
             context_store,
@@ -695,6 +706,7 @@ impl AgentPanel {
             zoomed: false,
             pending_serialization: None,
             hide_upsell: false,
+            cache_report: None,
         }
     }
 
@@ -815,7 +827,7 @@ impl AgentPanel {
                 self.prompt_store.clone(),
                 self.thread_store.downgrade(),
                 self.context_store.downgrade(),
-                thread,
+                thread.clone(),
                 window,
                 cx,
             )
@@ -845,6 +857,7 @@ impl AgentPanel {
             thread_subscription,
             active_thread_subscription,
             message_editor_subscription,
+            cx.observe(&thread, |_, _, cx| cx.notify()),
         ];
     }
 
@@ -1042,11 +1055,12 @@ impl AgentPanel {
                 self.prompt_store.clone(),
                 self.thread_store.downgrade(),
                 self.context_store.downgrade(),
-                thread,
+                thread.clone(),
                 window,
                 cx,
             )
         });
+
         self.message_editor.focus_handle(cx).focus(window);
 
         let message_editor_subscription =
@@ -1065,6 +1079,7 @@ impl AgentPanel {
             thread_subscription,
             active_thread_subscription,
             message_editor_subscription,
+            cx.observe(&thread, |_, _, cx| cx.notify()),
         ];
     }
 
@@ -1316,6 +1331,30 @@ impl AgentPanel {
             });
         } else {
             log::warn!("No configured model available for continuation");
+        }
+    }
+
+    fn toggle_infinite_context(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.active_thread() else {
+            return;
+        };
+        let thread_state = thread.read(cx);
+        if thread_state.is_generating() || thread_state.has_pending_tool_uses() {
+            return;
+        }
+        let enabled = !thread_state.infinite_context_enabled();
+        if thread
+            .update(cx, |thread, cx| {
+                thread.set_infinite_context_enabled(enabled, cx)
+            })
+            .notify_app_err(cx)
+            .is_some()
+        {
+            self.thread.update(cx, |active_thread, cx| {
+                active_thread.save_thread(cx);
+                cx.notify();
+            });
+            cx.notify();
         }
     }
 
@@ -1594,6 +1633,97 @@ impl Panel for AgentPanel {
 }
 
 impl AgentPanel {
+    fn replay_active_thread(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active_view, ActiveView::Thread { .. }) {
+            return;
+        }
+        let thread = self.thread.read(cx).thread().read(cx);
+        if thread.is_empty() || thread.is_generating() || !thread.all_tools_finished() {
+            return;
+        }
+        let id = thread.id().clone();
+        let title = thread.summary().or_default();
+        let snapshot = thread.snapshot_for_cache_replay(cx);
+        let input = cx.background_spawn(async move { Ok(serde_json::to_vec(&snapshot)?) });
+        self.start_cache_report(id, title, input, cx);
+    }
+
+    pub(crate) fn replay_saved_thread(
+        &mut self,
+        id: ThreadId,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self
+            .thread_store
+            .update(cx, |store, cx| store.load_thread_json(&id, cx));
+        self.start_cache_report(id, title, input, cx);
+    }
+
+    fn start_cache_report(
+        &mut self,
+        id: ThreadId,
+        title: SharedString,
+        input: Task<Result<Vec<u8>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        self.cache_report = Some(cx.new(|cx| CacheReport::new(id, title, input, cx, move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                struct ReplayCleanupWarning;
+                workspace.show_toast(workspace::Toast::new(
+                    workspace::notifications::NotificationId::unique::<ReplayCleanupWarning>(),
+                    "Offline replay could not remove its private journal. Sensitive data may remain in your temporary directory. Check Zed's log for the cleanup path.",
+                ), cx);
+            }).log_err();
+        })));
+        cx.notify();
+    }
+
+    fn render_infinite_context_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let thread = self.thread.read(cx).thread().read(cx);
+        let enabled = thread.infinite_context_enabled();
+        let busy = thread.is_generating() || thread.has_pending_tool_uses();
+        let summarizing = thread.memory_summaries_running();
+
+        h_flex()
+            .w_full()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .flex_wrap()
+            .child(
+                Button::new("infinite-context", "Infinite memory")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .toggle_state(enabled)
+                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .disabled(busy)
+                    .tooltip(Tooltip::text(if busy {
+                        "Infinite memory preserves the full log with bounded summaries, not unlimited model tokens. Background summary calls may cost extra. Wait for generation and pending tools to finish before changing this mode."
+                    } else {
+                        "Preserve conversation text with bounded summaries, not unlimited model tokens. Long tool output is clipped. Background summary calls may cost extra. Disabling cancels them without deleting the archive."
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_infinite_context(cx);
+                    })),
+            )
+            .child(
+                Button::new("replay-thread-cache", "Cache report")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .disabled(thread.is_generating() || !thread.all_tools_finished() || thread.is_empty() || !cfg!(unix))
+                    .tooltip(Tooltip::text(if cfg!(unix) {
+                        "Replay this thread locally to estimate cache reuse. No model calls or recorded tools are executed. Wait for generation and pending tools to finish."
+                    } else {
+                        "Offline cache replay currently requires macOS or Linux for private temporary journal permissions."
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.replay_active_thread(cx))),
+            )
+            .when(summarizing, |this| this.child(Label::new("Summarizing memory…").size(LabelSize::Small).color(Color::Muted)))
+    }
+
     // fn render_title_view(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
     //     const LOADING_SUMMARY_PLACEHOLDER: &str = "Loading Summary…";
 
@@ -1740,43 +1870,43 @@ impl AgentPanel {
     //             }),
     //     );
 
-        // let recent_entries_menu = div().child(
-        //     PopoverMenu::new("agent-nav-menu")
-        //         .trigger_with_tooltip(
-        //             IconButton::new("agent-nav-menu", IconName::MenuAlt)
-        //                 .icon_size(IconSize::Small)
-        //                 .style(ui::ButtonStyle::Subtle),
-        //             {
-        //                 let focus_handle = focus_handle.clone();
-        //                 move |window, cx| {
-        //                     Tooltip::for_action_in(
-        //                         "Toggle Panel Menu",
-        //                         &ToggleNavigationMenu,
-        //                         &focus_handle,
-        //                         window,
-        //                         cx,
-        //                     )
-        //                 }
-        //             },
-        //         )
-        //         .anchor(Corner::TopLeft)
-        //         .with_handle(self.assistant_navigation_menu_handle.clone())
-        //         .menu({
-        //             let menu = self.assistant_navigation_menu.clone();
-        //             move |window, cx| {
-        //                 if let Some(menu) = menu.as_ref() {
-        //                     menu.update(cx, |_, cx| {
-        //                         cx.defer_in(window, |menu, window, cx| {
-        //                             menu.rebuild(window, cx);
-        //                         });
-        //                     });
-        //                 }
-        //                 menu.clone()
-        //             }
-        //         }),
-        // );
+    // let recent_entries_menu = div().child(
+    //     PopoverMenu::new("agent-nav-menu")
+    //         .trigger_with_tooltip(
+    //             IconButton::new("agent-nav-menu", IconName::MenuAlt)
+    //                 .icon_size(IconSize::Small)
+    //                 .style(ui::ButtonStyle::Subtle),
+    //             {
+    //                 let focus_handle = focus_handle.clone();
+    //                 move |window, cx| {
+    //                     Tooltip::for_action_in(
+    //                         "Toggle Panel Menu",
+    //                         &ToggleNavigationMenu,
+    //                         &focus_handle,
+    //                         window,
+    //                         cx,
+    //                     )
+    //                 }
+    //             },
+    //         )
+    //         .anchor(Corner::TopLeft)
+    //         .with_handle(self.assistant_navigation_menu_handle.clone())
+    //         .menu({
+    //             let menu = self.assistant_navigation_menu.clone();
+    //             move |window, cx| {
+    //                 if let Some(menu) = menu.as_ref() {
+    //                     menu.update(cx, |_, cx| {
+    //                         cx.defer_in(window, |menu, window, cx| {
+    //                             menu.rebuild(window, cx);
+    //                         });
+    //                     });
+    //                 }
+    //                 menu.clone()
+    //             }
+    //         }),
+    // );
 
-        // No toolbar options menu here; the consolidated menu is positioned in the content area.
+    // No toolbar options menu here; the consolidated menu is positioned in the content area.
 
     //     h_flex()
     //         .id("assistant-toolbar")
@@ -2985,6 +3115,9 @@ impl Render for AgentPanel {
             .on_action(cx.listener(|this, _: &OpenConfiguration, window, cx| {
                 this.open_configuration(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ReplayThreadCache, _, cx| {
+                this.replay_active_thread(cx);
+            }))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
             .on_action(cx.listener(Self::deploy_rules_library))
             .on_action(cx.listener(Self::open_agent_diff))
@@ -3010,29 +3143,35 @@ impl Render for AgentPanel {
             // .child(self.render_toolbar(window, cx))
             // .children(self.render_upsell(window, cx))
             // .children(self.render_trial_end_upsell(window, cx))
+            .children(self.cache_report.clone())
             .map(|parent| match &self.active_view {
                 ActiveView::Thread { .. } => parent
                     .relative()
+                    .child(self.render_infinite_context_toggle(cx))
+                    .child(render_measured_cache_usage(
+                        self.thread
+                            .read(cx)
+                            .thread()
+                            .read(cx)
+                            .measured_cache_usage(),
+                    ))
                     .child(self.render_active_thread_or_empty_state(window, cx))
                     .children(self.render_tool_use_limit_reached(window, cx))
                     // Absolute-positioned consolidated options menu in the top-right
                     .child(
-                        h_flex()
-                            .w_full()
-                            .px_1()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex_none()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .bg(cx.theme().colors().panel_background)
-                                    .mb_1()
-                                    // Allow card to grow but keep default compact
-                                    .max_h(vh(0.3, window))
-                                    .child(self.message_editor.clone()),
-                            ),
+                        h_flex().w_full().px_1().child(
+                            div()
+                                .w_full()
+                                .flex_none()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().panel_background)
+                                .mb_1()
+                                // Allow card to grow but keep default compact
+                                .max_h(vh(0.3, window))
+                                .child(self.message_editor.clone()),
+                        ),
                     )
                     .children(self.render_last_error(cx))
                     .child(self.render_drag_target(cx)),

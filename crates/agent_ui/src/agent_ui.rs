@@ -5,6 +5,7 @@ mod agent_item;
 mod agent_model_selector;
 mod agent_panel;
 mod buffer_codegen;
+mod cache_report;
 mod context_picker;
 mod context_server_configuration;
 mod context_strip;
@@ -56,27 +57,27 @@ pub use ui::preview::{all_agent_previews, get_agent_preview};
 actions!(
     agent,
     [
-            NewAgentTab,
-            NewTextThread,
-            ToggleContextPicker,
-            ToggleNavigationMenu,
-            ToggleOptionsMenu,
-            DeleteRecentlyOpenThread,
-            ToggleProfileSelector,
-            RemoveAllContext,
-            ExpandMessageEditor,
-            OpenHistory,
-            AddContextServer,
-            RemoveSelectedThread,
-            Chat,
-            ChatWithFollow,
-            CycleNextInlineAssist,
-            CyclePreviousInlineAssist,
-            FocusUp,
-            FocusDown,
-            FocusLeft,
-            FocusRight,
-            /*...*/
+        NewAgentTab,
+        NewTextThread,
+        ToggleContextPicker,
+        ToggleNavigationMenu,
+        ToggleOptionsMenu,
+        DeleteRecentlyOpenThread,
+        ToggleProfileSelector,
+        RemoveAllContext,
+        ExpandMessageEditor,
+        OpenHistory,
+        AddContextServer,
+        RemoveSelectedThread,
+        Chat,
+        ChatWithFollow,
+        CycleNextInlineAssist,
+        CyclePreviousInlineAssist,
+        FocusUp,
+        FocusDown,
+        FocusLeft,
+        FocusRight,
+        /*...*/
         RemoveFocusedContext,
         AcceptSuggestedContext,
         OpenActiveThreadAsMarkdown,
@@ -92,6 +93,7 @@ actions!(
         ContinueThread,
         ContinueWithBurnMode,
         ToggleBurnMode,
+        ReplayThreadCache,
     ]
 );
 

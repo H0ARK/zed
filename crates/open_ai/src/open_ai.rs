@@ -209,6 +209,8 @@ pub struct Request {
     pub messages: Vec<RequestMessage>,
     pub stream: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
@@ -220,6 +222,11 @@ pub struct Request {
     pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -367,6 +374,14 @@ pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PromptTokensDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -518,5 +533,105 @@ pub fn embed<'a>(
         let response: OpenAiEmbeddingResponse =
             serde_json::from_str(&body).context("failed to parse OpenAI embedding response")?;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chat_completion_cache_usage_serde() -> Result<()> {
+        let cases = [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!({})), None),
+            (Some(json!({"cached_tokens": null})), None),
+            (Some(json!({"cached_tokens": 0})), Some(0)),
+            (Some(json!({"cached_tokens": 64})), Some(64)),
+            (Some(json!({"audio_tokens": 10, "future_detail": {}})), None),
+            (
+                Some(json!({"cached_tokens": 64, "audio_tokens": 10, "future_detail": {}})),
+                Some(64),
+            ),
+        ];
+
+        for (details, expected_cached_tokens) in cases {
+            let mut usage = json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+            });
+            if let Some(details) = details {
+                usage["prompt_tokens_details"] = details;
+            }
+            let event: ResponseStreamEvent = serde_json::from_value(json!({
+                "model": "gpt-4o",
+                "choices": [],
+                "usage": usage,
+            }))?;
+            assert!(event.choices.is_empty());
+            let usage = event.usage.context("missing usage")?;
+            assert_eq!(usage.prompt_tokens, 100);
+            assert_eq!(usage.completion_tokens, 20);
+            assert_eq!(usage.total_tokens, 120);
+            assert_eq!(
+                usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens),
+                expected_cached_tokens,
+            );
+
+            let serialized = serde_json::to_value(&usage)?;
+            if let Some(cached_tokens) = expected_cached_tokens {
+                assert_eq!(
+                    serialized["prompt_tokens_details"]["cached_tokens"],
+                    cached_tokens
+                );
+            } else if let Some(details) = serialized.get("prompt_tokens_details") {
+                assert!(details.get("cached_tokens").is_none());
+            }
+            let round_trip: Usage = serde_json::from_value(serialized)?;
+            assert_eq!(
+                round_trip
+                    .prompt_tokens_details
+                    .and_then(|details| details.cached_tokens),
+                expected_cached_tokens,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chat_completion_request_stream_options_serde() -> Result<()> {
+        let mut value = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "stream": true,
+            "temperature": 1.0,
+        });
+        let request: Request = serde_json::from_value(value.clone())?;
+        assert!(request.stream_options.is_none());
+        assert!(
+            serde_json::to_value(request)?
+                .get("stream_options")
+                .is_none()
+        );
+
+        value["stream_options"] = json!({"include_usage": true});
+        let request: Request = serde_json::from_value(value)?;
+        assert!(
+            request
+                .stream_options
+                .as_ref()
+                .is_some_and(|options| options.include_usage)
+        );
+        assert_eq!(
+            serde_json::to_value(request)?["stream_options"]["include_usage"],
+            true
+        );
+        Ok(())
     }
 }

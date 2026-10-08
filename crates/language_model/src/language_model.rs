@@ -75,6 +75,9 @@ pub enum LanguageModelCompletionEvent {
         message_id: String,
     },
     UsageUpdate(TokenUsage),
+    /// An absolute cache usage snapshot for this request, not an incremental delta.
+    /// Regular usage updates account for these tokens separately.
+    CacheUsageUpdate(LanguageModelCacheUsage),
 }
 
 #[derive(Error, Debug)]
@@ -178,6 +181,15 @@ pub enum StopReason {
     MaxTokens,
     ToolUse,
     Refusal,
+}
+
+/// Measured cache usage as an absolute per-request snapshot, not an incremental delta.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LanguageModelCacheUsage {
+    /// Total input tokens, including cached tokens.
+    pub input_tokens: u64,
+    /// The subset of input tokens read from the cache.
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize, Default)]
@@ -365,6 +377,7 @@ pub trait LanguageModel: Send + Sync {
                                 Ok(LanguageModelCompletionEvent::RedactedThinking { .. }) => None,
                                 Ok(LanguageModelCompletionEvent::Stop(_)) => None,
                                 Ok(LanguageModelCompletionEvent::ToolUse(_)) => None,
+                                Ok(LanguageModelCompletionEvent::CacheUsageUpdate(_)) => None,
                                 Ok(LanguageModelCompletionEvent::UsageUpdate(token_usage)) => {
                                     *last_token_usage.lock() = token_usage;
                                     None

@@ -515,6 +515,8 @@ pub fn into_anthropic(
 ) -> anthropic::Request {
     let mut new_messages: Vec<anthropic::Message> = Vec::new();
     let mut system_message = String::new();
+    let mut system_content = Vec::new();
+    let mut cache_system = false;
 
     for message in request.messages {
         if message.contents_empty() {
@@ -602,13 +604,6 @@ pub fn into_anthropic(
                     Role::Assistant => anthropic::Role::Assistant,
                     Role::System => unreachable!("System role should never occur here"),
                 };
-                if let Some(last_message) = new_messages.last_mut() {
-                    if last_message.role == anthropic_role {
-                        last_message.content.extend(anthropic_message_content);
-                        continue;
-                    }
-                }
-
                 // Mark the last segment of the message as cached
                 if message.cache {
                     let cache_control_value = Some(anthropic::CacheControl {
@@ -631,16 +626,31 @@ pub fn into_anthropic(
                     }
                 }
 
+                if let Some(last_message) = new_messages.last_mut() {
+                    if last_message.role == anthropic_role {
+                        last_message.content.extend(anthropic_message_content);
+                        continue;
+                    }
+                }
+
                 new_messages.push(anthropic::Message {
                     role: anthropic_role,
                     content: anthropic_message_content,
                 });
             }
             Role::System => {
+                let mut text = message.string_contents();
                 if !system_message.is_empty() {
-                    system_message.push_str("\n\n");
+                    text.insert_str(0, "\n\n");
                 }
-                system_message.push_str(&message.string_contents());
+                system_message.push_str(&text);
+                cache_system |= message.cache;
+                system_content.push(anthropic::RequestContent::Text {
+                    text,
+                    cache_control: message.cache.then_some(anthropic::CacheControl {
+                        cache_type: anthropic::CacheControlType::Ephemeral,
+                    }),
+                });
             }
         }
     }
@@ -651,6 +661,8 @@ pub fn into_anthropic(
         max_tokens: max_output_tokens,
         system: if system_message.is_empty() {
             None
+        } else if cache_system {
+            Some(anthropic::StringOrContents::Content(system_content))
         } else {
             Some(anthropic::StringOrContents::String(system_message))
         },
@@ -1074,6 +1086,124 @@ mod tests {
     use super::*;
     use anthropic::AnthropicModelMode;
     use language_model::{LanguageModelRequestMessage, MessageContent};
+
+    #[test]
+    fn test_cache_control_survives_same_role_coalescing() -> Result<()> {
+        for (role, expected_role) in [(Role::User, "user"), (Role::Assistant, "assistant")] {
+            let request = LanguageModelRequest {
+                messages: [
+                    ("first full block", false),
+                    ("last full block", true),
+                    ("partial block", false),
+                    ("request end", true),
+                ]
+                .into_iter()
+                .map(|(text, cache)| LanguageModelRequestMessage {
+                    role: role.clone(),
+                    content: vec![MessageContent::Text(text.into())],
+                    cache,
+                })
+                .collect(),
+                ..Default::default()
+            };
+
+            let request = into_anthropic(
+                request,
+                "claude-3-5-sonnet".into(),
+                0.7,
+                4096,
+                AnthropicModelMode::Default,
+            );
+
+            assert_eq!(
+                serde_json::to_value(&request.messages)?,
+                serde_json::json!([{
+                    "role": expected_role,
+                    "content": [
+                        {"type": "text", "text": "first full block"},
+                        {"type": "text", "text": "last full block", "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": "partial block"},
+                        {"type": "text", "text": "request end", "cache_control": {"type": "ephemeral"}}
+                    ]
+                }])
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_control_preserves_system_prefix() -> Result<()> {
+        let request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text("instructions".into())],
+                    cache: false,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![
+                        MessageContent::Text("cached prefix".into()),
+                        MessageContent::Text("continued".into()),
+                    ],
+                    cache: true,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text("uncached suffix".into())],
+                    cache: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let request = into_anthropic(
+            request,
+            "claude-3-5-sonnet".into(),
+            0.7,
+            4096,
+            AnthropicModelMode::Default,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&request.system)?,
+            serde_json::json!([
+                {"type": "text", "text": "instructions"},
+                {"type": "text", "text": "\n\ncached prefixcontinued", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "\n\nuncached suffix"}
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_uncached_system_preserves_string_format() -> Result<()> {
+        let request = LanguageModelRequest {
+            messages: ["first", "second"]
+                .into_iter()
+                .map(|text| LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text(text.into())],
+                    cache: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let request = into_anthropic(
+            request,
+            "claude-3-5-sonnet".into(),
+            0.7,
+            4096,
+            AnthropicModelMode::Default,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&request.system)?,
+            serde_json::json!("first\n\nsecond")
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_cache_control_only_on_last_segment() {

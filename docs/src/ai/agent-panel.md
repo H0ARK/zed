@@ -18,6 +18,7 @@ You should start to see the responses stream in with indications of [which tools
 
 Any message that you send to the AI is editable.
 You can click on the card that contains your message and re-submit it with an adjusted prompt and/or new pieces of context.
+In [Infinite memory mode](#infinite-memory), destructive message editing and deletion are disabled to preserve the transcript.
 
 ### Checkpoints {#checkpoints}
 
@@ -79,6 +80,106 @@ Depending on how many pieces of context you add, your token consumption can grow
 
 With that in mind, once you get close to the model's context window, a banner appears below the message editor suggesting to start a new thread with the current one summarized and added as context.
 You can also do this at any time with an ongoing thread via the "Agent Options" menu on the top right.
+
+### Infinite Memory (Experimental) {#infinite-memory}
+
+Infinite memory is an opt-in mode for agent threads, disabled by default.
+Click **Infinite memory** above the conversation to enable or disable it for the current thread; the button is selected when the mode is enabled.
+The choice is saved with the thread and does not change your default for new threads.
+The button is disabled while the agent is generating a response or has pending tool uses.
+
+To enable the mode by default for **new threads**, add this to your settings:
+
+```json
+{
+  "agent": {
+    "infinite_context": true
+  }
+}
+```
+
+This setting does not change existing threads, and the mode is not available for text threads.
+
+Infinite memory preserves conversation text in append-only daily journals at `<data_dir>/agent/infinite_context/<thread_id>` within Zed's data directory.
+Completed replies and tool exchanges are archived; reasoning is displayed but excluded from the memory journals.
+Tool output longer than 30,000 characters is explicitly clipped to its head and tail; other long text is split losslessly, and attached images are stored separately.
+Instead of replacing the transcript, it builds an immutable binary tree of summaries, each at most 512 UTF-8 bytes.
+The saved history view grows to 128,000 bytes, then merges built sibling summaries toward 64,000 bytes, keeping finer detail near the present.
+Each new user turn sends that view and the new message; only the current turn's live tool exchanges are replayed in full.
+The agent can use `zoom(id, n, page)` to retrieve older text, `zoom({"id": id, "n": 1, "image": index})` to retrieve an attached image by index, and `date(id)` to retrieve a message's timestamp.
+Once a thread has an archive, destructive message editing and deletion remain disabled even if memory mode is switched off; send a new correction instead.
+Disabling the mode cancels its background work and returns requests to ordinary full-history behavior without deleting the archive.
+
+**This does not disable context limits or give the model unlimited tokens.**
+Each request still has to fit the selected model's context window; older details remain available through summaries and retrieval rather than all being sent on every request.
+
+Background summarization makes additional model calls, which consume tokens and may incur costs or count toward provider usage limits.
+These calls use the model configured by `agent.thread_summary_model`, falling back to your default model when that setting is not specified.
+Conversation content used for summarization is sent to that model's provider, so choose it with your cost and privacy requirements in mind.
+A tool-capable conversation model is required for retrieval. Both conversation and summary requests are checked against their respective model limits.
+Background work is limited to eight simultaneous calls; failed summaries can be retried on the next message. Stopping generation also cancels the active summary drain.
+The compactor's separate persisted context targets 16,000 bytes and starts reducing near 27,000 bytes, reserving space below its 32,000-byte limit for in-flight work.
+
+This implementation does not yet provide the design's cross-request cache-write coordination or named-subagent chat retrieval.
+Assistant text is journaled when its response finishes or is canceled, not on every streamed chunk, so a process crash during an unfinished response can lose that response's unarchived tail.
+
+#### Measured cache reuse
+
+The **Measured cache reuse** row above the conversation, below the Infinite memory controls, shows live provider-reported cache reuse for the current thread, whether or not Infinite memory is enabled.
+It shows agent, memory-summary, and combined percentages alongside raw **cached / total input token** counts. Total input includes cached tokens; the combined percentage is token-weighted (`100 × combined cached tokens / combined total input tokens`), not an average of request percentages. Hover over the row for reported-request counts and measurement scope.
+
+Only observed requests with explicit cache counters contribute to these totals, including live usage updates and memory-summary retries that report counters. Repeated usage updates for a request replace that request's previous counters rather than counting another request.
+Older thread history without measured counters and requests from other models or providers without cache details are not measured; legacy token-usage fields are not used to infer cache reuse.
+An explicitly reported zero displays **0.00%** when total input is positive. Missing details display **not reported**, not zero. If no requests have reported counters, the row reads **Measured cache reuse: not reported**: Zed may be waiting for usage, or the provider may not support cache details. A reported zero total input displays raw counts with **N/A** instead of a percentage.
+Switching threads reads the newly active thread's measured totals, independently of any open offline report.
+These are provider-token measurements for the observed cache-reporting requests only, **not billing savings**, and displaying them makes no extra API calls.
+
+In this checkout, OpenAI **Chat Completions** support reads the optional `usage.prompt_tokens_details.cached_tokens` counter and uses `stream_options.include_usage: true` for streaming requests, including usage-only final chunks. Missing or null cache details remain unreported.
+The label is provider-neutral: cloud and compatible-provider paths that use the same event mapper can report counters too, as can other mappers that emit explicit cache usage.
+This checkout has no OpenAI **Responses** integration or Responses diagnostics. The installed `openai-subscribed` provider's implementation is absent from this checkout and is not changed by this feature; its cache-reporting behavior is not established here.
+
+#### Replaying a saved conversation locally
+
+The offline cache benchmark can replay a saved agent conversation without calling a model or executing its recorded tools.
+It supports this checkout's version `0.2.0` thread JSON and version `0.3.0` externally tagged `User`/`Agent` threads.
+
+Click **Cache report** next to **Infinite memory**, or run `agent: replay thread cache`, to replay a snapshot of the active thread. This is available whether or not Infinite memory is enabled, and is disabled while the thread is generating or has pending tools.
+
+For previous conversations, open history (`agent: open history`), hover or select a thread, and click its **Offline cache report** icon next to Delete. This reads the saved record directly, without opening, upgrading, or modifying the conversation.
+
+The panel displays agent, summary, and combined byte-weighted cache reuse, request counts, and tree statistics under **Offline estimate**, labeled with the source thread. Switching threads does not retarget an existing report. **Cancel** stops a running replay; starting another report cancels the previous one. Parsing, serialization, and journal work run in the background after an in-memory snapshot is captured. No provider requests are made, no recorded tools are executed, and transcript text is not shown in the report. Private temporary journals are deleted after completion, errors, or cancellation. A cleanup failure raises a separate warning even if you have closed the report. Replay currently requires macOS or Linux; its controls are disabled on Windows until private temporary journal permissions are supported.
+
+The command-line benchmark also supports custom replay parameters and full JSON reports. First list saved thread ids, then export a selected thread:
+
+```sh
+python3 script/export-agent-thread.py --list
+mkdir -p target/cache-replay
+python3 script/export-agent-thread.py --thread-id THREAD_ID --output target/cache-replay/thread.json
+```
+
+The exporter opens `threads.db` read-only and handles JSON or zstd-compressed records; compressed records require the `zstd` CLI.
+Use `--database PATH` for a custom Zed data directory.
+Snapshots contain private conversation data, are created with owner-only permissions on Unix, and must not be committed or shared without review.
+The exporter refuses to overwrite existing files. `target/` is ignored by Git.
+
+Then replay the snapshot:
+
+```sh
+cargo run -p agent --example infinite_context_replay --features gpui/runtime_shaders --offline -- \
+  --input target/cache-replay/thread.json --report target/cache-replay/report.json
+```
+
+The example uses the real memory tree and production cache-block formatting, but deterministic extractive stand-ins for model-generated summaries.
+Its cache model has a five-minute TTL, a 20-content-block lookup window, separate conversation/summary model scopes, and one-second gaps between recorded agent responses by default.
+It reports byte-weighted prefix-cache reuse for agent and summary calls separately, plus a cold-cache comparison and frontier rewrites.
+These are **structural estimates, not provider-token hit rates, billing savings, summary-quality validation, or a claim about the original thread's provider**.
+Provider token eligibility thresholds, concurrency, and model duration are not modeled; the original full system prompt and tool schemas are not recovered automatically.
+Reasoning is omitted. Saved token-usage counters are included only as unmodified baseline metadata, not mixed with replay byte metrics.
+
+For sensitivity checks, add `--pause-after-request 36 --pause-seconds 600` to simulate cache expiry, or `--summary-bytes 256` to change the stand-in summary size.
+An optional `--prefix-json FILE` supplies additional system blocks and tool schemas as `{"system": ["..."], "tools": [{"name": "...", "description": "...", "input_schema": {}}]}`.
+`--min-cache-bytes N` is a byte proxy for cache eligibility, not a provider's token threshold.
+Report files also refuse overwrites. Temporary replay journals are private on Unix and deleted after the run; currently the example rejects non-Unix hosts.
 
 ## Changing Models {#changing-models}
 

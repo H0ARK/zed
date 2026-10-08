@@ -53,6 +53,7 @@ pub struct AgentSettings {
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub commit_message_model: Option<LanguageModelSelection>,
     pub thread_summary_model: Option<LanguageModelSelection>,
+    pub infinite_context: bool,
     pub inline_alternatives: Vec<LanguageModelSelection>,
     pub using_outdated_settings_version: bool,
     pub default_profile: AgentProfileId,
@@ -241,6 +242,11 @@ pub struct AgentSettingsContent {
     commit_message_model: Option<LanguageModelSelection>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
     thread_summary_model: Option<LanguageModelSelection>,
+    /// Whether new agent threads preserve their full transcript with bounded summaries.
+    /// Background summary calls may incur additional model costs; model context limits still apply.
+    ///
+    /// Default: false
+    infinite_context: Option<bool>,
     /// Additional models with which to generate alternatives when performing inline assists.
     inline_alternatives: Option<Vec<LanguageModelSelection>>,
     /// The default profile to use in the Agent.
@@ -424,6 +430,7 @@ impl Settings for AgentSettings {
                 .clone()
                 .thread_summary_model
                 .or(settings.thread_summary_model.take());
+            merge(&mut settings.infinite_context, value.infinite_context);
             merge(
                 &mut settings.inline_alternatives,
                 value.inline_alternatives.clone(),
@@ -501,5 +508,69 @@ impl Settings for AgentSettings {
 fn merge<T>(target: &mut T, value: Option<T>) {
     if let Some(value) = value {
         *target = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_infinite_context_setting_deserialization() -> Result<()> {
+        let content: AgentSettingsContent = serde_json::from_str("{}")?;
+        assert_eq!(content.infinite_context, None);
+        assert!(!AgentSettings::default().infinite_context);
+
+        for enabled in [false, true] {
+            let content: AgentSettingsContent = serde_json::from_value(serde_json::json!({
+                "infinite_context": enabled,
+            }))?;
+            assert_eq!(content.infinite_context, Some(enabled));
+        }
+        assert!(
+            serde_json::from_str::<AgentSettingsContent>(r#"{"infinite_context": "true"}"#)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[gpui::test]
+    fn test_infinite_context_settings_merge(cx: &mut App) {
+        for (default, user, project, expected) in [
+            (None, None, None, false),
+            (Some(false), Some(true), None, true),
+            (Some(true), None, None, true),
+            (Some(true), Some(false), None, false),
+            (None, Some(true), None, true),
+            (None, Some(true), Some(false), false),
+            (None, Some(false), Some(true), true),
+        ] {
+            let default = AgentSettingsContent {
+                infinite_context: default,
+                ..Default::default()
+            };
+            let user = AgentSettingsContent {
+                infinite_context: user,
+                ..Default::default()
+            };
+            let project = AgentSettingsContent {
+                infinite_context: project,
+                ..Default::default()
+            };
+            let settings = AgentSettings::load(
+                SettingsSources {
+                    default: &default,
+                    global: None,
+                    extensions: None,
+                    user: Some(&user),
+                    release_channel: None,
+                    server: None,
+                    project: &[&project],
+                },
+                cx,
+            )
+            .expect("Settings should load");
+            assert_eq!(settings.infinite_context, expected);
+        }
     }
 }

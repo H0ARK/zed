@@ -1,78 +1,54 @@
 use crate::{
     agent_profile::AgentProfile,
-    context::{ AgentContext, AgentContextHandle, ContextLoadResult, LoadedContext },
+    context::{AgentContext, AgentContextHandle, ContextLoadResult, LoadedContext},
+    infinite_context::{InfiniteContext, SummaryJob},
     thread_store::{
-        SerializedCrease,
-        SerializedLanguageModel,
-        SerializedMessage,
-        SerializedMessageSegment,
-        SerializedThread,
-        SerializedToolResult,
-        SerializedToolUse,
-        SharedProjectContext,
+        SerializedCrease, SerializedLanguageModel, SerializedMessage, SerializedMessageSegment,
+        SerializedThread, SerializedToolResult, SerializedToolUse, SharedProjectContext,
         ThreadStore,
     },
-    tool_use::{ PendingToolUse, ToolUse, ToolUseMetadata, ToolUseState },
+    tool_use::{PendingToolUse, ToolUse, ToolUseMetadata, ToolUseState},
 };
-use agent_settings::{ AgentProfileId, AgentSettings, CompletionMode };
-use anyhow::{ Result, anyhow };
-use assistant_tool::{ ActionLog, AnyToolCard, Tool, ToolWorkingSet };
-use chrono::{ DateTime, Utc };
-use client::{ ModelRequestUsage, RequestUsage };
-use collections::{ HashMap, HashSet };
-use feature_flags::{ self, FeatureFlagAppExt };
-use futures::{ FutureExt, StreamExt as _, future::Shared };
+use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
+use anyhow::{Result, anyhow};
+use assistant_tool::{ActionLog, AnyToolCard, Tool, ToolWorkingSet};
+use chrono::{DateTime, Utc};
+use client::{ModelRequestUsage, RequestUsage};
+use collections::{HashMap, HashSet};
+use feature_flags::{self, FeatureFlagAppExt};
+use futures::{FutureExt, StreamExt as _, future::Shared, stream::FuturesUnordered};
 use git::repository::DiffType;
 use gpui::{
-    AnyWindowHandle,
-    App,
-    AppContext,
-    AsyncApp,
-    Context,
-    Entity,
-    EventEmitter,
-    SharedString,
-    Task,
-    WeakEntity,
-    Window,
+    AnyWindowHandle, App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task,
+    WeakEntity, Window,
 };
 use language_model::{
-    ConfiguredModel,
-    LanguageModel,
-    LanguageModelCompletionError,
-    LanguageModelCompletionEvent,
-    LanguageModelId,
-    LanguageModelKnownError,
-    LanguageModelRegistry,
-    LanguageModelRequest,
-    LanguageModelRequestMessage,
-    LanguageModelRequestTool,
-    LanguageModelToolResult,
-    LanguageModelToolResultContent,
-    LanguageModelToolUse,
-    LanguageModelToolUseId,
-    MessageContent,
-    ModelRequestLimitReachedError,
-    PaymentRequiredError,
-    Role,
-    SelectedModel,
-    StopReason,
-    TokenUsage,
+    ConfiguredModel, LanguageModel, LanguageModelCacheUsage, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelKnownError, LanguageModelRegistry,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
+    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
+    LanguageModelToolUseId, MessageContent, ModelRequestLimitReachedError, PaymentRequiredError,
+    Role, SelectedModel, StopReason, TokenUsage,
 };
 use postage::stream::Stream as _;
-use project::{ Project, git_store::{ GitStore, GitStoreCheckpoint, RepositoryState } };
-use prompt_store::{ ModelContext, PromptBuilder };
+use project::{
+    Project,
+    git_store::{GitStore, GitStoreCheckpoint, RepositoryState},
+};
+use prompt_store::{ModelContext, PromptBuilder};
 use proto::Plan;
 use schemars::JsonSchema;
-use serde::{ Deserialize, Serialize };
+use serde::{Deserialize, Serialize};
 use settings::Settings;
-use std::{ io::Write, ops::Range, sync::Arc, time::Instant };
+use std::{io::Write, ops::Range, sync::Arc, time::Instant};
 use thiserror::Error;
-use util::{ ResultExt as _, post_inc };
+use util::{ResultExt as _, post_inc};
 use uuid::Uuid;
-use zed_llm_client::{ CompletionIntent, CompletionRequestStatus, UsageLimit };
+use zed_llm_client::{CompletionIntent, CompletionRequestStatus, UsageLimit};
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ThreadId(Arc<str>);
 
 impl ThreadId {
@@ -153,9 +129,10 @@ impl Message {
     }
 
     pub fn push_thinking(&mut self, text: &str, signature: Option<String>) {
-        if
-            let Some(MessageSegment::Thinking { text: segment, signature: current_signature }) =
-                self.segments.last_mut()
+        if let Some(MessageSegment::Thinking {
+            text: segment,
+            signature: current_signature,
+        }) = self.segments.last_mut()
         {
             if let Some(signature) = signature {
                 *current_signature = Some(signature);
@@ -298,7 +275,86 @@ pub enum DetailedSummaryState {
 
 impl DetailedSummaryState {
     fn text(&self) -> Option<SharedString> {
-        if let Self::Generated { text, .. } = self { Some(text.clone()) } else { None }
+        if let Self::Generated { text, .. } = self {
+            Some(text.clone())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUsageTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl CacheUsageTotals {
+    pub fn cache_read_percentage(&self) -> Option<f64> {
+        (self.input_tokens > 0 && self.cached_tokens <= self.input_tokens)
+            .then(|| 100.0 * self.cached_tokens as f64 / self.input_tokens as f64)
+    }
+
+    fn update(
+        &mut self,
+        previous: &mut Option<LanguageModelCacheUsage>,
+        next: LanguageModelCacheUsage,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            next.cached_tokens <= next.input_tokens,
+            "Reported cached tokens exceed input tokens"
+        );
+        let old = previous.unwrap_or_default();
+        let input_tokens = self
+            .input_tokens
+            .checked_sub(old.input_tokens)
+            .and_then(|total| total.checked_add(next.input_tokens))
+            .ok_or_else(|| {
+                anyhow!("Measured input-token total overflow or inconsistent cache usage")
+            })?;
+        let cached_tokens = self
+            .cached_tokens
+            .checked_sub(old.cached_tokens)
+            .and_then(|total| total.checked_add(next.cached_tokens))
+            .ok_or_else(|| {
+                anyhow!("Measured cached-token total overflow or inconsistent cache usage")
+            })?;
+        let requests = self
+            .requests
+            .checked_add(u64::from(previous.is_none()))
+            .ok_or_else(|| anyhow!("Measured request count overflow"))?;
+        *self = Self {
+            requests,
+            input_tokens,
+            cached_tokens,
+        };
+        *previous = Some(next);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredCacheUsage {
+    #[serde(default)]
+    pub agent: CacheUsageTotals,
+    #[serde(default)]
+    pub summary: CacheUsageTotals,
+}
+
+impl MeasuredCacheUsage {
+    pub fn combined(&self) -> Option<CacheUsageTotals> {
+        Some(CacheUsageTotals {
+            requests: self.agent.requests.checked_add(self.summary.requests)?,
+            input_tokens: self
+                .agent
+                .input_tokens
+                .checked_add(self.summary.input_tokens)?,
+            cached_tokens: self
+                .agent
+                .cached_tokens
+                .checked_add(self.summary.cached_tokens)?,
+        })
     }
 }
 
@@ -311,8 +367,7 @@ pub struct TotalTokenUsage {
 impl TotalTokenUsage {
     pub fn ratio(&self) -> TokenUsageRatio {
         #[cfg(debug_assertions)]
-        let warning_threshold: f32 = std::env
-            ::var("ZED_THREAD_WARNING_THRESHOLD")
+        let warning_threshold: f32 = std::env::var("ZED_THREAD_WARNING_THRESHOLD")
             .unwrap_or("0.8".to_string())
             .parse()
             .unwrap();
@@ -351,9 +406,7 @@ pub enum TokenUsageRatio {
 #[derive(Debug, Clone, Copy)]
 pub enum QueueState {
     Sending,
-    Queued {
-        position: usize,
-    },
+    Queued { position: usize },
     Started,
 }
 
@@ -384,16 +437,29 @@ pub struct Thread {
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     request_token_usage: Vec<TokenUsage>,
     cumulative_token_usage: TokenUsage,
+    measured_cache_usage: MeasuredCacheUsage,
     exceeded_window_error: Option<ExceededWindowError>,
     tool_use_limit_reached: bool,
     feedback: Option<ThreadFeedback>,
     message_feedback: HashMap<MessageId, ThreadFeedback>,
     last_auto_capture_at: Option<Instant>,
     last_received_chunk_at: Option<Instant>,
-    request_callback: Option<Box<dyn FnMut(&LanguageModelRequest, &[Result<LanguageModelCompletionEvent, String>])>>,
+    request_callback: Option<
+        Box<dyn FnMut(&LanguageModelRequest, &[Result<LanguageModelCompletionEvent, String>])>,
+    >,
     remaining_turns: u32,
     configured_model: Option<ConfiguredModel>,
     profile: AgentProfile,
+    infinite_context_enabled: bool,
+    memory_archived: bool,
+    infinite_context: Option<InfiniteContext>,
+    memory_turn_start: Option<(MessageId, u64)>,
+    memory_preparing: bool,
+    memory_progress_tx: postage::watch::Sender<u64>,
+    memory_progress_rx: postage::watch::Receiver<u64>,
+    memory_preparation: Task<Option<()>>,
+    memory_summaries_running: bool,
+    memory_summaries: Shared<Task<std::result::Result<(), Arc<anyhow::Error>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,9 +503,10 @@ impl Thread {
         tools: Entity<ToolWorkingSet>,
         prompt_builder: Arc<PromptBuilder>,
         system_prompt: SharedProjectContext,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> Self {
         let (detailed_summary_tx, detailed_summary_rx) = postage::watch::channel();
+        let (memory_progress_tx, memory_progress_rx) = postage::watch::channel();
         let configured_model = LanguageModelRegistry::read_global(cx).default_model();
         let profile_id = AgentSettings::get_global(cx).default_profile.clone();
 
@@ -474,6 +541,7 @@ impl Thread {
             },
             request_token_usage: Vec::new(),
             cumulative_token_usage: TokenUsage::default(),
+            measured_cache_usage: MeasuredCacheUsage::default(),
             exceeded_window_error: None,
             tool_use_limit_reached: false,
             feedback: None,
@@ -484,6 +552,16 @@ impl Thread {
             remaining_turns: u32::MAX,
             configured_model,
             profile: AgentProfile::new(profile_id, tools),
+            infinite_context_enabled: AgentSettings::get_global(cx).infinite_context,
+            memory_archived: false,
+            infinite_context: None,
+            memory_turn_start: None,
+            memory_preparing: false,
+            memory_progress_tx,
+            memory_progress_rx,
+            memory_preparation: Task::ready(None),
+            memory_summaries_running: false,
+            memory_summaries: Task::ready(Ok(())).shared(),
         }
     }
 
@@ -495,27 +573,29 @@ impl Thread {
         prompt_builder: Arc<PromptBuilder>,
         project_context: SharedProjectContext,
         window: Option<&mut Window>, // None in headless mode
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> Self {
         let next_message_id = MessageId(
-            serialized.messages
+            serialized
+                .messages
                 .last()
                 .map(|message| message.id.0 + 1)
-                .unwrap_or(0)
+                .unwrap_or(0),
         );
         let tool_use = ToolUseState::from_serialized_messages(
             tools.clone(),
             &serialized.messages,
             project.clone(),
             window,
-            cx
+            cx,
         );
-        let (detailed_summary_tx, detailed_summary_rx) = postage::watch::channel_with(
-            serialized.detailed_summary_state
-        );
+        let (detailed_summary_tx, detailed_summary_rx) =
+            postage::watch::channel_with(serialized.detailed_summary_state);
+        let (memory_progress_tx, memory_progress_rx) = postage::watch::channel();
 
         let configured_model = LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-            serialized.model
+            serialized
+                .model
                 .and_then(|model| {
                     let model = SelectedModel {
                         provider: model.provider.clone().into(),
@@ -526,10 +606,12 @@ impl Thread {
                 .or_else(|| registry.default_model())
         });
 
-        let completion_mode = serialized.completion_mode.unwrap_or_else(
-            || AgentSettings::get_global(cx).preferred_completion_mode
-        );
-        let profile_id = serialized.profile.unwrap_or_else(|| AgentSettings::get_global(cx).default_profile.clone());
+        let completion_mode = serialized
+            .completion_mode
+            .unwrap_or_else(|| AgentSettings::get_global(cx).preferred_completion_mode);
+        let profile_id = serialized
+            .profile
+            .unwrap_or_else(|| AgentSettings::get_global(cx).default_profile.clone());
 
         Self {
             id,
@@ -540,22 +622,22 @@ impl Thread {
             detailed_summary_tx,
             detailed_summary_rx,
             completion_mode,
-            messages: serialized.messages
+            messages: serialized
+                .messages
                 .into_iter()
                 .map(|message| Message {
                     id: message.id,
                     role: message.role,
-                    segments: message.segments
+                    segments: message
+                        .segments
                         .into_iter()
-                        .map(|segment| {
-                            match segment {
-                                SerializedMessageSegment::Text { text } => MessageSegment::Text(text),
-                                SerializedMessageSegment::Thinking { text, signature } => {
-                                    MessageSegment::Thinking { text, signature }
-                                }
-                                SerializedMessageSegment::RedactedThinking { data } => {
-                                    MessageSegment::RedactedThinking(data)
-                                }
+                        .map(|segment| match segment {
+                            SerializedMessageSegment::Text { text } => MessageSegment::Text(text),
+                            SerializedMessageSegment::Thinking { text, signature } => {
+                                MessageSegment::Thinking { text, signature }
+                            }
+                            SerializedMessageSegment::RedactedThinking { data } => {
+                                MessageSegment::RedactedThinking(data)
                             }
                         })
                         .collect(),
@@ -564,7 +646,8 @@ impl Thread {
                         text: message.context,
                         images: Vec::new(),
                     },
-                    creases: message.creases
+                    creases: message
+                        .creases
                         .into_iter()
                         .map(|crease| MessageCrease {
                             range: crease.start..crease.end,
@@ -592,6 +675,7 @@ impl Thread {
             initial_project_snapshot: Task::ready(serialized.initial_project_snapshot).shared(),
             request_token_usage: serialized.request_token_usage,
             cumulative_token_usage: serialized.cumulative_token_usage,
+            measured_cache_usage: serialized.measured_cache_usage,
             exceeded_window_error: None,
             tool_use_limit_reached: serialized.tool_use_limit_reached,
             feedback: None,
@@ -602,12 +686,23 @@ impl Thread {
             remaining_turns: u32::MAX,
             configured_model,
             profile: AgentProfile::new(profile_id, tools),
+            infinite_context_enabled: serialized.infinite_context,
+            memory_archived: serialized.memory_archived || serialized.infinite_context,
+            infinite_context: None,
+            memory_turn_start: serialized.memory_turn_start,
+            memory_preparing: false,
+            memory_progress_tx,
+            memory_progress_rx,
+            memory_preparation: Task::ready(None),
+            memory_summaries_running: false,
+            memory_summaries: Task::ready(Ok(())).shared(),
         }
     }
 
     pub fn set_request_callback(
         &mut self,
-        callback: impl 'static + FnMut(&LanguageModelRequest, &[Result<LanguageModelCompletionEvent, String>])
+        callback: impl 'static
+        + FnMut(&LanguageModelRequest, &[Result<LanguageModelCompletionEvent, String>]),
     ) {
         self.request_callback = Some(Box::new(callback));
     }
@@ -697,7 +792,10 @@ impl Thread {
     }
 
     pub fn message(&self, id: MessageId) -> Option<&Message> {
-        let index = self.messages.binary_search_by(|message| message.id.cmp(&id)).ok()?;
+        let index = self
+            .messages
+            .binary_search_by(|message| message.id.cmp(&id))
+            .ok()?;
 
         self.messages.get(index)
     }
@@ -707,7 +805,7 @@ impl Thread {
     }
 
     pub fn is_generating(&self) -> bool {
-        !self.pending_completions.is_empty() || !self.all_tools_finished()
+        self.memory_preparing || !self.pending_completions.is_empty() || !self.all_tools_finished()
     }
 
     /// Indicates whether streaming of language model events is stale.
@@ -715,7 +813,8 @@ impl Thread {
     pub fn is_generation_stale(&self) -> Option<bool> {
         const STALE_THRESHOLD: u128 = 250;
 
-        self.last_received_chunk_at.map(|instant| instant.elapsed().as_millis() > STALE_THRESHOLD)
+        self.last_received_chunk_at
+            .map(|instant| instant.elapsed().as_millis() > STALE_THRESHOLD)
     }
 
     fn received_chunk(&mut self) {
@@ -723,7 +822,9 @@ impl Thread {
     }
 
     pub fn queue_state(&self) -> Option<QueueState> {
-        self.pending_completions.first().map(|pending_completion| pending_completion.queue_state)
+        self.pending_completions
+            .first()
+            .map(|pending_completion| pending_completion.queue_state)
     }
 
     pub fn tools(&self) -> &Entity<ToolWorkingSet> {
@@ -752,7 +853,11 @@ impl Thread {
         self.checkpoints_by_message.get(&id).cloned()
     }
 
-    pub fn restore_checkpoint(&mut self, checkpoint: ThreadCheckpoint, cx: &mut Context<Self>) -> Task<Result<()>> {
+    pub fn restore_checkpoint(
+        &mut self,
+        checkpoint: ThreadCheckpoint,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         self.last_restore_checkpoint = Some(LastRestoreCheckpoint::Pending {
             message_id: checkpoint.message_id,
         });
@@ -796,35 +901,44 @@ impl Thread {
         self.finalize_checkpoint(pending_checkpoint, cx);
     }
 
-    fn finalize_checkpoint(&mut self, pending_checkpoint: ThreadCheckpoint, cx: &mut Context<Self>) {
+    fn finalize_checkpoint(
+        &mut self,
+        pending_checkpoint: ThreadCheckpoint,
+        cx: &mut Context<Self>,
+    ) {
         let git_store = self.project.read(cx).git_store().clone();
         let final_checkpoint = git_store.update(cx, |git_store, cx| git_store.checkpoint(cx));
-        cx.spawn(async move |this, cx| {
-            match final_checkpoint.await {
-                Ok(final_checkpoint) => {
-                    let equal = git_store
-                        .update(cx, |store, cx| {
-                            store.compare_checkpoints(
-                                pending_checkpoint.git_checkpoint.clone(),
-                                final_checkpoint.clone(),
-                                cx
-                            )
-                        })?.await
-                        .unwrap_or(false);
+        cx.spawn(async move |this, cx| match final_checkpoint.await {
+            Ok(final_checkpoint) => {
+                let equal = git_store
+                    .update(cx, |store, cx| {
+                        store.compare_checkpoints(
+                            pending_checkpoint.git_checkpoint.clone(),
+                            final_checkpoint.clone(),
+                            cx,
+                        )
+                    })?
+                    .await
+                    .unwrap_or(false);
 
-                    if !equal {
-                        this.update(cx, |this, cx| { this.insert_checkpoint(pending_checkpoint, cx) })?;
-                    }
-
-                    Ok(())
+                if !equal {
+                    this.update(cx, |this, cx| {
+                        this.insert_checkpoint(pending_checkpoint, cx)
+                    })?;
                 }
-                Err(_) => this.update(cx, |this, cx| { this.insert_checkpoint(pending_checkpoint, cx) }),
+
+                Ok(())
             }
-        }).detach();
+            Err(_) => this.update(cx, |this, cx| {
+                this.insert_checkpoint(pending_checkpoint, cx)
+            }),
+        })
+        .detach();
     }
 
     fn insert_checkpoint(&mut self, checkpoint: ThreadCheckpoint, cx: &mut Context<Self>) {
-        self.checkpoints_by_message.insert(checkpoint.message_id, checkpoint);
+        self.checkpoints_by_message
+            .insert(checkpoint.message_id, checkpoint);
         cx.emit(ThreadEvent::CheckpointChanged);
         cx.notify();
     }
@@ -834,7 +948,18 @@ impl Thread {
     }
 
     pub fn truncate(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
-        let Some(message_ix) = self.messages.iter().rposition(|message| message.id == message_id) else {
+        if self.memory_history_is_append_only() {
+            self.memory_error(
+                anyhow!("Infinite memory is append-only; send a correction as a new message."),
+                cx,
+            );
+            return;
+        }
+        let Some(message_ix) = self
+            .messages
+            .iter()
+            .rposition(|message| message.id == message_id)
+        else {
             return;
         };
         for deleted_message in self.messages.drain(message_ix..) {
@@ -871,7 +996,8 @@ impl Thread {
         self.messages
             .get(ix + 1)
             .and_then(|message| {
-                self.message(message.id).map(|next_message| next_message.role == Role::User && !next_message.is_hidden)
+                self.message(message.id)
+                    .map(|next_message| next_message.role == Role::User && !next_message.is_hidden)
             })
             .unwrap_or(false)
     }
@@ -903,7 +1029,10 @@ impl Thread {
         self.tool_use.tool_uses_for_message(id, cx)
     }
 
-    pub fn tool_results_for_message(&self, assistant_message_id: MessageId) -> Vec<&LanguageModelToolResult> {
+    pub fn tool_results_for_message(
+        &self,
+        assistant_message_id: MessageId,
+    ) -> Vec<&LanguageModelToolResult> {
         self.tool_use.tool_results_for_message(assistant_message_id)
     }
 
@@ -926,20 +1055,39 @@ impl Thread {
     }
 
     /// Return tools that are both enabled and supported by the model
-    pub fn available_tools(&self, cx: &App, model: Arc<dyn LanguageModel>) -> Vec<LanguageModelRequestTool> {
+    pub fn available_tools(
+        &self,
+        cx: &App,
+        model: Arc<dyn LanguageModel>,
+    ) -> Vec<LanguageModelRequestTool> {
         if model.supports_tools() {
-            resolve_tool_name_conflicts(self.profile.enabled_tools(cx).as_slice())
-                .into_iter()
-                .filter_map(|(name, tool)| {
-                    // Skip tools that cannot be supported
-                    let input_schema = tool.input_schema(model.tool_input_format()).ok()?;
-                    Some(LanguageModelRequestTool {
-                        name,
-                        description: tool.description(),
-                        input_schema,
+            let mut tools: Vec<_> =
+                resolve_tool_name_conflicts(self.profile.enabled_tools(cx).as_slice())
+                    .into_iter()
+                    .filter(|(name, _)| {
+                        !self.infinite_context_enabled || (name != "zoom" && name != "date")
                     })
-                })
-                .collect()
+                    .filter_map(|(name, tool)| {
+                        // Skip tools that cannot be supported
+                        let input_schema = tool.input_schema(model.tool_input_format()).ok()?;
+                        Some(LanguageModelRequestTool {
+                            name,
+                            description: tool.description(),
+                            input_schema,
+                        })
+                    })
+                    .collect();
+            if self.infinite_context_enabled {
+                tools.extend(memory_tools().into_iter().filter_map(|mut tool| {
+                    assistant_tool::adapt_schema_to_format(
+                        &mut tool.input_schema,
+                        model.tool_input_format(),
+                    )
+                    .log_err()?;
+                    Some(tool)
+                }));
+            }
+            tools
         } else {
             Vec::default()
         }
@@ -951,7 +1099,7 @@ impl Thread {
         loaded_context: ContextLoadResult,
         git_checkpoint: Option<GitStoreCheckpoint>,
         creases: Vec<MessageCrease>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> MessageId {
         if !loaded_context.referenced_buffers.is_empty() {
             self.action_log.update(cx, |log, cx| {
@@ -967,7 +1115,7 @@ impl Thread {
             loaded_context.loaded_context,
             creases,
             false,
-            cx
+            cx,
         );
 
         if let Some(git_checkpoint) = git_checkpoint {
@@ -989,15 +1137,26 @@ impl Thread {
             LoadedContext::default(),
             vec![],
             true,
-            cx
+            cx,
         );
         self.pending_checkpoint = None;
 
         id
     }
 
-    pub fn insert_assistant_message(&mut self, segments: Vec<MessageSegment>, cx: &mut Context<Self>) -> MessageId {
-        self.insert_message(Role::Assistant, segments, LoadedContext::default(), Vec::new(), false, cx)
+    pub fn insert_assistant_message(
+        &mut self,
+        segments: Vec<MessageSegment>,
+        cx: &mut Context<Self>,
+    ) -> MessageId {
+        self.insert_message(
+            Role::Assistant,
+            segments,
+            LoadedContext::default(),
+            Vec::new(),
+            false,
+            cx,
+        )
     }
 
     pub fn insert_message(
@@ -1007,9 +1166,26 @@ impl Thread {
         loaded_context: LoadedContext,
         creases: Vec<MessageCrease>,
         is_hidden: bool,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> MessageId {
+        let new_turn = self.infinite_context_enabled && role == Role::User && !self.is_generating();
+        if new_turn {
+            self.memory_turn_start = None;
+            if let Err(error) = self.sync_memory() {
+                self.memory_error(error, cx);
+            }
+        }
         let id = self.next_message_id.post_inc();
+        if new_turn {
+            match self.sync_memory() {
+                Ok(()) => {
+                    if let Some(memory) = &self.infinite_context {
+                        self.memory_turn_start = Some((id, memory.message_count()));
+                    }
+                }
+                Err(error) => self.memory_error(error, cx),
+            }
+        }
         self.messages.push(Message {
             id,
             role,
@@ -1018,6 +1194,11 @@ impl Thread {
             creases,
             is_hidden,
         });
+        if self.infinite_context_enabled && role == Role::User {
+            if let Err(error) = self.sync_memory() {
+                self.memory_error(error, cx);
+            }
+        }
         self.touch_updated_at();
         cx.emit(ThreadEvent::MessageAdded(id));
         id
@@ -1031,8 +1212,15 @@ impl Thread {
         creases: Vec<MessageCrease>,
         loaded_context: Option<LoadedContext>,
         checkpoint: Option<GitStoreCheckpoint>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> bool {
+        if self.memory_history_is_append_only() {
+            self.memory_error(
+                anyhow!("Infinite memory is append-only; send a correction as a new message."),
+                cx,
+            );
+            return false;
+        }
         let Some(message) = self.messages.iter_mut().find(|message| message.id == id) else {
             return false;
         };
@@ -1043,10 +1231,13 @@ impl Thread {
             message.loaded_context = context;
         }
         if let Some(git_checkpoint) = checkpoint {
-            self.checkpoints_by_message.insert(id, ThreadCheckpoint {
-                message_id: id,
-                git_checkpoint,
-            });
+            self.checkpoints_by_message.insert(
+                id,
+                ThreadCheckpoint {
+                    message_id: id,
+                    git_checkpoint,
+                },
+            );
         }
         self.touch_updated_at();
         cx.emit(ThreadEvent::MessageEdited(id));
@@ -1054,6 +1245,13 @@ impl Thread {
     }
 
     pub fn delete_message(&mut self, id: MessageId, cx: &mut Context<Self>) -> bool {
+        if self.memory_history_is_append_only() {
+            self.memory_error(
+                anyhow!("Infinite memory is append-only; send a correction as a new message."),
+                cx,
+            );
+            return false;
+        }
         let Some(index) = self.messages.iter().position(|message| message.id == id) else {
             return false;
         };
@@ -1097,82 +1295,107 @@ impl Thread {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
         cx.spawn(async move |this, cx| {
             let initial_project_snapshot = initial_project_snapshot.await;
-            this.read_with(cx, |this, cx| SerializedThread {
-                version: SerializedThread::VERSION.to_string(),
-                summary: this.summary().or_default(),
-                updated_at: this.updated_at(),
-                messages: this
-                    .messages()
-                    .map(|message| SerializedMessage {
-                        id: message.id,
-                        role: message.role,
-                        segments: message.segments
-                            .iter()
-                            .map(|segment| {
-                                match segment {
-                                    MessageSegment::Text(text) => {
-                                        SerializedMessageSegment::Text { text: text.clone() }
-                                    }
-                                    MessageSegment::Thinking { text, signature } => {
-                                        SerializedMessageSegment::Thinking {
-                                            text: text.clone(),
-                                            signature: signature.clone(),
-                                        }
-                                    }
-                                    MessageSegment::RedactedThinking(data) => {
-                                        SerializedMessageSegment::RedactedThinking {
-                                            data: data.clone(),
-                                        }
-                                    }
+            this.read_with(cx, |this, cx| {
+                this.serialize_snapshot(initial_project_snapshot, cx)
+            })
+        })
+    }
+
+    /// Captures replay input immediately, without awaiting project state or writing history.
+    pub fn snapshot_for_cache_replay(&self, cx: &App) -> SerializedThread {
+        self.serialize_snapshot(None, cx)
+    }
+
+    fn serialize_snapshot(
+        &self,
+        initial_project_snapshot: Option<Arc<ProjectSnapshot>>,
+        cx: &App,
+    ) -> SerializedThread {
+        let this = self;
+        SerializedThread {
+            version: SerializedThread::VERSION.to_string(),
+            summary: this.summary().or_default(),
+            updated_at: this.updated_at(),
+            messages: this
+                .messages()
+                .map(|message| SerializedMessage {
+                    id: message.id,
+                    role: message.role,
+                    segments: message
+                        .segments
+                        .iter()
+                        .filter(|segment| {
+                            !this.memory_history_is_append_only()
+                                || matches!(segment, MessageSegment::Text(_))
+                        })
+                        .map(|segment| match segment {
+                            MessageSegment::Text(text) => {
+                                SerializedMessageSegment::Text { text: text.clone() }
+                            }
+                            MessageSegment::Thinking { text, signature } => {
+                                SerializedMessageSegment::Thinking {
+                                    text: text.clone(),
+                                    signature: signature.clone(),
                                 }
-                            })
-                            .collect(),
-                        tool_uses: this
-                            .tool_uses_for_message(message.id, cx)
-                            .into_iter()
-                            .map(|tool_use| SerializedToolUse {
-                                id: tool_use.id,
-                                name: tool_use.name,
-                                input: tool_use.input,
-                            })
-                            .collect(),
-                        tool_results: this
-                            .tool_results_for_message(message.id)
-                            .into_iter()
-                            .map(|tool_result| SerializedToolResult {
-                                tool_use_id: tool_result.tool_use_id.clone(),
-                                is_error: tool_result.is_error,
-                                content: tool_result.content.clone(),
-                                output: tool_result.output.clone(),
-                            })
-                            .collect(),
-                        context: message.loaded_context.text.clone(),
-                        creases: message.creases
-                            .iter()
-                            .map(|crease| SerializedCrease {
-                                start: crease.range.start,
-                                end: crease.range.end,
-                                icon_path: crease.icon_path.clone(),
-                                label: crease.label.clone(),
-                            })
-                            .collect(),
-                        is_hidden: message.is_hidden,
-                    })
-                    .collect(),
-                initial_project_snapshot,
-                cumulative_token_usage: this.cumulative_token_usage,
-                request_token_usage: this.request_token_usage.clone(),
-                detailed_summary_state: this.detailed_summary_rx.borrow().clone(),
-                exceeded_window_error: this.exceeded_window_error.clone(),
-                model: this.configured_model.as_ref().map(|model| SerializedLanguageModel {
+                            }
+                            MessageSegment::RedactedThinking(data) => {
+                                SerializedMessageSegment::RedactedThinking { data: data.clone() }
+                            }
+                        })
+                        .collect(),
+                    tool_uses: this
+                        .tool_uses_for_message(message.id, cx)
+                        .into_iter()
+                        .map(|tool_use| SerializedToolUse {
+                            id: tool_use.id,
+                            name: tool_use.name,
+                            input: tool_use.input,
+                        })
+                        .collect(),
+                    tool_results: this
+                        .tool_results_for_message(message.id)
+                        .into_iter()
+                        .map(|tool_result| SerializedToolResult {
+                            tool_use_id: tool_result.tool_use_id.clone(),
+                            is_error: tool_result.is_error,
+                            content: tool_result.content.clone(),
+                            output: tool_result.output.clone(),
+                        })
+                        .collect(),
+                    context: message.loaded_context.text.clone(),
+                    creases: message
+                        .creases
+                        .iter()
+                        .map(|crease| SerializedCrease {
+                            start: crease.range.start,
+                            end: crease.range.end,
+                            icon_path: crease.icon_path.clone(),
+                            label: crease.label.clone(),
+                        })
+                        .collect(),
+                    is_hidden: message.is_hidden,
+                })
+                .collect(),
+            initial_project_snapshot,
+            cumulative_token_usage: this.cumulative_token_usage,
+            measured_cache_usage: this.measured_cache_usage,
+            request_token_usage: this.request_token_usage.clone(),
+            detailed_summary_state: this.detailed_summary_rx.borrow().clone(),
+            exceeded_window_error: this.exceeded_window_error.clone(),
+            model: this
+                .configured_model
+                .as_ref()
+                .map(|model| SerializedLanguageModel {
                     provider: model.provider.id().0.to_string(),
                     model: model.model.id().0.to_string(),
                 }),
-                completion_mode: Some(this.completion_mode),
-                tool_use_limit_reached: this.tool_use_limit_reached,
-                profile: Some(this.profile.id().clone()),
-            })
-        })
+            completion_mode: Some(this.completion_mode),
+            tool_use_limit_reached: this.tool_use_limit_reached,
+            profile: Some(this.profile.id().clone()),
+            infinite_context: this.infinite_context_enabled,
+            memory_archived: this.memory_archived,
+            memory_turn_start: this.memory_turn_start,
+        }
     }
 
     pub fn remaining_turns(&self) -> u32 {
@@ -1188,17 +1411,415 @@ impl Thread {
         model: Arc<dyn LanguageModel>,
         intent: CompletionIntent,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
         if self.remaining_turns == 0 {
             return;
         }
 
+        if self.infinite_context_enabled {
+            self.prepare_memory_completion(model, intent, window, cx);
+            return;
+        }
         self.remaining_turns -= 1;
 
         let request = self.to_completion_request(model.clone(), intent, cx);
 
         self.stream_completion(request, model, window, cx);
+    }
+
+    pub fn infinite_context_enabled(&self) -> bool {
+        self.infinite_context_enabled
+    }
+
+    pub fn set_infinite_context_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.is_generating(),
+            "Wait for the current turn to finish before changing memory mode."
+        );
+        if enabled {
+            self.open_memory()?;
+            self.sync_memory()?;
+        } else {
+            self.cancel_memory_summaries(cx);
+        }
+        self.infinite_context_enabled = enabled;
+        self.memory_turn_start = None;
+        self.exceeded_window_error = None;
+        if enabled {
+            self.start_memory_summaries(cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    fn open_memory(&mut self) -> Result<()> {
+        if self.infinite_context.is_none() {
+            self.infinite_context = Some(InfiniteContext::open(
+                paths::data_dir()
+                    .join("agent/infinite_context")
+                    .join(self.id.to_string()),
+            )?);
+        }
+        if let Some(memory) = &self.infinite_context {
+            if let Some(checkpoint) = memory.source_checkpoint() {
+                self.next_message_id.0 = self.next_message_id.0.max(checkpoint as usize);
+            }
+        }
+        self.memory_archived = true;
+        Ok(())
+    }
+
+    pub fn memory_history_is_append_only(&self) -> bool {
+        self.infinite_context_enabled || self.memory_archived
+    }
+
+    pub fn memory_summaries_running(&self) -> bool {
+        self.memory_summaries_running
+    }
+
+    fn cancel_memory_summaries(&mut self, cx: &mut Context<Self>) {
+        self.memory_summaries = Task::ready(Ok(())).shared();
+        self.memory_summaries_running = false;
+        if let Some(memory) = &mut self.infinite_context {
+            if let Err(error) = memory.release_in_flight_jobs() {
+                self.memory_error(error, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn memory_tool_output(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<assistant_tool::ToolResultOutput> {
+        anyhow::ensure!(
+            matches!(name, "zoom" | "date"),
+            "Unknown memory tool: {name}"
+        );
+        let memory = self
+            .infinite_context
+            .as_ref()
+            .ok_or_else(|| anyhow!("Memory journal is not open"))?;
+        let id = input
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("id must be a nonnegative integer"))?;
+        if name == "date" {
+            return Ok(memory.date(id)?.into());
+        }
+        let n = input
+            .get("n")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("n must be a positive power of two"))?;
+        let page = input
+            .get("page")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("page must be a nonnegative integer"))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let text = memory.zoom(id, n, usize::try_from(page)?)?;
+        if let Some(index) = input.get("image") {
+            anyhow::ensure!(n == 1, "Image retrieval requires n=1");
+            let index = index
+                .as_u64()
+                .ok_or_else(|| anyhow!("image must be a nonnegative integer"))?;
+            let images = memory.zoom_images(id)?;
+            let image = images
+                .get(usize::try_from(index)?)
+                .ok_or_else(|| anyhow!("Image index out of range"))?;
+            return Ok(assistant_tool::ToolResultOutput {
+                content: assistant_tool::ToolResultContent::Image(serde_json::from_value(
+                    image.clone(),
+                )?),
+                output: None,
+            });
+        }
+        Ok(text.into())
+    }
+
+    fn memory_error(&self, error: anyhow::Error, cx: &mut Context<Self>) {
+        log::error!("Infinite memory: {error:#}");
+        cx.emit(ThreadEvent::ShowError(ThreadError::Message {
+            header: "Infinite memory".into(),
+            message: format!("{error:#}").into(),
+        }));
+    }
+
+    fn sync_memory(&mut self) -> Result<()> {
+        self.open_memory()?;
+        let memory = self
+            .infinite_context
+            .as_mut()
+            .ok_or_else(|| anyhow!("Memory journal is not open"))?;
+        let checkpoint = memory.source_checkpoint().unwrap_or(0);
+        let start = self
+            .messages
+            .partition_point(|message| message.id.0 < checkpoint as usize);
+        for message in self.messages.iter().skip(start) {
+            let tools: Vec<_> = self.tool_use.tool_results(message.id).collect();
+            if tools.iter().any(|(_, result)| result.is_none()) {
+                break;
+            }
+            // Streaming messages are mutable until the response finishes.
+            if message.role == Role::Assistant
+                && !self.pending_completions.is_empty()
+                && self
+                    .messages
+                    .last()
+                    .is_some_and(|last| last.id == message.id)
+            {
+                break;
+            }
+            let mut text = String::new();
+            for segment in &message.segments {
+                if let MessageSegment::Text(segment) = segment {
+                    text.push_str(segment);
+                }
+            }
+            let kind = match message.role {
+                Role::User => "user",
+                Role::Assistant => "unii",
+                Role::System => "note",
+            };
+            if !text.is_empty() || !message.loaded_context.images.is_empty() {
+                let images = message
+                    .loaded_context
+                    .images
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                memory.append_with_images(kind, &text, images, Utc::now())?;
+            }
+            if !message.loaded_context.text.is_empty() {
+                memory.append("note", &message.loaded_context.text, Utc::now())?;
+            }
+            for (tool, result) in tools {
+                memory.append(
+                    "tool",
+                    &format!("{} {}", tool.name, tool.raw_input),
+                    Utc::now(),
+                )?;
+                if let Some(result) = result {
+                    match &result.content {
+                        LanguageModelToolResultContent::Text(text) => {
+                            memory.append("echo", text, Utc::now())?
+                        }
+                        LanguageModelToolResultContent::Image(image) => memory.append_with_images(
+                            "echo",
+                            "Tool returned an image.",
+                            vec![serde_json::to_value(image)?],
+                            Utc::now(),
+                        )?,
+                    }
+                }
+            }
+            memory.checkpoint_source(u32::try_from(
+                message
+                    .id
+                    .0
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Message id overflow"))?,
+            )?)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_memory_completion(
+        &mut self,
+        model: Arc<dyn LanguageModel>,
+        intent: CompletionIntent,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.memory_preparing {
+            return;
+        }
+        if let Err(error) = self.sync_memory() {
+            self.memory_error(error, cx);
+            return;
+        }
+        if self.memory_turn_start.is_none() {
+            self.memory_error(
+                anyhow!("Send a new message to start a fresh infinite-memory turn."),
+                cx,
+            );
+            return;
+        }
+        if !model.supports_tools() {
+            self.memory_error(
+                anyhow!("Infinite memory requires a model that supports retrieval tools."),
+                cx,
+            );
+            return;
+        }
+        self.start_memory_summaries(cx);
+        let mut progress = self.memory_progress_rx.clone();
+        self.memory_preparing = true;
+        cx.notify();
+        self.memory_preparation = cx.spawn(async move |thread, cx| {
+            let result: Result<_> = async {
+                loop {
+                    let (view, running) = thread.read_with(cx, |thread, _| {
+                        let view = thread.memory_turn_start.ok_or_else(|| anyhow!("Memory turn is not ready")).and_then(|(_, end)| {
+                            thread.infinite_context.as_ref().ok_or_else(|| anyhow!("Memory journal is not open"))?.render_turn_before(end)
+                        });
+                        (view, thread.memory_summaries_running)
+                    })?;
+                    match view {
+                        Ok(_) => break,
+                        Err(error) if !running => return Err(error.context("Previous memory is not ready; retry to resume summaries")),
+                        Err(_) => { progress.recv().await.ok_or_else(|| anyhow!("Memory worker stopped"))?; }
+                    }
+                }
+                let (request, tokens) = thread.update(cx, |thread, cx| {
+                    let request = thread.to_completion_request(model.clone(), intent, cx);
+                    let tokens = model.count_tokens(request.clone(), cx);
+                    (request, tokens)
+                })?;
+                let tokens = tokens.await?;
+                let reserve = model.max_output_tokens().unwrap_or(4_096);
+                anyhow::ensure!(tokens.saturating_add(reserve) <= model.max_token_count(), "This memory request needs {tokens} input tokens plus {reserve} output tokens, exceeding this model's {}-token window. Select a larger-context model or reduce current-turn input.", model.max_token_count());
+                Ok(request)
+            }.await;
+            thread.update(cx, |thread, cx| {
+                thread.memory_preparing = false;
+                match result {
+                    Ok(request) => {
+                        thread.remaining_turns = thread.remaining_turns.saturating_sub(1);
+                        thread.stream_completion(request, model, window, cx);
+                    }
+                    Err(error) => thread.memory_error(error, cx),
+                }
+                cx.notify();
+            }).log_err()?;
+            Some(())
+        });
+    }
+
+    fn start_memory_summaries(&mut self, cx: &mut Context<Self>) {
+        if self.memory_summaries_running || !self.infinite_context_enabled {
+            return;
+        }
+        self.memory_summaries_running = true;
+        let model = LanguageModelRegistry::read_global(cx)
+            .thread_summary_model()
+            .map(|model| model.model);
+        self.memory_summaries = cx
+            .spawn(async move |thread, cx| {
+                let result: Result<()> = async {
+                    let mut running = FuturesUnordered::new();
+                    let mut failed = std::collections::BTreeSet::new();
+                    let mut first_error = None;
+                    loop {
+                        while running.len() < 8 {
+                            let next = thread.update(cx, |thread, cx| -> Result<_> {
+                                let Some(memory) = thread.infinite_context.as_mut() else {
+                                    return Ok(None);
+                                };
+                                let Some(job) = memory.next_job()? else {
+                                    return Ok(None);
+                                };
+                                if failed.contains(&job.key) {
+                                    memory.retry_job(job.key)?;
+                                    return Ok(None);
+                                }
+                                let context_end = if job.key.l == 0 { job.key.i } else { job.end };
+                                let view = memory.render_view_before(context_end)?;
+                                let model = model.clone().ok_or_else(|| {
+                                    anyhow!(
+                                        "Configure a thread summary model to use infinite memory."
+                                    )
+                                })?;
+                                let mut request = thread.completion_request(
+                                    model.clone(),
+                                    CompletionIntent::ThreadContextSummarization,
+                                    false,
+                                    cx,
+                                );
+                                append_memory_view(&mut request, view);
+                                request.messages.push(LanguageModelRequestMessage {
+                                    role: Role::User,
+                                    content: vec![MessageContent::Text(memory_summary_task(&job))],
+                                    cache: true,
+                                });
+                                Ok(Some((job, request, model)))
+                            })??;
+                            let Some((job, request, model)) = next else {
+                                break;
+                            };
+                            let async_cx = cx.clone();
+                            let summary_thread = thread.clone();
+                            running.push(async move {
+                                (
+                                    job.key,
+                                    summarize_memory_node(
+                                        model,
+                                        request,
+                                        summary_thread,
+                                        &async_cx,
+                                    )
+                                    .await,
+                                )
+                            });
+                        }
+                        let Some((key, result)) = running.next().await else {
+                            break;
+                        };
+                        thread.update(cx, |thread, cx| -> Result<()> {
+                            let memory = thread
+                                .infinite_context
+                                .as_mut()
+                                .ok_or_else(|| anyhow!("Memory journal closed"))?;
+                            match result {
+                                Ok(text) => memory.complete_job(key, text)?,
+                                Err(error) => {
+                                    memory.retry_job(key)?;
+                                    failed.insert(key);
+                                    if first_error.is_none() {
+                                        first_error = Some(error);
+                                    }
+                                }
+                            }
+                            *thread.memory_progress_tx.borrow_mut() += 1;
+                            cx.notify();
+                            Ok(())
+                        })??;
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = thread.update(cx, |thread, cx| {
+                    thread.memory_summaries_running = false;
+                    *thread.memory_progress_tx.borrow_mut() += 1;
+                    if result.is_err() {
+                        if let Some(memory) = &mut thread.infinite_context {
+                            if let Err(error) = memory.release_in_flight_jobs() {
+                                thread.memory_error(error, cx);
+                            }
+                        }
+                    }
+                    if let Err(error) = &result {
+                        thread.memory_error(anyhow!("Background summary failed: {error:#}"), cx);
+                    }
+                    cx.notify();
+                }) {
+                    return Err(Arc::new(error));
+                }
+                result.map_err(Arc::new)
+            })
+            .shared();
     }
 
     pub fn used_tools_since_last_user_message(&self) -> bool {
@@ -1217,7 +1838,17 @@ impl Thread {
         &self,
         model: Arc<dyn LanguageModel>,
         intent: CompletionIntent,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
+    ) -> LanguageModelRequest {
+        self.completion_request(model, intent, true, cx)
+    }
+
+    fn completion_request(
+        &self,
+        model: Arc<dyn LanguageModel>,
+        intent: CompletionIntent,
+        include_history: bool,
+        cx: &mut Context<Self>,
     ) -> LanguageModelRequest {
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
@@ -1242,16 +1873,17 @@ impl Thread {
         });
 
         if let Some(project_context) = self.project_context.borrow().as_ref() {
-            match self.prompt_builder.generate_assistant_system_prompt(project_context, model_context) {
+            match self
+                .prompt_builder
+                .generate_assistant_system_prompt(project_context, model_context)
+            {
                 Err(err) => {
                     let message = format!("{err:?}").into();
                     log::error!("{message}");
-                    cx.emit(
-                        ThreadEvent::ShowError(ThreadError::Message {
-                            header: "Error generating system prompt".into(),
-                            message,
-                        })
-                    );
+                    cx.emit(ThreadEvent::ShowError(ThreadError::Message {
+                        header: "Error generating system prompt".into(),
+                        message,
+                    }));
                 }
                 Ok(system_prompt) => {
                     request.messages.push(LanguageModelRequestMessage {
@@ -1264,29 +1896,69 @@ impl Thread {
         } else {
             let message = "Context for system prompt unexpectedly not ready.".into();
             log::error!("{message}");
-            cx.emit(
-                ThreadEvent::ShowError(ThreadError::Message {
-                    header: "Error generating system prompt".into(),
-                    message,
-                })
-            );
+            cx.emit(ThreadEvent::ShowError(ThreadError::Message {
+                header: "Error generating system prompt".into(),
+                message,
+            }));
         }
 
+        if self.infinite_context_enabled {
+            if let Some(system) = request
+                .messages
+                .iter_mut()
+                .find(|message| message.role == Role::System)
+            {
+                system.content.push(MessageContent::Text(
+                    include_str!("./prompts/infinite_context_prompt.txt").into(),
+                ));
+            }
+        }
+        request.tools = available_tools;
+        request.mode = if model.supports_max_mode() {
+            Some(self.completion_mode.into())
+        } else {
+            Some(CompletionMode::Normal.into())
+        };
+        if !include_history {
+            return request;
+        }
+        if self.infinite_context_enabled {
+            if let Some((_, end)) = self.memory_turn_start {
+                if let Some(memory) = &self.infinite_context {
+                    match memory.render_turn_before(end) {
+                        Ok(view) => append_memory_view(&mut request, view),
+                        Err(error) => self.memory_error(error, cx),
+                    }
+                }
+            }
+        }
+        let start = if self.infinite_context_enabled {
+            self.memory_turn_start
+                .map_or(self.messages.len(), |(start, _)| {
+                    self.messages.partition_point(|message| message.id < start)
+                })
+        } else {
+            0
+        };
         let mut message_ix_to_cache = None;
-        for message in &self.messages {
+        for message in self.messages.iter().skip(start) {
             let mut request_message = LanguageModelRequestMessage {
                 role: message.role,
                 content: Vec::new(),
                 cache: false,
             };
 
-            message.loaded_context.add_to_request_message(&mut request_message);
+            message
+                .loaded_context
+                .add_to_request_message(&mut request_message);
 
             for segment in &message.segments {
                 match segment {
                     MessageSegment::Text(text) => {
                         if !text.is_empty() {
-                            request_message.content.push(MessageContent::Text(text.into()));
+                            request_message
+                                .content
+                                .push(MessageContent::Text(text.into()));
                         }
                     }
                     MessageSegment::Thinking { text, signature } => {
@@ -1298,7 +1970,9 @@ impl Thread {
                         }
                     }
                     MessageSegment::RedactedThinking(data) => {
-                        request_message.content.push(MessageContent::RedactedThinking(data.clone()));
+                        request_message
+                            .content
+                            .push(MessageContent::RedactedThinking(data.clone()));
                     }
                 }
             }
@@ -1311,9 +1985,12 @@ impl Thread {
             };
             for (tool_use, tool_result) in self.tool_use.tool_results(message.id) {
                 if let Some(tool_result) = tool_result {
-                    request_message.content.push(MessageContent::ToolUse(tool_use.clone()));
-                    tool_results_message.content.push(
-                        MessageContent::ToolResult(LanguageModelToolResult {
+                    request_message
+                        .content
+                        .push(MessageContent::ToolUse(tool_use.clone()));
+                    tool_results_message
+                        .content
+                        .push(MessageContent::ToolResult(LanguageModelToolResult {
                             tool_use_id: tool_use.id.clone(),
                             tool_name: tool_result.tool_name.clone(),
                             is_error: tool_result.is_error,
@@ -1325,11 +2002,13 @@ impl Thread {
                                 tool_result.content.clone()
                             },
                             output: None,
-                        })
-                    );
+                        }));
                 } else {
                     cache_message = false;
-                    log::debug!("skipped tool use {:?} because it is still pending", tool_use);
+                    log::debug!(
+                        "skipped tool use {:?} because it is still pending",
+                        tool_use
+                    );
                 }
             }
 
@@ -1351,13 +2030,6 @@ impl Thread {
             request.messages[message_ix_to_cache].cache = true;
         }
 
-        request.tools = available_tools;
-        request.mode = if model.supports_max_mode() {
-            Some(self.completion_mode.into())
-        } else {
-            Some(CompletionMode::Normal.into())
-        };
-
         request
     }
 
@@ -1366,7 +2038,7 @@ impl Thread {
         model: &Arc<dyn LanguageModel>,
         intent: CompletionIntent,
         added_user_message: String,
-        cx: &App
+        cx: &App,
     ) -> LanguageModelRequest {
         let mut request = LanguageModelRequest {
             thread_id: None,
@@ -1380,7 +2052,18 @@ impl Thread {
             temperature: AgentSettings::temperature_for_model(model, cx),
         };
 
-        for message in &self.messages {
+        if self.infinite_context_enabled {
+            if let Some(memory) = &self.infinite_context {
+                if let Some(view) = memory.render_view_before(memory.message_count()).log_err() {
+                    append_memory_view(&mut request, view);
+                }
+            }
+        }
+        for message in self
+            .messages
+            .iter()
+            .filter(|_| !self.infinite_context_enabled)
+        {
             let mut request_message = LanguageModelRequestMessage {
                 role: message.role,
                 content: Vec::new(),
@@ -1389,7 +2072,9 @@ impl Thread {
 
             for segment in &message.segments {
                 match segment {
-                    MessageSegment::Text(text) => request_message.content.push(MessageContent::Text(text.clone())),
+                    MessageSegment::Text(text) => request_message
+                        .content
+                        .push(MessageContent::Text(text.clone())),
                     MessageSegment::Thinking { .. } => {}
                     MessageSegment::RedactedThinking(_) => {}
                 }
@@ -1416,7 +2101,7 @@ impl Thread {
         request: LanguageModelRequest,
         model: Arc<dyn LanguageModel>,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
         self.tool_use_limit_reached = false;
 
@@ -1443,6 +2128,7 @@ impl Thread {
 
                 let mut stop_reason = StopReason::EndTurn;
                 let mut current_token_usage = TokenUsage::default();
+                let mut current_cache_usage = None;
 
                 thread
                     .update(cx, |_thread, cx| {
@@ -1558,6 +2244,9 @@ impl Thread {
                                 thread.cumulative_token_usage =
                                     thread.cumulative_token_usage + token_usage - current_token_usage;
                                 current_token_usage = token_usage;
+                            }
+                            LanguageModelCompletionEvent::CacheUsageUpdate(usage) => {
+                                thread.measured_cache_usage.agent.update(&mut current_cache_usage, usage)?;
                             }
                             LanguageModelCompletionEvent::Text(chunk) => {
                                 thread.received_chunk();
@@ -1745,7 +2434,7 @@ impl Thread {
                                     // Remove the turn that was refused.
                                     //
                                     // https://docs.anthropic.com/en/docs/test-and-evaluate/strengthen-guardrails/handle-streaming-refusals#reset-context-after-refusal
-                                    {
+                                    if !thread.memory_history_is_append_only() {
                                         let mut messages_to_remove = Vec::new();
 
                                         for (ix, message) in thread.messages.iter().enumerate().rev() {
@@ -1838,6 +2527,12 @@ impl Thread {
                         }
                     }
 
+                    if thread.infinite_context_enabled {
+                        match thread.sync_memory() {
+                            Ok(()) => thread.start_memory_summaries(cx),
+                            Err(error) => thread.memory_error(error, cx),
+                        }
+                    }
                     cx.emit(ThreadEvent::Stopped(result.map_err(Arc::new)));
 
                     if
@@ -1892,7 +2587,7 @@ impl Thread {
             &model.model,
             CompletionIntent::ThreadSummarization,
             added_user_message.into(),
-            cx
+            cx,
         );
 
         self.summary = ThreadSummary::Generating;
@@ -1931,26 +2626,26 @@ impl Thread {
                 }
 
                 anyhow::Ok(new_summary)
-            }).await;
+            })
+            .await;
 
-            this
-                .update(cx, |this, cx| {
-                    match result {
-                        Ok(new_summary) => {
-                            if new_summary.is_empty() {
-                                this.summary = ThreadSummary::Error;
-                            } else {
-                                this.summary = ThreadSummary::Ready(new_summary.into());
-                            }
-                        }
-                        Err(err) => {
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(new_summary) => {
+                        if new_summary.is_empty() {
                             this.summary = ThreadSummary::Error;
-                            log::error!("Failed to generate thread summary: {}", err);
+                        } else {
+                            this.summary = ThreadSummary::Ready(new_summary.into());
                         }
                     }
-                    cx.emit(ThreadEvent::SummaryGenerated);
-                })
-                .log_err()?;
+                    Err(err) => {
+                        this.summary = ThreadSummary::Error;
+                        log::error!("Failed to generate thread summary: {}", err);
+                    }
+                }
+                cx.emit(ThreadEvent::SummaryGenerated);
+            })
+            .log_err()?;
 
             Some(())
         });
@@ -1959,16 +2654,17 @@ impl Thread {
     pub fn start_generating_detailed_summary_if_needed(
         &mut self,
         thread_store: WeakEntity<ThreadStore>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
         let Some(last_message_id) = self.messages.last().map(|message| message.id) else {
             return;
         };
 
         match &*self.detailed_summary_rx.borrow() {
-            DetailedSummaryState::Generating { message_id, .. } | DetailedSummaryState::Generated { message_id, .. } if
-                *message_id == last_message_id
-            => {
+            DetailedSummaryState::Generating { message_id, .. }
+            | DetailedSummaryState::Generated { message_id, .. }
+                if *message_id == last_message_id =>
+            {
                 // Already up-to-date
                 return;
             }
@@ -1976,7 +2672,8 @@ impl Thread {
         }
 
         let Some(ConfiguredModel { model, provider }) =
-            LanguageModelRegistry::read_global(cx).thread_summary_model() else {
+            LanguageModelRegistry::read_global(cx).thread_summary_model()
+        else {
             return;
         };
 
@@ -1990,7 +2687,7 @@ impl Thread {
             &model,
             CompletionIntent::ThreadContextSummarization,
             added_user_message.into(),
-            cx
+            cx,
         );
 
         *self.detailed_summary_tx.borrow_mut() = DetailedSummaryState::Generating {
@@ -2006,7 +2703,8 @@ impl Thread {
             let Some(mut messages) = stream.await.log_err() else {
                 thread
                     .update(cx, |thread, _cx| {
-                        *thread.detailed_summary_tx.borrow_mut() = DetailedSummaryState::NotGenerated;
+                        *thread.detailed_summary_tx.borrow_mut() =
+                            DetailedSummaryState::NotGenerated;
                     })
                     .ok()?;
                 return None;
@@ -2031,11 +2729,10 @@ impl Thread {
 
             // Save thread so its summary can be reused later
             if let Some(thread) = thread.upgrade() {
-                if
-                    let Ok(Ok(save_task)) = cx.update(|cx| {
-                        thread_store.update(cx, |thread_store, cx| thread_store.save_thread(&thread, cx))
-                    })
-                {
+                if let Ok(Ok(save_task)) = cx.update(|cx| {
+                    thread_store
+                        .update(cx, |thread_store, cx| thread_store.save_thread(&thread, cx))
+                }) {
                     save_task.await.log_err();
                 }
             }
@@ -2044,8 +2741,13 @@ impl Thread {
         });
     }
 
-    pub async fn wait_for_detailed_summary_or_text(this: &Entity<Self>, cx: &mut AsyncApp) -> Option<SharedString> {
-        let mut detailed_summary_rx = this.read_with(cx, |this, _cx| this.detailed_summary_rx.clone()).ok()?;
+    pub async fn wait_for_detailed_summary_or_text(
+        this: &Entity<Self>,
+        cx: &mut AsyncApp,
+    ) -> Option<SharedString> {
+        let mut detailed_summary_rx = this
+            .read_with(cx, |this, _cx| this.detailed_summary_rx.clone())
+            .ok()?;
         loop {
             match detailed_summary_rx.recv().await? {
                 DetailedSummaryState::Generating { .. } => {}
@@ -2067,18 +2769,23 @@ impl Thread {
     }
 
     pub fn is_generating_detailed_summary(&self) -> bool {
-        matches!(&*self.detailed_summary_rx.borrow(), DetailedSummaryState::Generating { .. })
+        matches!(
+            &*self.detailed_summary_rx.borrow(),
+            DetailedSummaryState::Generating { .. }
+        )
     }
 
     pub fn use_pending_tools(
         &mut self,
         window: Option<AnyWindowHandle>,
         model: Arc<dyn LanguageModel>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> Vec<PendingToolUse> {
         self.auto_capture_telemetry(cx);
-        let request = Arc::new(self.to_completion_request(model.clone(), CompletionIntent::ToolResults, cx));
-        let pending_tool_uses = self.tool_use
+        let request =
+            Arc::new(self.to_completion_request(model.clone(), CompletionIntent::ToolResults, cx));
+        let pending_tool_uses = self
+            .tool_use
             .pending_tool_uses()
             .into_iter()
             .filter(|tool_use| tool_use.status.is_idle())
@@ -2098,8 +2805,19 @@ impl Thread {
         request: Arc<LanguageModelRequest>,
         model: Arc<dyn LanguageModel>,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
+        if self.infinite_context_enabled && matches!(tool_use.name.as_ref(), "zoom" | "date") {
+            let output = self.memory_tool_output(&tool_use.name, &tool_use.input);
+            let pending = self.tool_use.insert_tool_output(
+                tool_use.id.clone(),
+                tool_use.name,
+                output,
+                self.configured_model.as_ref(),
+            );
+            self.tool_finished(tool_use.id, pending, false, window, cx);
+            return;
+        }
         let Some(tool) = self.tools.read(cx).tool(&tool_use.name, cx) else {
             return self.handle_hallucinated_tool_use(tool_use.id, tool_use.name, window, cx);
         };
@@ -2108,11 +2826,28 @@ impl Thread {
             return self.handle_hallucinated_tool_use(tool_use.id, tool_use.name, window, cx);
         }
 
-        if tool.needs_confirmation(&tool_use.input, cx) && !AgentSettings::get_global(cx).always_allow_tool_actions {
-            self.tool_use.confirm_tool_use(tool_use.id, tool_use.ui_text, tool_use.input, request, tool);
+        if tool.needs_confirmation(&tool_use.input, cx)
+            && !AgentSettings::get_global(cx).always_allow_tool_actions
+        {
+            self.tool_use.confirm_tool_use(
+                tool_use.id,
+                tool_use.ui_text,
+                tool_use.input,
+                request,
+                tool,
+            );
             cx.emit(ThreadEvent::ToolConfirmationNeeded);
         } else {
-            self.run_tool(tool_use.id, tool_use.ui_text, tool_use.input, request, tool, model, window, cx);
+            self.run_tool(
+                tool_use.id,
+                tool_use.ui_text,
+                tool_use.input,
+                request,
+                tool,
+                model,
+                window,
+                cx,
+            );
         }
     }
 
@@ -2121,7 +2856,7 @@ impl Thread {
         tool_use_id: LanguageModelToolUseId,
         hallucinated_tool_name: Arc<str>,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) {
         let available_tools = self.profile.enabled_tools(cx);
 
@@ -2133,15 +2868,14 @@ impl Thread {
 
         let error_message = format!(
             "The tool '{}' doesn't exist or is not enabled. Available tools:\n{}",
-            hallucinated_tool_name,
-            tool_list
+            hallucinated_tool_name, tool_list
         );
 
         let pending_tool_use = self.tool_use.insert_tool_output(
             tool_use_id.clone(),
             hallucinated_tool_name,
             Err(anyhow!("Missing tool call: {error_message}")),
-            self.configured_model.as_ref()
+            self.configured_model.as_ref(),
         );
 
         cx.emit(ThreadEvent::MissingToolUse {
@@ -2159,7 +2893,7 @@ impl Thread {
         invalid_json: Arc<str>,
         error: String,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) {
         log::error!("The model returned invalid input JSON: {invalid_json}");
 
@@ -2167,7 +2901,7 @@ impl Thread {
             tool_use_id.clone(),
             tool_name,
             Err(anyhow!("Error parsing input JSON: {error}")),
-            self.configured_model.as_ref()
+            self.configured_model.as_ref(),
         );
         let ui_text = if let Some(pending_tool_use) = &pending_tool_use {
             pending_tool_use.ui_text.clone()
@@ -2196,9 +2930,19 @@ impl Thread {
         tool: Arc<dyn Tool>,
         model: Arc<dyn LanguageModel>,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) {
-        self.run_tool_with_response_control(tool_use_id, ui_text, input, request, tool, model, true, window, cx);
+        self.run_tool_with_response_control(
+            tool_use_id,
+            ui_text,
+            input,
+            request,
+            tool,
+            model,
+            true,
+            window,
+            cx,
+        );
     }
 
     fn run_tool_with_response_control(
@@ -2211,7 +2955,7 @@ impl Thread {
         model: Arc<dyn LanguageModel>,
         should_generate_response: bool,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) {
         let task = self.spawn_tool_use_with_response_control(
             tool_use_id.clone(),
@@ -2221,9 +2965,10 @@ impl Thread {
             model,
             should_generate_response,
             window,
-            cx
+            cx,
         );
-        self.tool_use.run_pending_tool(tool_use_id, ui_text.into(), task);
+        self.tool_use
+            .run_pending_tool(tool_use_id, ui_text.into(), task);
     }
 
     /// Run a tool directly with an associated assistant message.
@@ -2239,10 +2984,11 @@ impl Thread {
         model: Arc<dyn LanguageModel>,
         should_generate_response: bool,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) {
         let tool_name: Arc<str> = tool_name.into();
-        let request = Arc::new(self.to_completion_request(model.clone(), CompletionIntent::ToolResults, cx));
+        let request =
+            Arc::new(self.to_completion_request(model.clone(), CompletionIntent::ToolResults, cx));
 
         // Create the tool use and associate it with the assistant message
         let tool_use = LanguageModelToolUse {
@@ -2260,7 +3006,8 @@ impl Thread {
         };
 
         // Associate the tool use with the assistant message
-        self.tool_use.request_tool_use(assistant_message_id, tool_use, tool_use_metadata, cx);
+        self.tool_use
+            .request_tool_use(assistant_message_id, tool_use, tool_use_metadata, cx);
 
         // Get the tool and run it
         if let Some(tool) = self.tools.read(cx).tool(&tool_name, cx) {
@@ -2273,7 +3020,7 @@ impl Thread {
                 model,
                 should_generate_response,
                 window,
-                cx
+                cx,
             );
         } else {
             log::error!("Tool '{}' not found", tool_name);
@@ -2288,9 +3035,18 @@ impl Thread {
         tool: Arc<dyn Tool>,
         model: Arc<dyn LanguageModel>,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) -> Task<()> {
-        self.spawn_tool_use_with_response_control(tool_use_id, request, input, tool, model, true, window, cx)
+        self.spawn_tool_use_with_response_control(
+            tool_use_id,
+            request,
+            input,
+            tool,
+            model,
+            true,
+            window,
+            cx,
+        )
     }
 
     fn spawn_tool_use_with_response_control(
@@ -2302,12 +3058,24 @@ impl Thread {
         model: Arc<dyn LanguageModel>,
         should_generate_response: bool,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Thread>
+        cx: &mut Context<Thread>,
     ) -> Task<()> {
         let tool_name: Arc<str> = tool.name().into();
 
-        log::info!("About to call tool.run() for tool_use_id: {}, tool_name: {}", tool_use_id, tool_name);
-        let tool_result = tool.run(input, request, self.project.clone(), self.action_log.clone(), model, window, cx);
+        log::info!(
+            "About to call tool.run() for tool_use_id: {}, tool_name: {}",
+            tool_use_id,
+            tool_name
+        );
+        let tool_result = tool.run(
+            input,
+            request,
+            self.project.clone(),
+            self.action_log.clone(),
+            model,
+            window,
+            cx,
+        );
         log::info!(
             "Tool.run() completed for tool_use_id: {}, card present: {}",
             tool_use_id,
@@ -2317,22 +3085,32 @@ impl Thread {
         // Store the card separately if it exists
         if let Some(card) = tool_result.card.clone() {
             log::info!("Registering tool card for tool_use_id: {}", tool_use_id);
-            self.tool_use.insert_tool_result_card(tool_use_id.clone(), card);
+            self.tool_use
+                .insert_tool_result_card(tool_use_id.clone(), card);
         } else {
             log::warn!("No tool card provided for tool_use_id: {}", tool_use_id);
         }
 
         cx.spawn({
             async move |thread: WeakEntity<Thread>, cx| {
-                let output = tool_result.output.await;
+                let mut output = tool_result.output.await;
 
                 thread
                     .update(cx, |thread, cx| {
+                        if thread.infinite_context_enabled {
+                            if let Ok(output) = &mut output {
+                                if let assistant_tool::ToolResultContent::Text(text) =
+                                    &mut output.content
+                                {
+                                    *text = clip_memory_output(text);
+                                }
+                            }
+                        }
                         let pending_tool_use = thread.tool_use.insert_tool_output(
                             tool_use_id.clone(),
                             tool_name,
                             output,
-                            thread.configured_model.as_ref()
+                            thread.configured_model.as_ref(),
                         );
                         thread.tool_finished_with_response_control(
                             tool_use_id,
@@ -2340,7 +3118,7 @@ impl Thread {
                             false,
                             should_generate_response,
                             window,
-                            cx
+                            cx,
                         );
                     })
                     .ok();
@@ -2354,9 +3132,16 @@ impl Thread {
         pending_tool_use: Option<PendingToolUse>,
         canceled: bool,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
-        self.tool_finished_with_response_control(tool_use_id, pending_tool_use, canceled, true, window, cx);
+        self.tool_finished_with_response_control(
+            tool_use_id,
+            pending_tool_use,
+            canceled,
+            true,
+            window,
+            cx,
+        );
     }
 
     fn tool_finished_with_response_control(
@@ -2366,8 +3151,13 @@ impl Thread {
         canceled: bool,
         should_generate_response: bool,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
+        if self.infinite_context_enabled && self.all_tools_finished() {
+            if let Err(error) = self.sync_memory() {
+                self.memory_error(error, cx);
+            }
+        }
         if self.all_tools_finished() && should_generate_response {
             if let Some(ConfiguredModel { model, .. }) = self.configured_model.as_ref() {
                 if !canceled {
@@ -2386,14 +3176,38 @@ impl Thread {
     /// Cancels the last pending completion, if there are any pending.
     ///
     /// Returns whether a completion was canceled.
-    pub fn cancel_last_completion(&mut self, window: Option<AnyWindowHandle>, cx: &mut Context<Self>) -> bool {
+    pub fn cancel_last_completion(
+        &mut self,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let mut canceled = self.pending_completions.pop().is_some();
+        if self.memory_preparing {
+            self.memory_preparation = Task::ready(None);
+            self.memory_preparing = false;
+            canceled = true;
+        }
+        if self.memory_summaries_running {
+            self.cancel_memory_summaries(cx);
+            canceled = true;
+        }
 
         for pending_tool_use in self.tool_use.cancel_pending() {
             canceled = true;
-            self.tool_finished(pending_tool_use.id.clone(), Some(pending_tool_use), true, window, cx);
+            self.tool_finished(
+                pending_tool_use.id.clone(),
+                Some(pending_tool_use),
+                true,
+                window,
+                cx,
+            );
         }
 
+        if self.infinite_context_enabled {
+            if let Err(error) = self.sync_memory() {
+                self.memory_error(error, cx);
+            }
+        }
         if canceled {
             cx.emit(ThreadEvent::CompletionCanceled);
 
@@ -2430,7 +3244,7 @@ impl Thread {
         &mut self,
         message_id: MessageId,
         feedback: ThreadFeedback,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         if self.message_feedback.get(&message_id) == Some(&feedback) {
             return Task::ready(Ok(()));
@@ -2441,7 +3255,8 @@ impl Thread {
         let thread_id = self.id().clone();
         let client = self.project.read(cx).client();
 
-        let enabled_tool_names: Vec<String> = self.profile
+        let enabled_tool_names: Vec<String> = self
+            .profile
             .enabled_tools(cx)
             .iter()
             .map(|tool| tool.name())
@@ -2459,7 +3274,8 @@ impl Thread {
         cx.background_spawn(async move {
             let final_project_snapshot = final_project_snapshot.await;
             let serialized_thread = serialized_thread.await?;
-            let thread_data = serde_json::to_value(serialized_thread).unwrap_or_else(|_| serde_json::Value::Null);
+            let thread_data =
+                serde_json::to_value(serialized_thread).unwrap_or_else(|_| serde_json::Value::Null);
 
             let rating = match feedback {
                 ThreadFeedback::Positive => "positive",
@@ -2481,8 +3297,13 @@ impl Thread {
         })
     }
 
-    pub fn report_feedback(&mut self, feedback: ThreadFeedback, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let last_assistant_message_id = self.messages
+    pub fn report_feedback(
+        &mut self,
+        feedback: ThreadFeedback,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let last_assistant_message_id = self
+            .messages
             .iter()
             .rev()
             .find(|msg| msg.role == Role::Assistant)
@@ -2501,13 +3322,20 @@ impl Thread {
             cx.background_spawn(async move {
                 let final_project_snapshot = final_project_snapshot.await;
                 let serialized_thread = serialized_thread.await?;
-                let thread_data = serde_json::to_value(serialized_thread).unwrap_or_else(|_| serde_json::Value::Null);
+                let thread_data = serde_json::to_value(serialized_thread)
+                    .unwrap_or_else(|_| serde_json::Value::Null);
 
                 let rating = match feedback {
                     ThreadFeedback::Positive => "positive",
                     ThreadFeedback::Negative => "negative",
                 };
-                telemetry::event!("Assistant Thread Rated", rating, thread_id, thread_data, final_project_snapshot);
+                telemetry::event!(
+                    "Assistant Thread Rated",
+                    rating,
+                    thread_id,
+                    thread_data,
+                    final_project_snapshot
+                );
                 client.telemetry().flush_events().await;
 
                 Ok(())
@@ -2516,7 +3344,10 @@ impl Thread {
     }
 
     /// Create a snapshot of the current project state including git information and unsaved buffers.
-    fn project_snapshot(project: Entity<Project>, cx: &mut Context<Self>) -> Task<Arc<ProjectSnapshot>> {
+    fn project_snapshot(
+        project: Entity<Project>,
+        cx: &mut Context<Self>,
+    ) -> Task<Arc<ProjectSnapshot>> {
         let git_store = project.read(cx).git_store().clone();
         let worktree_snapshots: Vec<_> = project
             .read(cx)
@@ -2539,7 +3370,8 @@ impl Thread {
                         }
                     }
                 }
-            }).ok();
+            })
+            .ok();
 
             Arc::new(ProjectSnapshot {
                 worktree_snapshots,
@@ -2552,7 +3384,7 @@ impl Thread {
     fn worktree_snapshot(
         worktree: Entity<project::Worktree>,
         git_store: Entity<GitStore>,
-        cx: &App
+        cx: &App,
     ) -> Task<WorktreeSnapshot> {
         cx.spawn(async move |cx| {
             // Get worktree path and snapshot
@@ -2575,14 +3407,19 @@ impl Thread {
                     git_store
                         .repositories()
                         .values()
-                        .find(|repo| { repo.read(cx).abs_path_to_repo_path(&worktree.read(cx).abs_path()).is_some() })
+                        .find(|repo| {
+                            repo.read(cx)
+                                .abs_path_to_repo_path(&worktree.read(cx).abs_path())
+                                .is_some()
+                        })
                         .cloned()
                 })
                 .ok()
                 .flatten()
                 .map(|repo| {
                     repo.update(cx, |repo, _| {
-                        let current_branch = repo.branch.as_ref().map(|branch| branch.name().to_owned());
+                        let current_branch =
+                            repo.branch.as_ref().map(|branch| branch.name().to_owned());
                         repo.send_job(None, |state, _| async move {
                             let RepositoryState::Local { backend, .. } = state else {
                                 return GitState {
@@ -2608,11 +3445,10 @@ impl Thread {
                 });
 
             let git_state = match git_state {
-                Some(git_state) =>
-                    match git_state.ok() {
-                        Some(git_state) => git_state.await.ok(),
-                        None => None,
-                    }
+                Some(git_state) => match git_state.ok() {
+                    Some(git_state) => git_state.await.ok(),
+                    None => None,
+                },
                 None => None,
             };
 
@@ -2645,7 +3481,11 @@ impl Thread {
             }
 
             if !message.loaded_context.images.is_empty() {
-                writeln!(markdown, "\n{} images attached as context.\n", message.loaded_context.images.len())?;
+                writeln!(
+                    markdown,
+                    "\n{} images attached as context.\n",
+                    message.loaded_context.images.len()
+                )?;
             }
 
             for segment in &message.segments {
@@ -2659,9 +3499,17 @@ impl Thread {
             }
 
             for tool_use in self.tool_uses_for_message(message.id, cx) {
-                writeln!(markdown, "**Use Tool: {} ({})**", tool_use.name, tool_use.id)?;
+                writeln!(
+                    markdown,
+                    "**Use Tool: {} ({})**",
+                    tool_use.name, tool_use.id
+                )?;
                 writeln!(markdown, "```json")?;
-                writeln!(markdown, "{}", serde_json::to_string_pretty(&tool_use.input)?)?;
+                writeln!(
+                    markdown,
+                    "{}",
+                    serde_json::to_string_pretty(&tool_use.input)?
+                )?;
                 writeln!(markdown, "```")?;
             }
 
@@ -2698,22 +3546,27 @@ impl Thread {
         &mut self,
         buffer: Entity<language::Buffer>,
         buffer_range: Range<language::Anchor>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
-        self.action_log.update(cx, |action_log, cx| { action_log.keep_edits_in_range(buffer, buffer_range, cx) });
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.keep_edits_in_range(buffer, buffer_range, cx)
+        });
     }
 
     pub fn keep_all_edits(&mut self, cx: &mut Context<Self>) {
-        self.action_log.update(cx, |action_log, cx| action_log.keep_all_edits(cx));
+        self.action_log
+            .update(cx, |action_log, cx| action_log.keep_all_edits(cx));
     }
 
     pub fn reject_edits_in_ranges(
         &mut self,
         buffer: Entity<language::Buffer>,
         buffer_ranges: Vec<Range<language::Anchor>>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        self.action_log.update(cx, |action_log, cx| { action_log.reject_edits_in_ranges(buffer, buffer_ranges, cx) })
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.reject_edits_in_ranges(buffer, buffer_ranges, cx)
+        })
     }
 
     pub fn action_log(&self) -> &Entity<ActionLog> {
@@ -2739,7 +3592,8 @@ impl Thread {
         self.last_auto_capture_at = Some(now);
 
         let thread_id = self.id().clone();
-        let github_login = self.project
+        let github_login = self
+            .project
             .read(cx)
             .user_store()
             .read(cx)
@@ -2767,6 +3621,10 @@ impl Thread {
             .detach();
     }
 
+    pub fn measured_cache_usage(&self) -> MeasuredCacheUsage {
+        self.measured_cache_usage
+    }
+
     pub fn cumulative_token_usage(&self) -> TokenUsage {
         self.cumulative_token_usage
     }
@@ -2778,7 +3636,8 @@ impl Thread {
 
         let max = model.model.max_token_count();
 
-        let index = self.messages
+        let index = self
+            .messages
             .iter()
             .position(|msg| msg.id == message_id)
             .unwrap_or(0);
@@ -2787,7 +3646,8 @@ impl Thread {
             return TotalTokenUsage { total: 0, max };
         }
 
-        let token_usage = &self.request_token_usage
+        let token_usage = &self
+            .request_token_usage
             .get(index - 1)
             .cloned()
             .unwrap_or_default();
@@ -2812,7 +3672,10 @@ impl Thread {
             }
         }
 
-        let total = self.token_usage_at_last_message().unwrap_or_default().total_tokens();
+        let total = self
+            .token_usage_at_last_message()
+            .unwrap_or_default()
+            .total_tokens();
 
         Some(TotalTokenUsage { total, max })
     }
@@ -2826,7 +3689,8 @@ impl Thread {
 
     fn update_token_usage_at_last_message(&mut self, token_usage: TokenUsage) {
         let placeholder = self.token_usage_at_last_message().unwrap_or_default();
-        self.request_token_usage.resize(self.messages.len(), placeholder);
+        self.request_token_usage
+            .resize(self.messages.len(), placeholder);
 
         if let Some(last) = self.request_token_usage.last_mut() {
             *last = token_usage;
@@ -2841,7 +3705,7 @@ impl Thread {
                         amount: amount as i32,
                         limit,
                     }),
-                    cx
+                    cx,
                 )
             })
         });
@@ -2852,23 +3716,238 @@ impl Thread {
         tool_use_id: LanguageModelToolUseId,
         tool_name: Arc<str>,
         window: Option<AnyWindowHandle>,
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
-        let err = Err(anyhow::anyhow!("Permission to run tool action denied by user"));
+        let err = Err(anyhow::anyhow!(
+            "Permission to run tool action denied by user"
+        ));
 
-        self.tool_use.insert_tool_output(tool_use_id.clone(), tool_name, err, self.configured_model.as_ref());
+        self.tool_use.insert_tool_output(
+            tool_use_id.clone(),
+            tool_name,
+            err,
+            self.configured_model.as_ref(),
+        );
         self.tool_finished(tool_use_id.clone(), None, true, window, cx);
     }
+}
+
+#[doc(hidden)]
+pub fn memory_tools() -> Vec<LanguageModelRequestTool> {
+    vec![
+        LanguageModelRequestTool {
+            name: "zoom".into(),
+            description: "Open memory line id+n into its two children. n=1 retrieves the original message; page is zero-based for long messages. To retrieve an attached image, set image to its zero-based index (n=1).".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {
+                "id": {"type": "integer", "minimum": 0},
+                "n": {"type": "integer", "minimum": 1},
+                "page": {"type": "integer", "minimum": 0},
+                "image": {"type": "integer", "minimum": 0}
+            }, "required": ["id", "n"], "additionalProperties": false}),
+        },
+        LanguageModelRequestTool {
+            name: "date".into(),
+            description: "Retrieve the original date and time of a permanent memory message id.".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"id": {"type": "integer", "minimum": 0}}, "required": ["id"], "additionalProperties": false}),
+        },
+    ]
+}
+
+#[doc(hidden)]
+pub fn append_memory_view(request: &mut LanguageModelRequest, view: String) {
+    let lines: Vec<_> = view
+        .lines()
+        .filter(|line| *line != "<chat>" && *line != "</chat>")
+        .collect();
+    let mut last_whole_block = None;
+    for (index, block) in lines.chunks(4).enumerate() {
+        let mut text = if index == 0 {
+            String::from("<chat>\n")
+        } else {
+            String::new()
+        };
+        for line in block {
+            text.push_str(line);
+            text.push('\n');
+        }
+        if block.len() == 4 {
+            last_whole_block = Some(request.messages.len());
+        }
+        request.messages.push(LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text(text)],
+            cache: false,
+        });
+    }
+    if let Some(index) = last_whole_block {
+        if let Some(message) = request.messages.get_mut(index) {
+            message.cache = true;
+        }
+    }
+    request.messages.push(LanguageModelRequestMessage {
+        role: Role::User,
+        content: vec![MessageContent::Text(
+            if lines.is_empty() {
+                "<chat>\n</chat>"
+            } else {
+                "</chat>"
+            }
+            .into(),
+        )],
+        cache: false,
+    });
+}
+
+#[doc(hidden)]
+pub fn memory_summary_task(job: &SummaryJob) -> String {
+    let ruler = "-".repeat(512);
+    let span = 1u64.checked_shl(job.key.l).unwrap_or(0);
+    let instruction = if job.key.l == 0 {
+        format!(
+            "Compaction: compress message {} into one line of at most 512 bytes (about 70 words), the length of this ruler:",
+            job.key.i
+        )
+    } else {
+        format!(
+            "Compaction: merge lines {}+{} and {}+{}, adjacent, into one line of at most 512 bytes (about 70 words), the length of this ruler:",
+            job.key.i,
+            span / 2,
+            job.key.i + span / 2,
+            span / 2
+        )
+    };
+    format!(
+        "{instruction}\n{ruler}\n<chat> is context only: resolve references without adding facts absent from <input>.\n<input>\n{}\n</input>",
+        job.input
+    )
+}
+
+async fn summarize_memory_node(
+    model: Arc<dyn LanguageModel>,
+    mut request: LanguageModelRequest,
+    thread: WeakEntity<Thread>,
+    cx: &AsyncApp,
+) -> Result<String> {
+    let mut shortest: Option<String> = None;
+    for attempt in 0..5 {
+        let tokens = cx
+            .update(|cx| model.count_tokens(request.clone(), cx))?
+            .await?;
+        let reserve = model.max_output_tokens().unwrap_or(4_096);
+        anyhow::ensure!(
+            tokens.saturating_add(reserve) <= model.max_token_count(),
+            "Summary request exceeds this model's context window. Configure a larger-context thread summary model."
+        );
+        let mut events = model.stream_completion(request.clone(), cx).await?;
+        let mut text = String::new();
+        let mut usage = TokenUsage::default();
+        let mut cache_usage = None;
+        let mut cx = cx.clone();
+        while let Some(event) = events.next().await {
+            match event? {
+                LanguageModelCompletionEvent::Text(chunk) => text.push_str(&chunk),
+                LanguageModelCompletionEvent::UsageUpdate(next_usage) => {
+                    thread.update(&mut cx, |thread, cx| {
+                        thread.cumulative_token_usage =
+                            thread.cumulative_token_usage + next_usage - usage;
+                        cx.notify();
+                    })?;
+                    usage = next_usage;
+                }
+                LanguageModelCompletionEvent::CacheUsageUpdate(next_usage) => {
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .measured_cache_usage
+                            .summary
+                            .update(&mut cache_usage, next_usage)?;
+                        thread.touch_updated_at();
+                        cx.emit(ThreadEvent::StreamedCompletion);
+                        cx.notify();
+                        anyhow::Ok(())
+                    })??;
+                }
+                LanguageModelCompletionEvent::StatusUpdate(
+                    CompletionRequestStatus::UsageUpdated { amount, limit },
+                ) => {
+                    thread.update(&mut cx, |thread, cx| {
+                        thread.update_model_request_usage(amount as u32, limit, cx)
+                    })?;
+                }
+                LanguageModelCompletionEvent::ToolUse(_) => {
+                    anyhow::bail!("Summary model called a tool instead of summarizing.")
+                }
+                LanguageModelCompletionEvent::Stop(StopReason::Refusal) => {
+                    anyhow::bail!("Summary model refused the memory task.")
+                }
+                _ => {}
+            }
+        }
+        let text = text.trim().replace(['\n', '\r'], " ");
+        anyhow::ensure!(!text.is_empty(), "Summary model returned an empty line.");
+        if shortest
+            .as_ref()
+            .is_none_or(|shortest| text.len() < shortest.len())
+        {
+            shortest = Some(text.clone());
+        }
+        if text.len() <= 512 {
+            return Ok(text);
+        }
+        if attempt < 4 {
+            let mut end = 512.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let correction = format!(
+                "Too long: your line is {} bytes, over the 512-byte limit. Write the whole line again for the same <input>, cutting just enough of the least valuable items to fit before this cut:\n{}| ← LIMIT",
+                text.len(),
+                &text[..end]
+            );
+            request.messages.push(LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec![MessageContent::Text(text)],
+                cache: false,
+            });
+            request.messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(correction)],
+                cache: false,
+            });
+        }
+    }
+    anyhow::bail!(
+        "Summary still exceeds 512 UTF-8 bytes after five attempts (shortest: {} bytes).",
+        shortest.as_ref().map_or(0, String::len)
+    );
+}
+
+#[doc(hidden)]
+pub fn clip_memory_output(text: &str) -> String {
+    if text.chars().count() <= 30_000 {
+        return text.into();
+    }
+    let marker = "[middle omitted]";
+    let remaining = 30_000 - marker.chars().count();
+    let head: String = text.chars().take(remaining / 2).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(remaining - remaining / 2)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}{marker}{tail}")
 }
 
 #[derive(Debug, Clone, Error)]
 pub enum ThreadError {
     #[error("Payment required")]
     PaymentRequired,
-    #[error("Model request limit reached")] ModelRequestLimitReached {
-        plan: Plan,
-    },
-    #[error("Message {header}: {message}")] Message {
+    #[error("Model request limit reached")]
+    ModelRequestLimitReached { plan: Plan },
+    #[error("Message {header}: {message}")]
+    Message {
         header: SharedString,
         message: SharedString,
     },
@@ -3007,18 +4086,24 @@ fn resolve_tool_name_conflicts(tools: &[Arc<dyn Tool>]) -> Vec<(String, Arc<dyn 
 }
 
 #[cfg(test)]
+#[path = "infinite_context_tests.rs"]
+mod infinite_context_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ context::load_context, context_store::ContextStore, thread_store, thread_store::ThreadStore };
-    use agent_settings::{ AgentProfileId, AgentSettings, LanguageModelParameters };
+    use crate::{
+        context::load_context, context_store::ContextStore, thread_store, thread_store::ThreadStore,
+    };
+    use agent_settings::{AgentProfileId, AgentSettings, LanguageModelParameters};
     use assistant_tool::ToolRegistry;
     use gpui::TestAppContext;
     use icons::IconName;
-    use language_model::fake_provider::{ FakeLanguageModel, FakeLanguageModelProvider };
-    use project::{ FakeFs, Project };
+    use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
+    use project::{FakeFs, Project};
     use prompt_store::PromptBuilder;
     use serde_json::json;
-    use settings::{ Settings, SettingsStore };
+    use settings::{Settings, SettingsStore};
     use std::sync::Arc;
     use theme::ThemeSettings;
     use util::path;
@@ -3030,22 +4115,32 @@ mod tests {
 
         let project = create_test_project(
             cx,
-            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"})
-        ).await;
+            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"}),
+        )
+        .await;
 
-        let (_workspace, _thread_store, thread, context_store, model) = setup_test_environment(
-            cx,
-            project.clone()
-        ).await;
+        let (_workspace, _thread_store, thread, context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
-        add_file_to_context(&project, &context_store, "test/code.rs", cx).await.unwrap();
+        add_file_to_context(&project, &context_store, "test/code.rs", cx)
+            .await
+            .unwrap();
 
-        let context = context_store.read_with(cx, |store, _| store.context().next().cloned().unwrap());
-        let loaded_context = cx.update(|cx| load_context(vec![context], &project, &None, cx)).await;
+        let context =
+            context_store.read_with(cx, |store, _| store.context().next().cloned().unwrap());
+        let loaded_context = cx
+            .update(|cx| load_context(vec![context], &project, &None, cx))
+            .await;
 
         // Insert user message with context
         let message_id = thread.update(cx, |thread, cx| {
-            thread.insert_user_message("Please explain this code", loaded_context, None, Vec::new(), cx)
+            thread.insert_user_message(
+                "Please explain this code",
+                loaded_context,
+                None,
+                Vec::new(),
+                cx,
+            )
         });
 
         // Check content and context in message object
@@ -3075,7 +4170,10 @@ fn main() {{
 
         assert_eq!(message.role, Role::User);
         assert_eq!(message.segments.len(), 1);
-        assert_eq!(message.segments[0], MessageSegment::Text("Please explain this code".to_string()));
+        assert_eq!(
+            message.segments[0],
+            MessageSegment::Text("Please explain this code".to_string())
+        );
         assert_eq!(message.loaded_context.text, expected_context);
 
         // Check message in request
@@ -3099,41 +4197,55 @@ fn main() {{
                 "file2.rs": "fn function2() {}\n",
                 "file3.rs": "fn function3() {}\n",
                 "file4.rs": "fn function4() {}\n",
-            })
-        ).await;
+            }),
+        )
+        .await;
 
-        let (_, _thread_store, thread, context_store, model) = setup_test_environment(cx, project.clone()).await;
+        let (_, _thread_store, thread, context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
         // First message with context 1
-        add_file_to_context(&project, &context_store, "test/file1.rs", cx).await.unwrap();
+        add_file_to_context(&project, &context_store, "test/file1.rs", cx)
+            .await
+            .unwrap();
         let new_contexts = context_store.update(cx, |store, cx| {
             store.new_context_for_thread(thread.read(cx), None)
         });
         assert_eq!(new_contexts.len(), 1);
-        let loaded_context = cx.update(|cx| load_context(new_contexts, &project, &None, cx)).await;
+        let loaded_context = cx
+            .update(|cx| load_context(new_contexts, &project, &None, cx))
+            .await;
         let message1_id = thread.update(cx, |thread, cx| {
             thread.insert_user_message("Message 1", loaded_context, None, Vec::new(), cx)
         });
 
         // Second message with contexts 1 and 2 (context 1 should be skipped as it's already included)
-        add_file_to_context(&project, &context_store, "test/file2.rs", cx).await.unwrap();
+        add_file_to_context(&project, &context_store, "test/file2.rs", cx)
+            .await
+            .unwrap();
         let new_contexts = context_store.update(cx, |store, cx| {
             store.new_context_for_thread(thread.read(cx), None)
         });
         assert_eq!(new_contexts.len(), 1);
-        let loaded_context = cx.update(|cx| load_context(new_contexts, &project, &None, cx)).await;
+        let loaded_context = cx
+            .update(|cx| load_context(new_contexts, &project, &None, cx))
+            .await;
         let message2_id = thread.update(cx, |thread, cx| {
             thread.insert_user_message("Message 2", loaded_context, None, Vec::new(), cx)
         });
 
         // Third message with all three contexts (contexts 1 and 2 should be skipped)
         //
-        add_file_to_context(&project, &context_store, "test/file3.rs", cx).await.unwrap();
+        add_file_to_context(&project, &context_store, "test/file3.rs", cx)
+            .await
+            .unwrap();
         let new_contexts = context_store.update(cx, |store, cx| {
             store.new_context_for_thread(thread.read(cx), None)
         });
         assert_eq!(new_contexts.len(), 1);
-        let loaded_context = cx.update(|cx| load_context(new_contexts, &project, &None, cx)).await;
+        let loaded_context = cx
+            .update(|cx| load_context(new_contexts, &project, &None, cx))
+            .await;
         let message3_id = thread.update(cx, |thread, cx| {
             thread.insert_user_message("Message 3", loaded_context, None, Vec::new(), cx)
         });
@@ -3180,12 +4292,17 @@ fn main() {{
         assert!(!request.messages[3].string_contents().contains("file2.rs"));
         assert!(request.messages[3].string_contents().contains("file3.rs"));
 
-        add_file_to_context(&project, &context_store, "test/file4.rs", cx).await.unwrap();
+        add_file_to_context(&project, &context_store, "test/file4.rs", cx)
+            .await
+            .unwrap();
         let new_contexts = context_store.update(cx, |store, cx| {
             store.new_context_for_thread(thread.read(cx), Some(message2_id))
         });
         assert_eq!(new_contexts.len(), 3);
-        let loaded_context = cx.update(|cx| load_context(new_contexts, &project, &None, cx)).await.loaded_context;
+        let loaded_context = cx
+            .update(|cx| load_context(new_contexts, &project, &None, cx))
+            .await
+            .loaded_context;
 
         assert!(!loaded_context.text.contains("file1.rs"));
         assert!(loaded_context.text.contains("file2.rs"));
@@ -3198,7 +4315,10 @@ fn main() {{
             store.new_context_for_thread(thread.read(cx), Some(message2_id))
         });
         assert_eq!(new_contexts.len(), 2);
-        let loaded_context = cx.update(|cx| load_context(new_contexts, &project, &None, cx)).await.loaded_context;
+        let loaded_context = cx
+            .update(|cx| load_context(new_contexts, &project, &None, cx))
+            .await
+            .loaded_context;
 
         assert!(!loaded_context.text.contains("file1.rs"));
         assert!(loaded_context.text.contains("file2.rs"));
@@ -3211,7 +4331,10 @@ fn main() {{
             store.new_context_for_thread(thread.read(cx), Some(message2_id))
         });
         assert_eq!(new_contexts.len(), 1);
-        let loaded_context = cx.update(|cx| load_context(new_contexts, &project, &None, cx)).await.loaded_context;
+        let loaded_context = cx
+            .update(|cx| load_context(new_contexts, &project, &None, cx))
+            .await
+            .loaded_context;
 
         assert!(!loaded_context.text.contains("file1.rs"));
         assert!(loaded_context.text.contains("file2.rs"));
@@ -3225,10 +4348,12 @@ fn main() {{
 
         let project = create_test_project(
             cx,
-            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"})
-        ).await;
+            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"}),
+        )
+        .await;
 
-        let (_, _thread_store, thread, _context_store, model) = setup_test_environment(cx, project.clone()).await;
+        let (_, _thread_store, thread, _context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
         // Insert user message without any context (empty context vector)
         let message_id = thread.update(cx, |thread, cx| {
@@ -3237,7 +4362,7 @@ fn main() {{
                 ContextLoadResult::default(),
                 None,
                 Vec::new(),
-                cx
+                cx,
             )
         });
 
@@ -3247,7 +4372,10 @@ fn main() {{
         // Context should be empty when no files are included
         assert_eq!(message.role, Role::User);
         assert_eq!(message.segments.len(), 1);
-        assert_eq!(message.segments[0], MessageSegment::Text("What is the best way to learn Rust?".to_string()));
+        assert_eq!(
+            message.segments[0],
+            MessageSegment::Text("What is the best way to learn Rust?".to_string())
+        );
         assert_eq!(message.loaded_context.text, "");
 
         // Check message in request
@@ -3256,14 +4384,24 @@ fn main() {{
         });
 
         assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.messages[1].string_contents(), "What is the best way to learn Rust?");
+        assert_eq!(
+            request.messages[1].string_contents(),
+            "What is the best way to learn Rust?"
+        );
 
         // Add second message, also without context
         let message2_id = thread.update(cx, |thread, cx| {
-            thread.insert_user_message("Are there any good books?", ContextLoadResult::default(), None, Vec::new(), cx)
+            thread.insert_user_message(
+                "Are there any good books?",
+                ContextLoadResult::default(),
+                None,
+                Vec::new(),
+                cx,
+            )
         });
 
-        let message2 = thread.read_with(cx, |thread, _| thread.message(message2_id).unwrap().clone());
+        let message2 =
+            thread.read_with(cx, |thread, _| thread.message(message2_id).unwrap().clone());
         assert_eq!(message2.loaded_context.text, "");
 
         // Check that both messages appear in the request
@@ -3272,8 +4410,14 @@ fn main() {{
         });
 
         assert_eq!(request.messages.len(), 3);
-        assert_eq!(request.messages[1].string_contents(), "What is the best way to learn Rust?");
-        assert_eq!(request.messages[2].string_contents(), "Are there any good books?");
+        assert_eq!(
+            request.messages[1].string_contents(),
+            "What is the best way to learn Rust?"
+        );
+        assert_eq!(
+            request.messages[2].string_contents(),
+            "Are there any good books?"
+        );
     }
 
     #[gpui::test]
@@ -3282,18 +4426,20 @@ fn main() {{
 
         let project = create_test_project(
             cx,
-            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"})
-        ).await;
+            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"}),
+        )
+        .await;
 
-        let (_workspace, thread_store, thread, _context_store, _model) = setup_test_environment(
-            cx,
-            project.clone()
-        ).await;
+        let (_workspace, thread_store, thread, _context_store, _model) =
+            setup_test_environment(cx, project.clone()).await;
 
         // Check that we are starting with the default profile
         let profile = cx.read(|cx| thread.read(cx).profile.clone());
         let tool_set = cx.read(|cx| thread_store.read(cx).tools());
-        assert_eq!(profile, AgentProfile::new(AgentProfileId::default(), tool_set));
+        assert_eq!(
+            profile,
+            AgentProfile::new(AgentProfileId::default(), tool_set)
+        );
     }
 
     #[gpui::test]
@@ -3302,16 +4448,18 @@ fn main() {{
 
         let project = create_test_project(
             cx,
-            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"})
-        ).await;
+            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"}),
+        )
+        .await;
 
-        let (_workspace, thread_store, thread, _context_store, _model) = setup_test_environment(
-            cx,
-            project.clone()
-        ).await;
+        let (_workspace, thread_store, thread, _context_store, _model) =
+            setup_test_environment(cx, project.clone()).await;
 
         // Profile gets serialized with default values
-        let serialized = thread.update(cx, |thread, cx| thread.serialize(cx)).await.unwrap();
+        let serialized = thread
+            .update(cx, |thread, cx| thread.serialize(cx))
+            .await
+            .unwrap();
 
         assert_eq!(serialized.profile, Some(AgentProfileId::default()));
 
@@ -3325,13 +4473,16 @@ fn main() {{
                     thread.prompt_builder.clone(),
                     thread.project_context.clone(),
                     None,
-                    cx
+                    cx,
                 )
             })
         });
         let tool_set = cx.read(|cx| thread_store.read(cx).tools());
 
-        assert_eq!(deserialized.profile, AgentProfile::new(AgentProfileId::default(), tool_set));
+        assert_eq!(
+            deserialized.profile,
+            AgentProfile::new(AgentProfileId::default(), tool_set)
+        );
     }
 
     #[gpui::test]
@@ -3340,13 +4491,12 @@ fn main() {{
 
         let project = create_test_project(
             cx,
-            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"})
-        ).await;
+            json!({"code.rs": "fn main() {\n    println!(\"Hello, world!\");\n}"}),
+        )
+        .await;
 
-        let (_workspace, _thread_store, thread, _context_store, model) = setup_test_environment(
-            cx,
-            project.clone()
-        ).await;
+        let (_workspace, _thread_store, thread, _context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
         // Both model and provider
         cx.update(|cx| {
@@ -3359,7 +4509,7 @@ fn main() {{
                     }],
                     ..AgentSettings::get_global(cx).clone()
                 },
-                cx
+                cx,
             );
         });
 
@@ -3379,7 +4529,7 @@ fn main() {{
                     }],
                     ..AgentSettings::get_global(cx).clone()
                 },
-                cx
+                cx,
             );
         });
 
@@ -3399,7 +4549,7 @@ fn main() {{
                     }],
                     ..AgentSettings::get_global(cx).clone()
                 },
-                cx
+                cx,
             );
         });
 
@@ -3419,7 +4569,7 @@ fn main() {{
                     }],
                     ..AgentSettings::get_global(cx).clone()
                 },
-                cx
+                cx,
             );
         });
 
@@ -3435,7 +4585,8 @@ fn main() {{
 
         let project = create_test_project(cx, json!({})).await;
 
-        let (_, _thread_store, thread, _context_store, model) = setup_test_environment(cx, project.clone()).await;
+        let (_, _thread_store, thread, _context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
         // Initial state should be pending
         thread.read_with(cx, |thread, _| {
@@ -3455,7 +4606,12 @@ fn main() {{
         // Send a message
         thread.update(cx, |thread, cx| {
             thread.insert_user_message("Hi!", ContextLoadResult::default(), None, vec![], cx);
-            thread.send_to_model(model.clone(), CompletionIntent::ThreadSummarization, None, cx);
+            thread.send_to_model(
+                model.clone(),
+                CompletionIntent::ThreadSummarization,
+                None,
+                cx,
+            );
         });
 
         let fake_model = model.as_fake();
@@ -3514,7 +4670,8 @@ fn main() {{
 
         let project = create_test_project(cx, json!({})).await;
 
-        let (_, _thread_store, thread, _context_store, model) = setup_test_environment(cx, project.clone()).await;
+        let (_, _thread_store, thread, _context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
         test_summarize_error(&model, &thread, cx);
 
@@ -3535,13 +4692,20 @@ fn main() {{
 
         let project = create_test_project(cx, json!({})).await;
 
-        let (_, _thread_store, thread, _context_store, model) = setup_test_environment(cx, project.clone()).await;
+        let (_, _thread_store, thread, _context_store, model) =
+            setup_test_environment(cx, project.clone()).await;
 
         test_summarize_error(&model, &thread, cx);
 
         // Sending another message should not trigger another summarize request
         thread.update(cx, |thread, cx| {
-            thread.insert_user_message("How are you?", ContextLoadResult::default(), None, vec![], cx);
+            thread.insert_user_message(
+                "How are you?",
+                ContextLoadResult::default(),
+                None,
+                vec![],
+                cx,
+            );
             thread.send_to_model(model.clone(), CompletionIntent::UserPrompt, None, cx);
         });
 
@@ -3575,15 +4739,15 @@ fn main() {{
 
     #[gpui::test]
     fn test_resolve_tool_name_conflicts() {
-        use assistant_tool::{ Tool, ToolSource };
+        use assistant_tool::{Tool, ToolSource};
 
         assert_resolve_tool_name_conflicts(
             vec![
                 TestTool::new("tool1", ToolSource::Native),
                 TestTool::new("tool2", ToolSource::Native),
-                TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-1".into() })
+                TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-1".into() }),
             ],
-            vec!["tool1", "tool2", "tool3"]
+            vec!["tool1", "tool2", "tool3"],
         );
 
         assert_resolve_tool_name_conflicts(
@@ -3591,9 +4755,9 @@ fn main() {{
                 TestTool::new("tool1", ToolSource::Native),
                 TestTool::new("tool2", ToolSource::Native),
                 TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-1".into() }),
-                TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-2".into() })
+                TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-2".into() }),
             ],
-            vec!["tool1", "tool2", "mcp-1_tool3", "mcp-2_tool3"]
+            vec!["tool1", "tool2", "mcp-1_tool3", "mcp-2_tool3"],
         );
 
         assert_resolve_tool_name_conflicts(
@@ -3602,37 +4766,41 @@ fn main() {{
                 TestTool::new("tool2", ToolSource::Native),
                 TestTool::new("tool3", ToolSource::Native),
                 TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-1".into() }),
-                TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-2".into() })
+                TestTool::new("tool3", ToolSource::ContextServer { id: "mcp-2".into() }),
             ],
-            vec!["tool1", "tool2", "tool3", "mcp-1_tool3", "mcp-2_tool3"]
+            vec!["tool1", "tool2", "tool3", "mcp-1_tool3", "mcp-2_tool3"],
         );
 
         // Test that tool with very long name is always truncated
         assert_resolve_tool_name_conflicts(
-            vec![
-                TestTool::new(
-                    "tool-with-more-then-64-characters-blah-blah-blah-blah-blah-blah-blah-blah",
-                    ToolSource::Native
-                )
-            ],
-            vec!["tool-with-more-then-64-characters-blah-blah-blah-blah-blah-blah-"]
+            vec![TestTool::new(
+                "tool-with-more-then-64-characters-blah-blah-blah-blah-blah-blah-blah-blah",
+                ToolSource::Native,
+            )],
+            vec!["tool-with-more-then-64-characters-blah-blah-blah-blah-blah-blah-"],
         );
 
         // Test deduplication of tools with very long names, in this case the mcp server name should be truncated
         assert_resolve_tool_name_conflicts(
             vec![
                 TestTool::new("tool-with-very-very-very-long-name", ToolSource::Native),
-                TestTool::new("tool-with-very-very-very-long-name", ToolSource::ContextServer {
-                    id: "mcp-with-very-very-very-long-name".into(),
-                })
+                TestTool::new(
+                    "tool-with-very-very-very-long-name",
+                    ToolSource::ContextServer {
+                        id: "mcp-with-very-very-very-long-name".into(),
+                    },
+                ),
             ],
             vec![
                 "tool-with-very-very-very-long-name",
-                "mcp-with-very-very-very-long-_tool-with-very-very-very-long-name"
-            ]
+                "mcp-with-very-very-very-long-_tool-with-very-very-very-long-name",
+            ],
         );
 
-        fn assert_resolve_tool_name_conflicts(tools: Vec<TestTool>, expected: Vec<impl Into<String>>) {
+        fn assert_resolve_tool_name_conflicts(
+            tools: Vec<TestTool>,
+            expected: Vec<impl Into<String>>,
+        ) {
             let tools: Vec<Arc<dyn Tool>> = tools
                 .into_iter()
                 .map(|t| Arc::new(t) as Arc<dyn Tool>)
@@ -3643,12 +4811,9 @@ fn main() {{
                 let expected_name = expected_name.into();
                 let actual_name = &tools[i].0;
                 assert_eq!(
-                    actual_name,
-                    &expected_name,
+                    actual_name, &expected_name,
                     "Expected '{}' got '{}' at index {}",
-                    expected_name,
-                    actual_name,
-                    i
+                    expected_name, actual_name, i
                 );
             }
         }
@@ -3704,7 +4869,7 @@ fn main() {{
                 _action_log: Entity<ActionLog>,
                 _model: Arc<dyn LanguageModel>,
                 _window: Option<AnyWindowHandle>,
-                _cx: &mut App
+                _cx: &mut App,
             ) -> assistant_tool::ToolResult {
                 assistant_tool::ToolResult {
                     output: Task::ready(Err(anyhow::anyhow!("No content"))),
@@ -3714,10 +4879,19 @@ fn main() {{
         }
     }
 
-    fn test_summarize_error(model: &Arc<dyn LanguageModel>, thread: &Entity<Thread>, cx: &mut TestAppContext) {
+    fn test_summarize_error(
+        model: &Arc<dyn LanguageModel>,
+        thread: &Entity<Thread>,
+        cx: &mut TestAppContext,
+    ) {
         thread.update(cx, |thread, cx| {
             thread.insert_user_message("Hi!", ContextLoadResult::default(), None, vec![], cx);
-            thread.send_to_model(model.clone(), CompletionIntent::ThreadSummarization, None, cx);
+            thread.send_to_model(
+                model.clone(),
+                CompletionIntent::ThreadSummarization,
+                None,
+                cx,
+            );
         });
 
         let fake_model = model.as_fake();
@@ -3747,7 +4921,7 @@ fn main() {{
         cx.run_until_parked();
     }
 
-    fn init_test_settings(cx: &mut TestAppContext) {
+    pub(super) fn init_test_settings(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -3764,17 +4938,27 @@ fn main() {{
     }
 
     // Helper to create a test project with test files
-    async fn create_test_project(cx: &mut TestAppContext, files: serde_json::Value) -> Entity<Project> {
+    pub(super) async fn create_test_project(
+        cx: &mut TestAppContext,
+        files: serde_json::Value,
+    ) -> Entity<Project> {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/test"), files).await;
         Project::test(fs, [path!("/test").as_ref()], cx).await
     }
 
-    async fn setup_test_environment(
+    pub(super) async fn setup_test_environment(
         cx: &mut TestAppContext,
-        project: Entity<Project>
-    ) -> (Entity<Workspace>, Entity<ThreadStore>, Entity<Thread>, Entity<ContextStore>, Arc<dyn LanguageModel>) {
-        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        project: Entity<Project>,
+    ) -> (
+        Entity<Workspace>,
+        Entity<ThreadStore>,
+        Entity<Thread>,
+        Entity<ContextStore>,
+        Arc<dyn LanguageModel>,
+    ) {
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
         let thread_store = cx
             .update(|_, cx| {
@@ -3783,9 +4967,10 @@ fn main() {{
                     cx.new(|_| ToolWorkingSet::default()),
                     None,
                     Arc::new(PromptBuilder::new(None).unwrap()),
-                    cx
+                    cx,
                 )
-            }).await
+            })
+            .await
             .unwrap();
 
         let thread = thread_store.update(cx, |store, cx| store.create_thread(cx));
@@ -3802,14 +4987,14 @@ fn main() {{
                         provider: provider.clone(),
                         model: model.clone(),
                     }),
-                    cx
+                    cx,
                 );
                 registry.set_thread_summary_model(
                     Some(ConfiguredModel {
                         provider,
                         model: model.clone(),
                     }),
-                    cx
+                    cx,
                 );
             })
         });
@@ -3821,11 +5006,18 @@ fn main() {{
         project: &Entity<Project>,
         context_store: &Entity<ContextStore>,
         path: &str,
-        cx: &mut TestAppContext
+        cx: &mut TestAppContext,
     ) -> Result<Entity<language::Buffer>> {
-        let buffer_path = project.read_with(cx, |project, cx| project.find_project_path(path, cx)).unwrap();
+        let buffer_path = project
+            .read_with(cx, |project, cx| project.find_project_path(path, cx))
+            .unwrap();
 
-        let buffer = project.update(cx, |project, cx| { project.open_buffer(buffer_path.clone(), cx) }).await.unwrap();
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(buffer_path.clone(), cx)
+            })
+            .await
+            .unwrap();
 
         context_store.update(cx, |context_store, cx| {
             context_store.add_file_from_buffer(&buffer_path, buffer.clone(), false, cx);

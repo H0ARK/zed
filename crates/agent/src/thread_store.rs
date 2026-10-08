@@ -1,7 +1,8 @@
 use crate::{
     context_server_tool::ContextServerTool,
     thread::{
-        DetailedSummaryState, ExceededWindowError, MessageId, ProjectSnapshot, Thread, ThreadId,
+        DetailedSummaryState, ExceededWindowError, MeasuredCacheUsage, MessageId, ProjectSnapshot,
+        Thread, ThreadId,
     },
 };
 use agent_settings::{AgentProfileId, CompletionMode};
@@ -466,6 +467,16 @@ impl ThreadStore {
         })
     }
 
+    /// Reads saved JSON without deserializing or upgrading the thread's schema.
+    pub fn load_thread_json(&self, id: &ThreadId, cx: &mut Context<Self>) -> Task<Result<Vec<u8>>> {
+        let id = id.clone();
+        let database_future = ThreadsDatabase::global_future(cx);
+        cx.spawn(async move |_, _| {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            database.load_thread_json(id).await
+        })
+    }
+
     pub fn save_thread(&self, thread: &Entity<Thread>, cx: &mut Context<Self>) -> Task<Result<()>> {
         let (metadata, serialized_thread) =
             thread.update(cx, |thread, cx| (thread.id().clone(), thread.serialize(cx)));
@@ -616,6 +627,8 @@ pub struct SerializedThread {
     #[serde(default)]
     pub cumulative_token_usage: TokenUsage,
     #[serde(default)]
+    pub measured_cache_usage: MeasuredCacheUsage,
+    #[serde(default)]
     pub request_token_usage: Vec<TokenUsage>,
     #[serde(default)]
     pub detailed_summary_state: DetailedSummaryState,
@@ -629,6 +642,12 @@ pub struct SerializedThread {
     pub tool_use_limit_reached: bool,
     #[serde(default)]
     pub profile: Option<AgentProfileId>,
+    #[serde(default)]
+    pub infinite_context: bool,
+    #[serde(default)]
+    pub memory_turn_start: Option<(MessageId, u64)>,
+    #[serde(default)]
+    pub memory_archived: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -776,6 +795,10 @@ impl LegacySerializedThread {
             completion_mode: None,
             tool_use_limit_reached: false,
             profile: None,
+            infinite_context: false,
+            memory_turn_start: None,
+            memory_archived: false,
+            measured_cache_usage: MeasuredCacheUsage::default(),
         }
     }
 }
@@ -1013,30 +1036,43 @@ impl ThreadsDatabase {
         })
     }
 
-    pub fn try_find_thread(&self, id: ThreadId) -> Task<Result<Option<SerializedThread>>> {
-        let connection = self.connection.clone();
-
-        self.executor.spawn(async move {
-            let connection = connection.lock().unwrap();
+    fn try_find_thread_json(
+        connection: &Mutex<Connection>,
+        id: &ThreadId,
+    ) -> Result<Option<Vec<u8>>> {
+        let row = {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow!("threads database connection lock poisoned"))?;
             let mut select = connection.select_bound::<ThreadId, (DataType, Vec<u8>)>(indoc! {"
                 SELECT data_type, data FROM threads WHERE id = ? LIMIT 1
             "})?;
+            select(id.clone())?.into_iter().next()
+        };
 
-            let rows = select(id)?;
-            if let Some((data_type, data)) = rows.into_iter().next() {
-                let json_data = match data_type {
-                    DataType::Zstd => {
-                        let decompressed = zstd::decode_all(&data[..])?;
-                        String::from_utf8(decompressed)?
-                    }
-                    DataType::Json => String::from_utf8(data)?,
-                };
-
-                let thread = SerializedThread::from_json(json_data.as_bytes())?;
-                Ok(Some(thread))
-            } else {
-                Ok(None)
+        row.map(|(data_type, data)| match data_type {
+            DataType::Zstd => {
+                zstd::decode_all(data.as_slice()).context("failed to decompress stored thread JSON")
             }
+            DataType::Json => Ok(data),
+        })
+        .transpose()
+    }
+
+    fn load_thread_json(&self, id: ThreadId) -> Task<Result<Vec<u8>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            Self::try_find_thread_json(&connection, &id)?
+                .with_context(|| format!("no thread found with ID: {id:?}"))
+        })
+    }
+
+    pub fn try_find_thread(&self, id: ThreadId) -> Task<Result<Option<SerializedThread>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            Self::try_find_thread_json(&connection, &id)?
+                .map(|json| SerializedThread::from_json(&json))
+                .transpose()
         })
     }
 
@@ -1071,6 +1107,130 @@ mod tests {
     use chrono::Utc;
     use language_model::{Role, TokenUsage};
     use pretty_assertions::assert_eq;
+
+    fn raw_thread_database(
+        executor: BackgroundExecutor,
+        data_type: DataType,
+        data: Vec<u8>,
+    ) -> Result<ThreadsDatabase> {
+        let connection = Connection::open_memory(None);
+        connection.exec(indoc! {"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_type TEXT NOT NULL,
+                data BLOB NOT NULL
+            )
+        "})?()?;
+        connection.exec_bound::<(ThreadId, String, String, DataType, Vec<u8>)>(indoc! {"
+            INSERT INTO threads (id, summary, updated_at, data_type, data) VALUES (?, ?, ?, ?, ?)
+        "})?((
+            ThreadId::from("saved-thread"),
+            "Saved thread".to_string(),
+            "2025-01-01T00:00:00Z".to_string(),
+            data_type,
+            data,
+        ))?;
+        connection.exec("PRAGMA query_only = ON")?()?;
+        Ok(ThreadsDatabase {
+            executor,
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_preserves_versions_and_is_read_only(
+        executor: BackgroundExecutor,
+    ) {
+        for version in ["0.3.0", "99.0.0"] {
+            let json = format!(
+                r#"{{
+                    "version": "{version}",
+                    "summary": "Saved thread",
+                    "messages": [],
+                    "unknown_field": {{"nested": [1, 2, 3]}}
+                }}
+"#
+            )
+            .into_bytes();
+            for data_type in [DataType::Json, DataType::Zstd] {
+                let data = match data_type {
+                    DataType::Json => json.clone(),
+                    DataType::Zstd => {
+                        zstd::encode_all(json.as_slice(), ThreadsDatabase::COMPRESSION_LEVEL)
+                            .expect("test JSON should compress")
+                    }
+                };
+                let database =
+                    raw_thread_database(executor.clone(), data_type.clone(), data.clone())
+                        .expect("test database should initialize");
+                let id = ThreadId::from("saved-thread");
+                let loaded = database
+                    .load_thread_json(id.clone())
+                    .await
+                    .expect("raw JSON should load even with an unsupported version");
+                assert_eq!(loaded, json);
+                assert!(database.try_find_thread(id.clone()).await.is_err());
+
+                let connection = database
+                    .connection
+                    .lock()
+                    .expect("test connection lock should not be poisoned");
+                let rows = connection
+                    .select_bound::<(), (ThreadId, String, String, DataType, Vec<u8>)>(
+                        "SELECT id, summary, updated_at, data_type, data FROM threads",
+                    )
+                    .expect("stored rows query should prepare")(())
+                .expect("stored rows should be readable");
+                assert_eq!(
+                    rows,
+                    vec![(
+                        id,
+                        "Saved thread".to_string(),
+                        "2025-01-01T00:00:00Z".to_string(),
+                        data_type,
+                        data,
+                    )]
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_missing_id_errors(executor: BackgroundExecutor) {
+        let database = raw_thread_database(executor, DataType::Json, b"{}".to_vec())
+            .expect("test database should initialize");
+        let id = ThreadId::from("missing-thread");
+        let error = database
+            .load_thread_json(id.clone())
+            .await
+            .expect_err("a missing thread should fail to load");
+        assert!(error.to_string().contains("no thread found with ID"));
+        assert!(error.to_string().contains("missing-thread"));
+        assert!(
+            database
+                .try_find_thread(id)
+                .await
+                .expect("a missing thread lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_thread_json_invalid_zstd_errors(executor: BackgroundExecutor) {
+        let database = raw_thread_database(executor, DataType::Zstd, b"not zstd".to_vec())
+            .expect("test database should initialize");
+        let error = database
+            .load_thread_json(ThreadId::from("saved-thread"))
+            .await
+            .expect_err("invalid zstd should fail to load");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decompress stored thread JSON")
+        );
+    }
 
     #[test]
     fn test_legacy_serialized_thread_upgrade() {
@@ -1116,7 +1276,11 @@ mod tests {
                 model: None,
                 completion_mode: None,
                 tool_use_limit_reached: false,
-                profile: None
+                profile: None,
+                infinite_context: false,
+                memory_turn_start: None,
+                memory_archived: false,
+                measured_cache_usage: MeasuredCacheUsage::default(),
             }
         )
     }
@@ -1184,6 +1348,10 @@ mod tests {
             completion_mode: None,
             tool_use_limit_reached: false,
             profile: None,
+            infinite_context: false,
+            memory_turn_start: None,
+            memory_archived: false,
+            measured_cache_usage: MeasuredCacheUsage::default(),
         });
         let upgraded = thread_v0_1_0.upgrade();
 
@@ -1236,7 +1404,11 @@ mod tests {
                 model: None,
                 completion_mode: None,
                 tool_use_limit_reached: false,
-                profile: None
+                profile: None,
+                infinite_context: false,
+                memory_turn_start: None,
+                memory_archived: false,
+                measured_cache_usage: MeasuredCacheUsage::default(),
             }
         )
     }
